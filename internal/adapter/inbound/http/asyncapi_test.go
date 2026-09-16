@@ -1,8 +1,9 @@
 package http
 
 import (
+	"context"
 	"net/http"
-	"strings"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -21,19 +22,64 @@ func TestAsyncAPIYAMLHandler(t *testing.T) {
 	assert.Equal(t, string(apispec.AsyncAPISpec), rec.Body.String())
 }
 
-func TestAsyncAPIHandler(t *testing.T) {
-	r := gin.New()
-	r.GET("/asyncapi", AsyncAPIHandler)
-	rec := doRequest(t, r, http.MethodGet, "/asyncapi", nil, nil)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+// TestAsyncAPIHandler_RendersEmbeddedSpec drives the AsyncAPIHandler end-to-end
+// against the real embedded spec. Exercises loadAsyncSpec → readAsyncSpec →
+// renderPage → renderServers/renderMessage/renderSchema/renderPropsTable /
+// resolveSchema / propType / typeHTML / snsEventType / sortedKeys / walkYAML —
+// the entire docs-render surface with a single request.
+func TestAsyncAPIHandler_RendersEmbeddedSpec(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/asyncapi", nil)
 
-	body := rec.Body.String()
-	assert.Contains(t, body, "iam-token-service")
-	// The embedded spec's own YAML syntax uses "<" nowhere by construction,
-	// but html.EscapeString must still have run — assert a recognizable,
-	// escaped fragment of the spec survives inside the <pre> block instead
-	// of asserting a negative (absence of "<") that would pass vacuously.
-	assert.Contains(t, body, "asyncapi: 3.0.0")
-	assert.True(t, strings.Contains(body, "<pre>") && strings.Contains(body, "</pre>"))
+	AsyncAPIHandler(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.True(t, len(body) > 500, "rendered doc must be substantial HTML")
+	assert.Contains(t, body, "<!DOCTYPE html>")
+	assert.Contains(t, body, "AsyncAPI",
+		"rendered doc must reference AsyncAPI in the title/body")
+	assert.Contains(t, body, "ServiceAccountRegistered",
+		"rendered doc must list this service's published events")
+	assert.Contains(t, w.Header().Get("Content-Type"), "text/html")
+}
+
+// TestReadAsyncSpec_InvalidYAMLReturnsError covers the parse-error branch
+// so readAsyncSpec's error path is not dead code.
+func TestReadAsyncSpec_InvalidYAMLReturnsError(t *testing.T) {
+	_, err := readAsyncSpec([]byte("::: not-valid ::: yaml"))
+	assert.Error(t, err)
+}
+
+// TestReadAsyncSpec_MinimalValidYAML covers the happy path with a small
+// hand-crafted spec so we don't depend on the embedded bytes for this
+// case. Also exercises asyncSchema.UnmarshalYAML property-order capture.
+func TestReadAsyncSpec_MinimalValidYAML(t *testing.T) {
+	src := []byte(`
+asyncapi: "3.0.0"
+info:
+  title: "Test Spec"
+  version: "0.1.0"
+components:
+  schemas:
+    Sample:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+`)
+	spec, err := readAsyncSpec(src)
+	require.NoError(t, err)
+	assert.Equal(t, "Test Spec", spec.Info.Title)
+	assert.Equal(t, "0.1.0", spec.Info.Version)
+
+	sch, ok := spec.Comps.Schemas["Sample"]
+	require.True(t, ok)
+	// UnmarshalYAML must capture insertion order.
+	assert.Equal(t, []string{"id", "name"}, sch.PropertyOrder,
+		"schema property order must be preserved for stable render output")
 }
