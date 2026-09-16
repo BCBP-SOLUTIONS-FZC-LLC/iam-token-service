@@ -122,15 +122,13 @@ jobs:
       # api/asyncapi.yaml is the single source of truth for event payload schemas.
       # internal/eventschema/*.json are derived from it and read by schema-gov.
       # --check exits 1 if any file would change without writing (same gate as
-      # iam-user-profile / iam-org-membership). The image is a private GHCR
-      # package — authenticate with GO_PRIVATE_TOKEN (GITHUB_TOKEN is
-      # repo-scoped and is denied unless this repo is granted package access).
+      # iam-org-membership / iam-user-profile).
       - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Event schema sync check (AsyncAPI → JSON)
         env:
