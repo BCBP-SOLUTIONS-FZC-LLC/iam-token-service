@@ -170,7 +170,7 @@ jobs:
 
       # Table format: human-readable in CI logs; fails on CRITICAL/HIGH/UNKNOWN.
       - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: table
@@ -181,7 +181,7 @@ jobs:
 
       # SARIF format: uploads to GitHub Security tab.
       - name: Trivy scan — SARIF upload
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: sarif
@@ -198,7 +198,7 @@ jobs:
 
       # CycloneDX SBOM — full component inventory for compliance / audit.
       - name: Trivy SBOM — CycloneDX
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: cyclonedx
