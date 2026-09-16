@@ -470,6 +470,41 @@ happen under connection pooling.
 
 ---
 
+## Data model overview
+
+Database `serviceaccount` on a dedicated Postgres instance (dev stage —
+nothing shared). **2 tenant-scoped tables**, both `ENABLE ROW LEVEL
+SECURITY` + `FORCE ROW LEVEL SECURITY` + `REVOKE ALL FROM PUBLIC`:
+`service_account_principals` (one row per tenant automation principal;
+`uq_sap_active_principal UNIQUE (tenant_id, principal_type)` is what makes
+TS-4 idempotent) and `service_account_credentials` (one row per
+issued/rotated version; `fk_sac_principal` is a **composite**
+`(principal_id, tenant_id)` FK back to the principals table — a
+cross-tenant credential row is structurally impossible, not just
+policy-blocked). Plus two operational, RLS-exempt tables:
+`processed_events` (the offboarding consumer's dedup ledger — `PRIMARY KEY
+(event_id, consumer)`, `event_id` is `text` not `uuid` since SQS/SNS
+message IDs are external strings) and `outbox_events` (owned by
+`platform-events`' `outbox.ApplySchema`, this migration only customizes
+its `payload` column type). Since this service has never been deployed,
+the schema is one migration, not an incremental expand/contract history.
+
+Both tenant-scoped tables carry `record_version`, bumped by the shared
+`touch_row()` `BEFORE UPDATE` trigger, guarded by
+`WHEN (OLD.* IS DISTINCT FROM NEW.*)` so a no-op write never spuriously
+advances the version (CONC-1). `uq_sac_one_active UNIQUE (principal_id)
+WHERE status = 'active' AND deleted_at IS NULL` (CONC-2) is why TS-1
+demotes the prior `active` row to `rotating` *before* inserting the new
+one — an insert-then-demote ordering would briefly hold two `active` rows
+and violate this index immediately. `idx_sac_overlap (expires_at) WHERE
+status = 'rotating'` is the exact partial index the §8.3 overlap-expiry
+sweep scans.
+
+Full table catalogue, RLS policy definition, and every trigger/migration
+detail is in [`.claude/database-schema.md`](.claude/database-schema.md).
+
+---
+
 ## Event and outbox flow
 
 Every credential state transition emits exactly one event, in the **same
@@ -772,7 +807,11 @@ in-mesh callers (`ingressNamespaceSelector` is a required value — the
 render fails closed if left unset, since an empty selector matches every
 namespace in the cluster), `ServiceAccount` bound to the OpenBao
 Kubernetes-auth role, `PrometheusRule`/`ServiceMonitor` for the alerts in
-`deploy/monitoring/app-alerts.yml`, `PodDisruptionBudget`.
+`deploy/monitoring/app-alerts.yml`, `PodDisruptionBudget` (`minAvailable:
+1`). HPA (`autoscaling.enabled`) and Ingress/HTTPRoute/SecurityPolicy
+(`ingress.enabled`) both ship as disabled-by-default scaffolding matching
+the sibling IAM services' chart shape — this service has no public
+surface today, so a fixed `replicaCount` is the current scaling model.
 
 ---
 
@@ -794,6 +833,68 @@ merged across all suites with a max-count strategy
 (`scripts/merge_coverage.py`). `make test-ci` runs the full merged
 pipeline; the CI gate (`.github/workflows/validate-test.yml`) enforces a
 coverage floor.
+
+---
+
+## Consumer conformance checklist
+
+Before a downstream service subscribes to `iam-serviceaccount-events`,
+verify the following. Audit Log is this topic's one subscriber today
+(`serviceaccount-audit-q`) — audit-only, since the automation principal
+carries no roles (TS-INV-4) — but this is the same contract any future
+subscriber would need to honor.
+
+**Decoding**
+- [ ] Strip the 18-byte Glue header (`[0x03][0x00][16-byte schema version
+  UUID]`) before deserialising the envelope JSON, when `GLUE_REGISTRY_NAME`
+  is set (`GlueCodec`); with `NoopCodec` (dev, unset) the message is plain
+  JSON with no header.
+- [ ] Handle an unrecognised `event_type` gracefully (log + skip, not
+  error) — a new event type can be added to this topic without warning
+  every existing consumer.
+- [ ] Ignore unknown JSON fields in the payload — Go's `encoding/json`
+  decoder does this by default; do not wrap it in a
+  `DisallowUnknownFields()` decoder for this contract.
+
+**Envelope shape** (`api/asyncapi.yaml § components/schemas/EventEnvelopeBase`)
+- [ ] `id` (UUID v7), `type`, `source`, `specversion`, `time`, `data`,
+  `tenant_id` are the required fields — treat `envelope.tenant_id` as
+  authoritative, never a `tenant_id` inside `data`.
+- [ ] `dataschema`, `trace_id`, `actor` are present-when-applicable, not
+  universally required — `actor` is `"iam-system"` on RP/cron-originated
+  events, since the automation principal carries no other identity to
+  attribute a write to.
+
+**Idempotency**
+- [ ] Record the envelope `id` against your own consumer name **before**
+  committing any side-effect, mirroring this service's own
+  `processed_events` composite `PRIMARY KEY (event_id, consumer)` pattern
+  (its own inbound side, for `TenantMembershipsPurged`).
+- [ ] Use an `ON CONFLICT DO NOTHING`-style insert — do not error on
+  duplicate delivery, since SNS→SQS is at-least-once.
+
+**Ordering**
+- [ ] Do not assume SNS preserves delivery order. In practice this is low
+  risk for this topic specifically — every event here is a terminal state
+  transition for one credential version (issue/rotate/revoke), not a
+  field-level upsert that redelivery-out-of-order could corrupt — but
+  don't rely on that going forward without re-checking against whatever
+  new event types get added.
+
+**Infrastructure**
+- [ ] Configure a DLQ on the SQS subscription queue with
+  `maxReceiveCount ≤ 5` — matches this service's own inbound queue
+  (`tenant-lifecycle-tokensvc-q` / `-dlq`).
+- [ ] Enforce `aws:SourceArn` in the SQS queue resource policy against the
+  `iam-serviceaccount-events` topic ARN.
+
+**Observability**
+- [ ] Emit a metric or alert on DLQ delivery — this service alerts on
+  `IAMTokenServiceOutboxStuck` (`outbox_dead_letters_total` rate > 0,
+  `deploy/monitoring/app-alerts.yml`); a consuming service should hold
+  itself to the same bar.
+- [ ] Log the envelope `id` and `type` on every processed message for
+  end-to-end traceability.
 
 ---
 
