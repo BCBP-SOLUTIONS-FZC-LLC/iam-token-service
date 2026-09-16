@@ -27,7 +27,12 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Raised from 20: TEST_POSTGRES_PARALLEL=1 (below) serializes this
+    # branch's ~227-container test/postgres suite instead of running it
+    # 2-wide, which can meaningfully increase wall-clock time. 35 min leaves
+    # headroom over the internal `go test -timeout 1500s` (25 min) for
+    # checkout/setup/lint/build.
+    timeout-minutes: 35
     outputs:
       pct: ${{ steps.gate.outputs.pct }}
     steps:
@@ -66,18 +71,24 @@ jobs:
       # Mandatory blocking gate: runs the full test suite with -race and coverage.
       # Any data race detected here blocks all downstream jobs (trivy, smoke,
       # push, release). Do NOT remove or skip.
-      - name: Tests — unit · contract · postgres/RLS · integration (race + coverage)
+      - name: Tests — unit · postgres · integration (race + coverage)
         env:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
         # TEST_POSTGRES_PARALLEL lowered from the Makefile's dev-machine
         # default (4) — GitHub-hosted runners have far less CPU/RAM headroom
         # than a dev box, and concurrent testcontainers Postgres instances
         # (each with its own pgxpool) is enough resource pressure to stall a
-        # connection attempt and surface as a test failure.
-        run: make test-ci TEST_POSTGRES_PARALLEL=2
+        # connection attempt and surface as a test failure. Lowered again to
+        # 1 (from 2) on this branch specifically: its test/postgres suite
+        # spins ~227 containers across the run (vs. ~80 upstream) from the
+        # additional error-path/coverage-gap test files, so even -parallel 2
+        # was enough concurrent container churn to keep tripping
+        # TestInvite_SeatCapLostRace_CommitsDurableCleanupRow /
+        # TestConsumerEVT14_StaleEventSkipped intermittently.
+        run: make test-ci TEST_POSTGRES_PARALLEL=1
 
-      # make test-ci already merges coverage profiles into coverage.out.
-      # Assert the combined statement coverage meets 98%.
+      # make test-ci already merges all three coverage profiles into coverage.out
+      # via _merge-coverage. Assert the combined statement coverage meets 98%.
       # Do not lower this threshold.
       - name: Coverage threshold gate (≥ 98%)
         id: gate
@@ -142,9 +153,10 @@ jobs:
             --schema-dir internal/eventschema \
             --check
 
-      # Black-box, real-Postgres, production-wired-router suite (§14.4).
-      # Correctness-only: not part of the coverage gate above — mirrors how
-      # the sibling IAM services treat their own e2e suites.
+      # Black-box, real-Postgres, production-wired-router suite (§14.4 —
+      # RLS cross-tenant isolation, full TS-1..TS-4 lifecycle over real
+      # HTTP). Correctness-only: not part of the coverage gate above —
+      # mirrors how the sibling IAM services treat their own e2e suites.
       - name: Tests — e2e (real router + real Postgres, testcontainers)
         env:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
