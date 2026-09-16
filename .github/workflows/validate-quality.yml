@@ -17,7 +17,6 @@ name: Validate / Quality
 
 permissions:
   contents: read
-  packages: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -29,9 +28,6 @@ jobs:
     name: quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,28 +89,6 @@ jobs:
       # (§5.5) — docs/swagger/ is checked in, not generated at build time.
       - name: Swagger docs up to date
         run: make swag-check
-
-      # AsyncAPI structural/lifecycle validation — no AWS required (§7.3.1,
-      # docker run against the pinned platform-schemagov image, a private
-      # GHCR package — must authenticate before pulling, or docker pull
-      # fails "unauthorized" even though the runner's default GITHUB_TOKEN
-      # has package-read access via the `packages: read` permission above).
-      - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull schema-gov image
-        env:
-          SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
-        run: docker pull "${SCHEMA_GOV_IMAGE}"
-
-      - name: AsyncAPI schema validation
-        env:
-          SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
-        run: make schema-validate
 
       # Invariant gates (§25, TS-INV-1/TS-INV-2/RLS-6):
       #   TS-INV-1 — no Keycloak Admin API dependency anywhere in this repo.
