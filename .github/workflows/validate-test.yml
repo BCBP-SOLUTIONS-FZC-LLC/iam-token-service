@@ -134,7 +134,6 @@ jobs:
         env:
           SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
         run: |
-          docker pull "${SCHEMA_GOV_IMAGE}"
           docker run --rm \
             -v "${{ github.workspace }}":/workspace \
             -e GITHUB_ACTIONS \
