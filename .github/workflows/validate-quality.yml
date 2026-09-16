@@ -108,9 +108,8 @@ jobs:
 
       - name: Vulnerability check
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.3
-          if ! govulncheck ./...; then
-            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'govulncheck ./...' locally to view details."
+          if ! make vuln-check; then
+            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'make vuln-check' locally to view details."
             exit 1
           fi
 
