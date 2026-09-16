@@ -61,6 +61,20 @@ service:
   port: 8080
   metricsPort: 9090
 
+# HPA — disabled by default. This service's traffic today is a small,
+# predictable set of internal-only callers (Realm Provisioner, O&M, the
+# operator gateway, §5.6) with no public surface, so a fixed replicaCount
+# (server.replicaCount) is the current model; kept here as dormant
+# scaffolding matching the sibling IAM services' chart shape, for if load
+# ever warrants autoscaling.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 75
+  targetRPSPerReplica: 500
+
 # Restricts ingress to in-mesh callers only (§10.2) — Realm Provisioner,
 # O&M, the operator gateway, and this service's own rotator CronJob (which
 # never calls the server's HTTP API, but shares the mesh). No public/edge
@@ -93,6 +107,64 @@ networkPolicy:
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
+
+# Ingress — disabled by default. No public/edge route exists today (§5.6,
+# all 4 routes are /api/v1/internal/*, gated to in-mesh callers by
+# networkPolicy above); kept as dormant scaffolding matching the sibling
+# IAM services' chart shape, for if that ever changes.
+# type: HTTPRoute  — Envoy Gateway / any Gateway API-compatible controller (recommended)
+# type: Ingress    — classic nginx / traefik Ingress controller
+ingress:
+  enabled: false
+  type: HTTPRoute
+
+  hosts:
+    - host: iam-token-service.internal.example.com
+      paths:
+        - path: /api/v1/internal
+          pathType: PathPrefix
+
+  # Gateway API (type: HTTPRoute) — reference the Gateway resource that
+  # Envoy Gateway manages. Deploy the Gateway separately.
+  gateway:
+    name: ""              # required — name of the Gateway resource
+    namespace: ""         # optional — defaults to the release namespace
+    sectionName: ""       # optional — target a specific listener (e.g. "https")
+
+  # Envoy Gateway SecurityPolicy — rate limiting (CORS is unlikely to ever
+  # be needed — no browser-facing surface — kept for structural parity).
+  # Requires gateway.envoyproxy.io/v1alpha1 CRD (Envoy Gateway v0.6+).
+  securityPolicy:
+    enabled: false
+    cors:
+      enabled: false
+      allowOrigins: []
+      allowMethods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      allowHeaders:
+        - Authorization
+        - Content-Type
+        - X-Tenant-ID
+        - X-User-ID
+      maxAge: "86400"
+    rateLimit:
+      enabled: false
+      requestsPerUnit: 1000
+      unit: Second          # Second | Minute | Hour
+
+  # Classic Ingress (type: Ingress)
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls: []
+  #  - secretName: iam-token-service-tls
+  #    hosts:
+  #      - iam-token-service.internal.example.com
 
 # database: platform-pgcommon config (§4, §12). DATABASE_URL /
 # MIGRATION_DATABASE_URL / RECONCILER_DATABASE_URL are supplied via

@@ -1,0 +1,171 @@
+# SLO recording + burn-rate alerts for iam-token-service.
+#
+# ⚠ DRAFT — UNREVIEWED. Ported from iam-org-membership's slo-rules.yml
+# shape (recording rules + multi-window multi-burn-rate alerts, SRE book
+# Ch. 5) at the user's request, but the three targets below (30ms/99.9%/
+# 2-cycle-style numbers) are illustrative placeholders, not agreed product
+# or SRE commitments — nobody has reviewed or signed off on them. Treat
+# every percentage/duration/threshold here as "adjust before relying on
+# this," not as an established target. The metric names and job labels ARE
+# real (cross-checked against deploy/monitoring/app-alerts.yml, this
+# service's existing threshold-alert file, which remains the reviewed
+# source of truth until this file is).
+#
+# Three SLOs are declared:
+#
+#  SLO-1  TS-1 issue/rotate hot-path latency
+#         Target (placeholder): 99% of credential issue/rotate requests
+#         complete within 500ms. This path does a material-first OpenBao
+#         write before the Postgres commit (§6.2) — compare against
+#         IAMTokenServiceOpenBaoCallLatencyHigh's existing 5s p99 bar in
+#         app-alerts.yml, which is deliberately looser (that alert exists
+#         to catch OpenBao itself being slow, not to define the
+#         end-to-end SLO).
+#
+#  SLO-2  Write-path error rate
+#         Target (placeholder): 99.9% of mutating requests (TS-1 issue/
+#         rotate, TS-2 revoke, TS-4 register) return a non-5xx status.
+#         Mirrors IAMTokenServiceHighErrorRate's flat 5%-over-5m alert in
+#         app-alerts.yml, expressed as an error-budget burn instead.
+#
+#  SLO-3  Rotation sweep convergence
+#         Target (placeholder): 99% of §8.3 overlap-expiry sweep CronJob
+#         runs (schedule: rotator.schedule, default */5 * * * *, §8.3)
+#         complete without an error result. Distinct from
+#         IAMTokenServiceRotationSweepFailures (app-alerts.yml), which
+#         fires on ANY error in 1h — this tracks the success ratio as a
+#         budget instead of a raw count.
+#
+# Recording rules pre-compute the SLI numerator/denominator so alert rules
+# can key off a scalar. Alerts follow the multi-window multi-burn-rate
+# pattern (SRE book Ch. 5): a slow burn signals an ongoing degradation,
+# a fast burn signals an outage worth paging on.
+
+groups:
+  # ── SLI recording ───────────────────────────────────────────────────────
+  - name: iam-token-service.slo.records
+    interval: 30s
+    rules:
+      # TS-1 issue/rotate latency histogram → error budget window.
+      # Assumes the gincommon middleware exposes http_request_duration_seconds
+      # bucketed histogram with a "path" label matching the route pattern.
+      - record: iam_token_service:ts1_latency_sli:ratio_rate_5m
+        expr: |
+          sum(rate(http_request_duration_seconds_bucket{
+            job="iam-token-service-server",
+            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+            le="0.5"
+          }[5m]))
+          /
+          clamp_min(sum(rate(http_request_duration_seconds_count{
+            job="iam-token-service-server",
+            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+          }[5m])), 0.001)
+
+      - record: iam_token_service:ts1_latency_sli:ratio_rate_1h
+        expr: |
+          sum(rate(http_request_duration_seconds_bucket{
+            job="iam-token-service-server",
+            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+            le="0.5"
+          }[1h]))
+          /
+          clamp_min(sum(rate(http_request_duration_seconds_count{
+            job="iam-token-service-server",
+            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+          }[1h])), 0.001)
+
+      # Write-path error rate (5xx only — 4xx like credential_replay_revoked
+      # 409 or optimistic_lock_conflict are intentional, §17).
+      - record: iam_token_service:write_error_rate:ratio_rate_5m
+        expr: |
+          sum(rate(http_requests_total{
+            job="iam-token-service-server",
+            method=~"POST|PUT|PATCH|DELETE",
+            status=~"5.."
+          }[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total{
+            job="iam-token-service-server",
+            method=~"POST|PUT|PATCH|DELETE"
+          }[5m])), 0.001)
+
+      # Rotation sweep success ratio (§8.3) — result label matches
+      # IAMTokenServiceRotationSweepFailures' iam_token_service_rotation_sweep_total.
+      - record: iam_token_service:sweep_success_rate:ratio_rate_1h
+        expr: |
+          sum(rate(iam_token_service_rotation_sweep_total{
+            job="iam-token-service-rotator",
+            result!="error"
+          }[1h]))
+          /
+          clamp_min(sum(rate(iam_token_service_rotation_sweep_total{
+            job="iam-token-service-rotator"
+          }[1h])), 0.001)
+
+  # ── SLO burn-rate alerts (multi-window) ─────────────────────────────────
+  - name: iam-token-service.slo.burn
+    interval: 1m
+    rules:
+      # SLO-1: fast burn on TS-1 latency (2% budget in 1h → page).
+      - alert: IAMTokenServiceSLO1_TS1LatencyFastBurn
+        expr: |
+          (1 - iam_token_service:ts1_latency_sli:ratio_rate_5m) > (14.4 * (1 - 0.99))
+          and
+          (1 - iam_token_service:ts1_latency_sli:ratio_rate_1h) > (14.4 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-1
+          team: platform
+        annotations:
+          summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 latency degraded (placeholder target — see file header)"
+          description: |
+            TS-1 (issue/rotate) is missing the placeholder 500ms target for
+            {{ $value | humanizePercentage }} of requests over the last
+            5m + 1h windows. Check
+            iam_token_service_openbao_call_duration_seconds{op} first (§6.2
+            material-first write) and Postgres query latency second.
+
+      # SLO-1: slow burn (5% budget in 24h → ticket).
+      - alert: IAMTokenServiceSLO1_TS1LatencySlowBurn
+        expr: |
+          (1 - iam_token_service:ts1_latency_sli:ratio_rate_1h) > (6 * (1 - 0.99))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-1
+          team: platform
+        annotations:
+          summary: "SLO-1 slow-burn: TS-1 latency below placeholder target for 15m+"
+
+      # SLO-2: write-path 5xx spike.
+      - alert: IAMTokenServiceSLO2_WriteErrorRateFastBurn
+        expr: iam_token_service:write_error_rate:ratio_rate_5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-2
+          team: platform
+        annotations:
+          summary: "SLO-2 fast-burn: write-path 5xx rate above placeholder target"
+          description: |
+            {{ $value | humanizePercentage }} of mutating requests are
+            returning 5xx. Likely Postgres or OpenBao failure — cross-reference
+            IAMTokenServiceOpenBaoCallLatencyHigh and /readyz.
+
+      # SLO-3: rotation sweep success ratio degraded.
+      - alert: IAMTokenServiceSLO3_SweepSuccessRateLow
+        expr: iam_token_service:sweep_success_rate:ratio_rate_1h < 0.99
+        for: 20m
+        labels:
+          severity: ticket
+          slo: SLO-3
+          team: platform
+        annotations:
+          summary: "SLO-3: §8.3 overlap-expiry sweep success ratio below placeholder target"
+          description: |
+            Sweep success ratio = {{ $value | humanizePercentage }} over the
+            last hour (for 20m+). Check the rotator CronJob logs — this
+            complements IAMTokenServiceRotationSweepFailures (app-alerts.yml),
+            which fires on any single error rather than a sustained ratio.

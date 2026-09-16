@@ -1,0 +1,45 @@
+{{- if and .Values.ingress.enabled (eq (.Values.ingress.type | default "Ingress") "HTTPRoute") }}
+# Disabled by default (ingress.enabled: false) — see ingress.yaml's note.
+#
+# Gateway API HTTPRoute — attach to an Envoy Gateway (or any Gateway API-compatible
+# controller) by setting ingress.gateway.name in values.yaml.
+#
+# TLS termination is configured on the Gateway listener, not here.
+# For CORS and gateway-level rate limiting, enable ingress.securityPolicy —
+# CORS is unlikely to ever be needed here (this service has no
+# browser-facing surface, all routes are /api/v1/internal/*), kept only for
+# structural parity with the sibling IAM services' chart shape.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ required "ingress.gateway.name is required when ingress.type is HTTPRoute" .Values.ingress.gateway.name }}
+      {{- with .Values.ingress.gateway.namespace }}
+      namespace: {{ . }}
+      {{- end }}
+      {{- with .Values.ingress.gateway.sectionName }}
+      sectionName: {{ . }}
+      {{- end }}
+  {{- if .Values.ingress.hosts }}
+  hostnames:
+    {{- range .Values.ingress.hosts }}
+    - {{ .host | quote }}
+    {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    {{- range .paths }}
+    - matches:
+        - path:
+            type: {{ .pathType | default "PathPrefix" }}
+            value: {{ .path | quote }}
+      backendRefs:
+        - name: {{ include "iam-token-service.fullname" $ }}-server
+          port: {{ $.Values.service.port }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
