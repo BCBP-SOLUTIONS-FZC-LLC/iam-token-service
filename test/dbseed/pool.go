@@ -144,6 +144,7 @@ func (r *bufferedRows) Err() error                                   { return r.
 func (r *bufferedRows) CommandTag() pgconn.CommandTag                { return r.tag }
 func (r *bufferedRows) FieldDescriptions() []pgconn.FieldDescription { return r.fields }
 func (r *bufferedRows) Conn() *pgx.Conn                              { return nil }
+func (r *bufferedRows) TypeMap() *pgtype.Map                         { return r.m }
 
 func (r *bufferedRows) Next() bool {
 	if r.closed {
