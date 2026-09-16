@@ -1,0 +1,45 @@
+%% cmd/rotator — run-to-completion CronJob (LLD §8.3, §8.6). Connects as
+%% serviceaccount_reconciler (BYPASSRLS, SELECT-only, no GUCProvider) for
+%% cross-tenant enumeration, then opens normal RLS-scoped
+%% serviceaccount_app transactions for the actual per-tenant writes
+%% (§4.3/RLS-7) — reconciler_jobs may not depend on the service layer.
+flowchart TD
+    START(["CronJob fires<br/>(one binary invocation)"])
+    START --> SWEEP
+
+    subgraph SWEEP["1. Overlap-expiry sweep (§8.3)"]
+        S1["ReconcilerRepository.ListExpiredRotating()<br/>BYPASSRLS — cross-tenant, status=rotating<br/>AND expires_at < now()"]
+        S2["for each row: open serviceaccount_app tx,<br/>UPDATE status=revoked, delete OpenBao material"]
+        S3["metrics.RotationSweepTotal{result}"]
+        S1 --> S2 --> S3
+    end
+
+    SWEEP --> RECON
+
+    subgraph RECON["2. Orphan-material reconciler (§8.6)"]
+        R1["ReconcilerRepository.ListPrincipalMaterialStates()<br/>BYPASSRLS — every principal's committed<br/>credential versions across all tenants"]
+        R2["OpenBao List(tenant/client prefix)<br/>enumerate actual KV v2 entries"]
+        R3{"material vs registry"}
+        R4["orphan_deleted:<br/>OpenBao path with no matching<br/>committed version → Delete"]
+        R5["missing_material:<br/>committed version with no<br/>OpenBao entry → page (data loss)"]
+        R6["ok: match"]
+        R1 --> R2 --> R3
+        R3 -->|extra in OpenBao| R4
+        R3 -->|missing in OpenBao| R5
+        R3 -->|consistent| R6
+        R4 & R5 & R6 --> R7["metrics.MaterialReconcileTotal{result}"]
+    end
+
+    RECON --> PRUNE
+
+    subgraph PRUNE["3. Retention prune"]
+        P1["processed_events.Prune(ttlDays, limit)<br/>batched DELETE, > 8-day SQS lifetime"]
+        P2["outbox prune via platform-events"]
+        P1 --> P2
+    end
+
+    PRUNE --> DONE(["Exit — Kubernetes recreates the Pod<br/>on the next schedule"])
+
+    style S1 fill:#e8f4fc,stroke:#2980b9
+    style R1 fill:#e8f4fc,stroke:#2980b9
+    style R5 fill:#fce8e6,stroke:#c0392b

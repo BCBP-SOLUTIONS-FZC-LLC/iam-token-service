@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# docker-compose's `secrets.go_private_token.file` — a real GitHub PAT with
+# read access to the private BCBP-SOLUTIONS-FZC-LLC Go modules, never committed.
+.go_private_token
+
+# make test-ci coverage output, bin/ build artifacts
+.coverage/
+bin/
+
 # Editor/IDE
 # .idea/
 # .vscode/

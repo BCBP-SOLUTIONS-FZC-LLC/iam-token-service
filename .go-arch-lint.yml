@@ -1,0 +1,177 @@
+version: 3
+workdir: .
+
+allow:
+  depOnAnyVendor: true
+  # Deep-scan follows method calls through the composition root and flags
+  # every DI wire (e.g. cmd passing an outbound adapter to a service
+  # constructor) as a cross-layer dependency. That's how Clean Architecture
+  # is supposed to work in main.go — keep import-level checks only.
+  deepScan: false
+
+# Tests, dev scripts, and deploy manifests are not part of the runtime
+# architecture. Excluding them keeps the linter focused on production code.
+exclude:
+  - test
+  - scripts
+  - deploy
+
+excludeFiles:
+  - '.*_test\.go$'
+
+components:
+  domain:
+    in: internal/core/domain
+
+  port:
+    in: internal/core/port
+
+  service:
+    in: internal/core/service
+
+  requestctx:
+    in: pkg/requestctx
+
+  # Embedded JSON schemas for the 5 published events, validated at
+  # outbox-enqueue time by the eventbus adapter's ValidatingCodec (§7.3.1).
+  eventschema:
+    in: internal/eventschema
+
+  # Embedded AsyncAPI spec asset (api/asyncapi.yaml, api/embed.go) — single
+  # source of truth for the event contract (§7.3).
+  apispec:
+    in: api
+
+  # Generated Swagger/OpenAPI spec (`make swag`, docs/swagger/{docs.go,
+  # swagger.json,swagger.yaml}) — self-contained generated asset, no
+  # internal deps.
+  swaggerdocs:
+    in: docs/swagger
+
+  # postgres is its own component (not folded into adapters_outbound) so
+  # OpenBao-style isolation stays one-purpose: pgcommon pool, RLS GUC, and
+  # domain repositories. Tx context helpers live on core/port (same as
+  # iam-user-profile / iam-org-membership) so eventbus never imports this
+  # package.
+  postgres:
+    in: internal/adapter/outbound/postgres
+
+  # openbao is its own component (not folded into adapters_outbound) so the
+  # TS-INV-1/no-gocloak structural boundary has a clean, single-purpose
+  # counterpart on the OpenBao side — KV v2 custody only (§6.3, §10.5).
+  openbao:
+    in: internal/adapter/outbound/openbao
+
+  # Cross-cutting Prometheus counters. Not a business adapter —
+  # instrumentation is imported by inbound consumers (skipDuplicate /
+  # ackUnknown) and the composition root, matching iam-user-profile /
+  # iam-org-membership.
+  observability:
+    in: internal/adapter/outbound/metrics
+
+  adapters_outbound:
+    in:
+      - internal/adapter/outbound/eventbus
+
+  adapters_inbound:
+    in:
+      - internal/adapter/inbound/http
+      - internal/adapter/inbound/consumer
+
+  reconciler_jobs:
+    in: cmd/rotator
+
+  cmd:
+    in:
+      - cmd/server
+      - cmd/consumer
+      - cmd/rotator
+
+deps:
+  # domain: no internal (project) imports — pure value types + invariants
+  # only. anyVendorDeps covers its use of google/uuid etc.
+  domain:
+    anyVendorDeps: true
+
+  # port: depends only on domain (interfaces are described in terms of
+  # domain types).
+  port:
+    mayDependOn:
+      - domain
+
+  service:
+    mayDependOn:
+      - domain
+      - port
+      - requestctx
+
+  requestctx:
+    anyVendorDeps: true
+
+  eventschema:
+    anyVendorDeps: true
+
+  apispec:
+    anyVendorDeps: true
+
+  swaggerdocs:
+    anyVendorDeps: true
+
+  observability:
+    anyVendorDeps: true
+    mayDependOn:
+      - domain
+      - port
+      - service
+
+  postgres:
+    mayDependOn:
+      - domain
+      - port
+
+  openbao:
+    mayDependOn:
+      - domain
+      - port
+
+  adapters_outbound:
+    mayDependOn:
+      - domain
+      - port
+      - service
+      - eventschema
+      - observability
+
+  adapters_inbound:
+    mayDependOn:
+      - domain
+      - port
+      - service
+      - requestctx
+      - apispec
+      - observability
+
+  reconciler_jobs:
+    mayDependOn:
+      - domain
+      - port
+      - postgres
+      - openbao
+      - observability
+      - adapters_outbound
+
+  cmd:
+    mayDependOn:
+      - domain
+      - port
+      - service
+      - requestctx
+      - eventschema
+      - apispec
+      - swaggerdocs
+      - postgres
+      - openbao
+      - adapters_inbound
+      - adapters_outbound
+      - observability
+      - reconciler_jobs

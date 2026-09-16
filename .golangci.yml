@@ -1,0 +1,17 @@
+# Minimal golangci-lint config — default linter set plus a small set of
+# additions that matter for a service handling credential material
+# (unchecked errors, unused values). Kept intentionally small; broaden as
+# the team finds value in more linters rather than front-loading strictness.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

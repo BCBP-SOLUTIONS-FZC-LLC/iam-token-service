@@ -1,0 +1,188 @@
+# Default values for iam-token-service (§12).
+
+image:
+  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-token-service
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  # annotations carries IRSA (IAM Roles for Service Accounts) — this pod
+  # identity is used for AWS access (Glue/SNS/SQS via OIDC, §13.5); OpenBao
+  # access is separately via its own Kubernetes auth method (§10.5,
+  # TS-CONFIG-3), not this annotation.
+  annotations: {}
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+server:
+  replicaCount: 2 # HA, not throughput (§13.2/§21)
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+consumer:
+  replicaCount: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+
+rotator:
+  schedule: "*/5 * * * *" # ROTATION_SWEEP_SCHEDULE (§8.3) — also drives the reconciler/prune tasks, see cmd/rotator's package doc
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Deliberately shorter than the 300s (5m) schedule interval, not equal to
+  # it: with concurrencyPolicy: Forbid, a run that legitimately used its
+  # entire budget would leave zero slack before the next scheduled tick,
+  # silently skipping it. 240s leaves a 60s margin.
+  activeDeadlineSeconds: 240
+  resources:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+
+service:
+  port: 8080
+  metricsPort: 9090
+
+# Restricts ingress to in-mesh callers only (§10.2) — Realm Provisioner,
+# O&M, the operator gateway, and this service's own rotator CronJob (which
+# never calls the server's HTTP API, but shares the mesh). No public/edge
+# route exists (§5.6). Egress is an explicit allow-list (DNS, Postgres,
+# OpenBao, AWS HTTPS for SNS/Glue, OTel) shared by every workload this
+# chart creates (server, consumer, rotator) — see
+# templates/_helpers.tpl's egressRules.
+networkPolicy:
+  enabled: true
+  # Required whenever enabled: true — a NetworkPolicy `namespaceSelector: {}`
+  # matches every namespace in the cluster, which is NOT a mesh-scoped
+  # restriction, it is no restriction at all. There is no safe default here
+  # (templates/networkpolicy.yaml fails the render if this is left empty),
+  # so every real install must set it to a real label selector, e.g.:
+  #   ingressNamespaceSelector:
+  #     matchLabels:
+  #       mesh: iam
+  # matching whatever namespace label your mesh/cluster convention uses for
+  # "in-mesh" namespaces (Realm Provisioner, O&M, the operator gateway).
+  ingressNamespaceSelector: {}
+  postgresPort: 5432
+  openbaoPort: 8200
+  otelPort: 4317
+  additionalEgressRules: []
+
+# podDisruptionBudget — ensures at least 1 pod survives voluntary
+# disruptions (node drains, cluster upgrades) on each of the server and
+# consumer Deployments. With replicaCount: 2 on both, keep minAvailable=1
+# so a single node drain doesn't take either one to zero.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# database: platform-pgcommon config (§4, §12). DATABASE_URL /
+# MIGRATION_DATABASE_URL / RECONCILER_DATABASE_URL are supplied via
+# externalSecretRef (ESO) or an existing Secret — never rendered in
+# values.yaml or committed anywhere (TS-CONFIG-1).
+database:
+  logicalName: serviceaccount
+  pgBouncerMode: true
+  existingSecretName: "" # must provide DATABASE_URL, MIGRATION_DATABASE_URL, RECONCILER_DATABASE_URL
+
+# openbao: Kubernetes auth method (§6.3, §10.5, TS-CONFIG-3) — no static
+# token, no AWS Secrets Manager permission.
+openbao:
+  addr: "https://openbao.iam.svc.cluster.local:8200"
+  authRole: iam-token-service
+  kvMount: iam
+
+# rotation: overlap-window and cadence tuning (§6.2, §8.3).
+rotation:
+  defaultOverlapSeconds: 300
+  defaultCadenceDays: 90
+
+# events: SNS/Glue (§7.3.1, §25 frozen names). topicArn and glueRegistryName
+# are supplied via env/secret in real environments — empty here means
+# dev/test without real AWS (cmd/server's buildGlueCodec/buildSNSPublisher
+# fall back to NoopCodec/a no-op publisher, never crashing the pod).
+events:
+  topic: iam-serviceaccount-events
+  source: iam-token-service
+  glueRegistryName: iam-serviceaccount-events
+  topicArn: ""
+  awsRegion: ap-south-1
+
+# outbox: platform-events runner tunables (config.LoadOutbox / OUTBOX_*).
+# Deployed defaults match iam-user-profile / LLD §7.4 (500 ms poll).
+outbox:
+  pollInterval: "500ms"
+  batchSize: 50
+  maxAttempts: 5
+  drainTimeout: "30s"
+  publishConcurrency: 4
+  publishTimeout: "10s"
+  startupJitter: "2s"
+  claimLeaseDuration: "10m"
+
+# sqs: the offboarding consumer's one inbound subscription (§7.1, §12).
+sqs:
+  offboardingQueueUrl: ""
+  offboardingConcurrency: 2
+  maxMessages: 10
+  waitSeconds: 20
+  visibilityTimeoutSeconds: 60
+
+processedEvents:
+  ttlDays: 8
+
+docs:
+  enabled: false
+  authToken: ""
+
+otel:
+  serviceName: iam-token-service
+  exporterEndpoint: ""
+
+appEnv: production
+logLevel: info
+
+# Graceful shutdown budget for the HTTP+metrics server and the outbox
+# runner's SNS-publish loop to finish in-flight work; SQS's at-least-once
+# delivery makes a redelivery safe if this is exceeded on the consumer.
+terminationGracePeriodSeconds: 30
+
+# ServiceMonitor — requires kube-prometheus-stack (monitoring.coreos.com/v1
+# CRD). PrometheusRule (alerting rules, templates/prometheusrule.yaml) is
+# also gated on this flag — no scrape means no metrics, which means every
+# alert stays permanently inactive.
+serviceMonitor:
+  enabled: true
+  interval: "30s"
+  scrapeTimeout: "10s"
+  additionalLabels: {}
+  relabelings: []
+  namespaceSelector: {}
+
+existingSecret: ""
+
+# rotationEpoch — used only when existingSecret (or
+# database.existingSecretName) is set. Bump this value to trigger a
+# rolling restart after an external secret is rotated:
+#   helm upgrade ... --set rotationEpoch=$(date +%s)
+rotationEpoch: "0"
+
+secretValues: {}

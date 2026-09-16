@@ -1,0 +1,74 @@
+package metrics
+
+import (
+	"context"
+	"time"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
+)
+
+// InstrumentedSecretStore wraps a port.SecretStore and records call
+// duration around Write and Delete — the two ops §11.2 freezes labels for
+// — on both the legacy Tier-3 iam_token_service_openbao_call_duration_seconds{op}
+// and the registry-proposed Tier-1 platform_dependency_request_seconds{dependency="openbao",operation}
+// (Enterprise Platform Observability Standard, dual-emitted during the
+// compatibility period). Read and List pass through unmeasured (TS-1's
+// rotation_id-replay Read is rare and not part of the frozen op label set;
+// List is the §8.6 reconciler's own enumeration, already covered by
+// iam_token_service_material_reconcile_total).
+//
+// Defined in the metrics package (not on openbao.Client itself) because
+// the openbao adapter component may depend only on domain/port
+// (.go-arch-lint.yml) — this decorator depends on port only, so any
+// port.SecretStore implementation can be wrapped, not just OpenBao's.
+type InstrumentedSecretStore struct {
+	inner port.SecretStore
+}
+
+// NewInstrumentedSecretStore wraps inner with call-duration instrumentation.
+func NewInstrumentedSecretStore(inner port.SecretStore) *InstrumentedSecretStore {
+	return &InstrumentedSecretStore{inner: inner}
+}
+
+var _ port.SecretStore = (*InstrumentedSecretStore)(nil)
+
+// Write delegates to inner, recording write call duration.
+func (s *InstrumentedSecretStore) Write(ctx context.Context, path string, secret string) error {
+	start := time.Now()
+	err := s.inner.Write(ctx, path, secret)
+	observeOpenBaoCall("write", time.Since(start).Seconds())
+	return err
+}
+
+// Read delegates to inner, unmeasured (see package doc).
+func (s *InstrumentedSecretStore) Read(ctx context.Context, path string) (string, error) {
+	return s.inner.Read(ctx, path)
+}
+
+// Delete delegates to inner, recording delete call duration.
+func (s *InstrumentedSecretStore) Delete(ctx context.Context, path string) error {
+	start := time.Now()
+	err := s.inner.Delete(ctx, path)
+	observeOpenBaoCall("delete", time.Since(start).Seconds())
+	return err
+}
+
+// List delegates to inner, unmeasured (see package doc).
+func (s *InstrumentedSecretStore) List(ctx context.Context, pathPrefix string) ([]string, error) {
+	return s.inner.List(ctx, pathPrefix)
+}
+
+// observeOpenBaoCall records elapsed seconds on both the legacy Tier-3
+// OpenBaoCallDuration and the registry-proposed Tier-1
+// DependencyRequestDuration. Nil-checked (matching dedup.go's defensive
+// style) so a decorator constructed before Register runs — e.g. in a test
+// that forgets to call it — degrades to a no-op instead of a nil-pointer
+// panic.
+func observeOpenBaoCall(op string, elapsedSeconds float64) {
+	if OpenBaoCallDuration != nil {
+		OpenBaoCallDuration.WithLabelValues(op).Observe(elapsedSeconds)
+	}
+	if DependencyRequestDuration != nil {
+		DependencyRequestDuration.WithLabelValues("openbao", op).Observe(elapsedSeconds)
+	}
+}

@@ -1,0 +1,18 @@
+apiVersion: v2
+name: iam-token-service
+description: Token Service for the IAM stack — credential lifecycle (issue/rotate/revoke) for the per-tenant platform-automation service-account principal (TS-1..TS-4, the TenantMembershipsPurged offboarding cascade, the overlap-expiry sweep and orphan-material reconciler)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.28.0"
+keywords:
+  - iam
+  - token-service
+  - credentials
+  - service-account
+home: https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service
+sources:
+  - https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service
+maintainers:
+  - name: BCBP Solutions IAM Team
+    email: platform@bcbpsolutions.com

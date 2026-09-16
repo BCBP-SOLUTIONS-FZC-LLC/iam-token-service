@@ -1,0 +1,42 @@
+%% TenantMembershipsPurged consumer (LLD §7.1, §8.4). One active inbound
+%% subscription. Idempotent via processed_events keyed on envelope id.
+%% Unknown event types and malformed envelope ids are acked, never
+%% retried (ackUnknown / dedup.go) — a producer schema addition must
+%% never DLQ-storm this queue.
+sequenceDiagram
+    participant SQS as tenant-lifecycle-tokensvc-q
+    participant C as OffboardingConsumer.Handle
+    participant PE as processed_events
+    participant PRIN as service_account_principals
+    participant CRED as service_account_credentials
+    participant BAO as OpenBao KV v2
+    participant PUB as outbox_events
+
+    SQS->>C: TenantMembershipsPurged{tenant_id}
+    C->>C: validate envelope id (missing/invalid → ack, log, return nil)
+    alt event type != TenantMembershipsPurged
+        C->>PE: ackUnknown: MarkProcessed + metric + info log
+        C-->>SQS: ack (forward-compat, no DLQ storm)
+    else known type
+        C->>PE: IsProcessed(envelope.id)?
+        alt already processed
+            PE-->>C: true
+            C-->>SQS: ack, no-op (idempotent redelivery)
+        else first delivery
+            PE-->>C: false
+            C->>C: bind GUC: tenant_id + SystemPrincipalID
+            C->>PRIN: ListByTenant(tenant_id)
+            PRIN-->>C: principals
+            loop each principal
+                C->>CRED: ListByPrincipal(tenant_id, principal_id)
+                CRED-->>C: credential rows (collect OpenBao paths)
+            end
+            loop each collected path
+                C->>BAO: Delete(path) — material-first (§9.3, §15.2)
+            end
+            C->>PRIN: RunInTx:<br/>DeleteByTenant (FK-cascades credentials)<br/>MarkProcessed(envelope.id)<br/>per-principal: enqueue ServiceAccountRevoked
+            PRIN-->>C: committed
+            C-->>SQS: ack
+        end
+    end
+    Note over BAO,PRIN: Delete-material-before-DB-commit is deliberate:<br/>once the principal row is gone, the §8.6 orphan reconciler<br/>(which enumerates the LIVE registry) can never find this<br/>tenant's material again — DB-first ordering could leak it forever.

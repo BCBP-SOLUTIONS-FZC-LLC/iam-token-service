@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-server
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  # No local disk state and no long-running in-flight work beyond a single
+  # HTTP request or outbox-publish batch, but maxSurge: 0 with hard pod
+  # anti-affinity below still means a rolling update never has 0 AND never
+  # exceeds replicaCount pods scheduled at once (§13.2 — HA, not throughput).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.service.metricsPort | quote }}
+        prometheus.io/path: /metrics
+        {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- else }}
+        rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Spreads server replicas across nodes so a single node loss/drain
+      # cannot take out more than one replica at a time — matches
+      # maxUnavailable: 1 above (§13.2 HA).
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/iam-token-service-server"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+          env:
+            {{- include "iam-token-service.commonEnv" . | nindent 12 }}
+            - name: APP_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.service.metricsPort | quote }}
+            - name: ROTATION_DEFAULT_OVERLAP_SECONDS
+              value: {{ .Values.rotation.defaultOverlapSeconds | quote }}
+            - name: ROTATION_DEFAULT_CADENCE_DAYS
+              value: {{ .Values.rotation.defaultCadenceDays | quote }}
+            - name: GLUE_REGISTRY_NAME
+              value: {{ .Values.events.glueRegistryName | quote }}
+            - name: SNS_TOPIC_ARN
+              value: {{ .Values.events.topicArn | quote }}
+            - name: SNS_TOPIC_SERVICEACCOUNT_ARN
+              value: {{ .Values.events.topicArn | quote }}
+            - name: OUTBOX_POLL_INTERVAL
+              value: {{ .Values.outbox.pollInterval | quote }}
+            - name: OUTBOX_BATCH_SIZE
+              value: {{ .Values.outbox.batchSize | quote }}
+            - name: OUTBOX_MAX_ATTEMPTS
+              value: {{ .Values.outbox.maxAttempts | quote }}
+            - name: OUTBOX_DRAIN_TIMEOUT
+              value: {{ .Values.outbox.drainTimeout | quote }}
+            - name: OUTBOX_PUBLISH_CONCURRENCY
+              value: {{ .Values.outbox.publishConcurrency | quote }}
+            - name: OUTBOX_PUBLISH_TIMEOUT
+              value: {{ .Values.outbox.publishTimeout | quote }}
+            - name: OUTBOX_STARTUP_JITTER
+              value: {{ .Values.outbox.startupJitter | quote }}
+            - name: OUTBOX_CLAIM_LEASE_DURATION
+              value: {{ .Values.outbox.claimLeaseDuration | quote }}
+            - name: DOCS_ENABLED
+              value: {{ .Values.docs.enabled | quote }}
+            {{- if .Values.docs.authToken }}
+            - name: DOCS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecretName | default (include "iam-token-service.secretName" .) }}
+                  key: DOCS_AUTH_TOKEN
+            {{- end }}
+          # Covers a slow cold start (Postgres pool warmup, OpenBao
+          # Kubernetes-auth login) before liveness/readiness take over.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 0
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 0
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      # Required under securityContext.readOnlyRootFilesystem: true — any
+      # incidental temp-file write (e.g. Go's os.CreateTemp) needs a writable
+      # path.
+      volumes:
+        - name: tmp
+          emptyDir: {}

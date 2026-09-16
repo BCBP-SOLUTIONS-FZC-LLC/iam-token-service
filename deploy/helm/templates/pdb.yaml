@@ -1,0 +1,29 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# minAvailable: 1 keeps a single node drain/upgrade from taking either
+# Deployment to zero, given replicaCount: 2 (§13.2 — HA, not throughput).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-server
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-consumer
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consumer
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+{{- end }}

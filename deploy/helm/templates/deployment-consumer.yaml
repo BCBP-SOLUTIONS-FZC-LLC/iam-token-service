@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-consumer
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consumer
+spec:
+  replicas: {{ .Values.consumer.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.service.metricsPort | quote }}
+        prometheus.io/path: /metrics
+        {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- else }}
+        rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: consumer
+          image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/iam-token-service-consumer"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+          env:
+            {{- include "iam-token-service.commonEnv" . | nindent 12 }}
+            - name: APP_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.service.metricsPort | quote }}
+            - name: SQS_QUEUE_URL
+              value: {{ .Values.sqs.offboardingQueueUrl | quote }}
+            - name: SQS_OFFBOARDING_QUEUE_URL
+              value: {{ .Values.sqs.offboardingQueueUrl | quote }}
+            - name: SQS_CONCURRENCY
+              value: {{ .Values.sqs.offboardingConcurrency | quote }}
+            - name: SQS_OFFBOARDING_CONCURRENCY
+              value: {{ .Values.sqs.offboardingConcurrency | quote }}
+            - name: SQS_MAX_MESSAGES
+              value: {{ .Values.sqs.maxMessages | quote }}
+            - name: SQS_WAIT_SECONDS
+              value: {{ .Values.sqs.waitSeconds | quote }}
+            - name: SQS_VISIBILITY_TIMEOUT
+              value: {{ printf "%ds" (.Values.sqs.visibilityTimeoutSeconds | int) | quote }}
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 0
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 0
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.consumer.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

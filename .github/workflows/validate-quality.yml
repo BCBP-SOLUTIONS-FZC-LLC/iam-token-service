@@ -1,0 +1,143 @@
+# Reusable workflow — quality gate.
+# fmt · tidy · vet · lint · govulncheck · gosec (SAST) · Dockerfile check ·
+# invariant gates (TS-INV-1 no-gocloak, TS-INV-2 no-secret-log, RLS-6
+# SET-LOCAL-only).
+# Called by ci.yml and release.yml. Must pass before push; does not gate
+# coverage, trivy, or smoke (those only need validate-test.yml).
+name: Validate / Quality
+
+"on":
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (leave empty to use the caller ref)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Configure private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      # Workflow files must use literal operators, not HTML entity encodings.
+      - name: Reject HTML-escaped operators in workflow files
+        run: |
+          if grep -REn '&(gt|lt|amp)' .github/workflows/ .github/scripts/; then
+            echo "::error::Workflow or script files contain HTML entities. Use literal operators instead."
+            exit 1
+          fi
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Tidy check
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error file=go.mod,title=Module drift::go.mod or go.sum is stale — run 'go mod tidy' and commit the result."
+            exit 1
+          fi
+
+      - name: Vet
+        run: make vet
+
+      # Wired as a `tool` directive in go.mod (`make setup`/`make lint`
+      # resolve the same way locally, via the pre-commit hook) — using
+      # `go tool golangci-lint` here instead of the golangci-lint-action
+      # keeps CI and local dev on exactly the same pinned version, with no
+      # separate action-managed download to drift out of sync.
+      - name: Lint
+        run: make lint
+
+      # Fails if handler annotation changes weren't followed by `make swag`
+      # (§5.5) — docs/swagger/ is checked in, not generated at build time.
+      - name: Swagger docs up to date
+        run: make swag-check
+
+      # AsyncAPI structural/lifecycle validation — no AWS required (§7.3.1,
+      # docker run against the pinned platform-schemagov image).
+      - name: AsyncAPI schema validation
+        run: make schema-validate
+
+      # Invariant gates (§25, TS-INV-1/TS-INV-2/RLS-6):
+      #   TS-INV-1 — no Keycloak Admin API dependency anywhere in this repo.
+      #   TS-INV-2 — no credential/secret field name reaches a log sink.
+      #   RLS-6    — app.tenant_id is only ever bound via a transaction-local
+      #              SET LOCAL (pgcommon.WithGUCSet/GUCSetFromContext), never
+      #              a session-scoped SET.
+      #   gincommon-obs — logs/metrics/traces enter only via platform-gincommon
+      #              (Zap logger.NewLogger, MetricsRegisterer, InitTracingFromEnv).
+      #   metrics-taxonomy — every metric this service defines complies with
+      #              the Enterprise Platform Observability Standard's
+      #              namespace classification (platform_/iam_ prefix) and
+      #              naming rules (counter _total, histogram _seconds, no
+      #              service name leaked into a shared metric name).
+      - name: Invariant gates (no-gocloak, no-secret-log, SET-LOCAL-only, gincommon-obs, metrics-taxonomy)
+        run: make gates
+
+      - name: Vulnerability check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.3
+          if ! govulncheck ./...; then
+            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'govulncheck ./...' locally to view details."
+            exit 1
+          fi
+
+      # SAST (Go source-code static analysis) — distinct from the check
+      # above (known-CVE dependency versions) and the release pipeline's
+      # Trivy scan (OS/container package CVEs): this is the one gate that
+      # looks for code-level issues (hardcoded credentials, unsafe
+      # deserialization, command injection, etc.) in this service's own
+      # source. Wired as a `tool` directive in go.mod, same rationale as
+      # golangci-lint above.
+      - name: SAST (gosec)
+        run: make sast
+
+      # Softened to a warning, not a hard gate: the Dockerfile's base images
+      # (golang:1.26.6-bookworm, distroless/static-debian12:nonroot) are not
+      # yet digest-pinned. A floating tag can be silently overwritten
+      # upstream, breaking supply-chain guarantees — pin both to @sha256:...
+      # and flip this to ::error once that's done.
+      - name: Dockerfile base image digest check
+        run: |
+          if grep -E '^FROM [^ @]+:[^ @]+( AS .+)?$' Dockerfile; then
+            echo "::warning file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines are not digest-pinned (e.g. golang:1.26.6-bookworm@sha256:...). Tracked as a known gap, not yet a blocking gate."
+          else
+            echo "Dockerfile base images are digest-pinned."
+          fi

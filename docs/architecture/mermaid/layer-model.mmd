@@ -1,0 +1,71 @@
+%% Clean Architecture layers per .go-arch-lint.yml. Arrows point inward
+%% (outer layers depend on inner layers, never the reverse). cmd/rotator
+%% (reconciler_jobs) is deliberately barred from depending on service —
+%% it talks to postgres/openbao directly under BYPASSRLS (§4.3/RLS-7).
+graph TD
+    subgraph cmd["cmd/* — composition roots"]
+        SERVER["cmd/server<br/>HTTP API + outbox runner"]
+        CONSUMER["cmd/consumer<br/>offboarding SQS subscriber"]
+        ROTATOR["cmd/rotator<br/>sweep + reconciler + prune CronJob"]
+    end
+
+    subgraph inbound["adapters_inbound"]
+        HTTP["internal/adapter/inbound/http<br/>Gin handlers, GUC bridge middleware"]
+        CONS["internal/adapter/inbound/consumer<br/>OffboardingConsumer, dedup"]
+    end
+
+    subgraph outbound["adapters_outbound"]
+        EVENTBUS["internal/adapter/outbound/eventbus<br/>Publisher, ValidatingCodec, GlueCodec"]
+    end
+
+    subgraph isolated["single-purpose outbound components"]
+        POSTGRES["postgres<br/>repositories, RLS GUC binding, TxRunner"]
+        OPENBAO["openbao<br/>KV v2 client, Kubernetes auth"]
+        OBS["observability<br/>Prometheus metrics"]
+    end
+
+    subgraph core["internal/core"]
+        SERVICE["service<br/>CredentialService, tracing"]
+        PORT["port<br/>repository + adapter interfaces"]
+        DOMAIN["domain<br/>Credential, Principal, Event, errors"]
+    end
+
+    REQCTX["pkg/requestctx"]
+    ESCHEMA["internal/eventschema<br/>embedded JSON Schemas"]
+    APISPEC["api<br/>embedded asyncapi.yaml"]
+    SWAGGERDOCS["docs/swagger<br/>generated OpenAPI"]
+
+    SERVER --> HTTP
+    SERVER --> POSTGRES
+    SERVER --> OPENBAO
+    SERVER --> EVENTBUS
+    SERVER --> SWAGGERDOCS
+    SERVER --> APISPEC
+    CONSUMER --> CONS
+    CONSUMER --> POSTGRES
+    CONSUMER --> OPENBAO
+    ROTATOR --> POSTGRES
+    ROTATOR --> OPENBAO
+    ROTATOR --> EVENTBUS
+    ROTATOR --> OBS
+
+    HTTP --> SERVICE
+    CONS --> PORT
+    CONS --> OBS
+    EVENTBUS --> SERVICE
+    EVENTBUS --> ESCHEMA
+    POSTGRES --> PORT
+    OPENBAO --> PORT
+    OBS --> SERVICE
+
+    SERVICE --> PORT
+    SERVICE --> DOMAIN
+    SERVICE --> REQCTX
+    PORT --> DOMAIN
+
+    HTTP --> REQCTX
+    HTTP --> APISPEC
+
+    style ROTATOR fill:#fce8e6,stroke:#c0392b
+    style SERVICE fill:#e8f4fc,stroke:#2980b9
+    style DOMAIN fill:#eafaf1,stroke:#27ae60

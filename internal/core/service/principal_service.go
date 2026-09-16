@@ -1,0 +1,145 @@
+package service
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
+)
+
+// PrincipalService implements TS-4 (register) and TS-3 (read metadata)
+// (§5.4, §8.1, §8.5).
+type PrincipalService struct {
+	principals  port.PrincipalRepository
+	credentials port.CredentialRepository
+	tx          port.TxRunner
+}
+
+// NewPrincipalService wires PrincipalService's dependencies.
+func NewPrincipalService(principals port.PrincipalRepository, credentials port.CredentialRepository, tx port.TxRunner) *PrincipalService {
+	return &PrincipalService{principals: principals, credentials: credentials, tx: tx}
+}
+
+// RegisterRequest is the TS-4 request body (§5.4). Supplied by the Realm
+// Provisioner after it mints the `platform-automation` Keycloak client;
+// this service never generates principal_sub (TS-INV-1).
+type RegisterRequest struct {
+	PrincipalSub     uuid.UUID
+	KeycloakClientID string
+}
+
+// RegisterResult is the TS-4 response body (§5.4). Created is false on an
+// idempotent repeat (§5.4 — 200 rather than 201).
+type RegisterResult struct {
+	PrincipalID   uuid.UUID
+	TenantID      uuid.UUID
+	PrincipalType domain.PrincipalType
+	Status        domain.PrincipalStatus
+	RecordVersion int
+	Created       bool
+}
+
+// Register implements TS-4 (§5.4, §8.1): idempotent create on
+// (tenant_id, principal_type) — a repeat call returns the existing
+// principal rather than erroring. principal_sub is stored verbatim
+// (RP-supplied, never generated here); keycloak_client_id is validated
+// against the frozen platform-automation value at MVP (§10.3).
+func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req RegisterRequest, actor uuid.UUID) (*RegisterResult, error) {
+	if req.PrincipalSub == uuid.Nil {
+		return nil, domain.NewError(domain.ErrInvalidRequest, "principal_sub is required").
+			WithDetails(map[string]any{"field": "principal_sub"})
+	}
+	if req.KeycloakClientID != domain.KeycloakClientPlatformAutomation {
+		return nil, domain.NewError(domain.ErrInvalidRequest, "keycloak_client_id must be 'platform-automation' at MVP").
+			WithDetails(map[string]any{"field": "keycloak_client_id"})
+	}
+
+	candidate := &domain.ServiceAccountPrincipal{
+		TenantID: tenantID, PrincipalSub: req.PrincipalSub, KeycloakClientID: req.KeycloakClientID,
+		PrincipalType: domain.PrincipalTypePlatformAutomation,
+	}
+
+	var result *domain.ServiceAccountPrincipal
+	var created bool
+	err := s.tx.RunInTx(ctx, func(ctx context.Context) error {
+		var err error
+		result, created, err = s.principals.Register(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		if !created {
+			return nil
+		}
+		pub, ok := port.EventPublisherFromContext(ctx)
+		if !ok {
+			return nil
+		}
+		return pub.Enqueue(ctx, &domain.Event{
+			Type: domain.EventServiceAccountRegistered, TenantID: tenantID, Actor: actor,
+			Data: domain.ServiceAccountRegisteredPayload{
+				TenantID: tenantID, PrincipalID: result.ID, PrincipalSub: result.PrincipalSub,
+				KeycloakClientID: result.KeycloakClientID, PrincipalType: string(result.PrincipalType),
+				CreatedAt: result.CreatedAt.UTC().Format(time.RFC3339),
+			},
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &RegisterResult{
+		PrincipalID: result.ID, TenantID: result.TenantID, PrincipalType: result.PrincipalType,
+		Status: result.Status, RecordVersion: result.RecordVersion, Created: created,
+	}, nil
+}
+
+// CredentialSummary is one entry in ReadPrincipalResult.Credentials (§5.4
+// TS-3) — metadata only, never a secret.
+type CredentialSummary struct {
+	Version     int
+	Status      domain.CredentialStatus
+	OpenBaoPath string
+	IssuedAt    time.Time
+	ExpiresAt   *time.Time
+}
+
+// ReadPrincipalResult is the TS-3 response body (§5.4).
+type ReadPrincipalResult struct {
+	PrincipalID      uuid.UUID
+	TenantID         uuid.UUID
+	KeycloakClientID string
+	PrincipalType    domain.PrincipalType
+	Status           domain.PrincipalStatus
+	RecordVersion    int
+	Credentials      []CredentialSummary
+}
+
+// ReadPrincipal implements TS-3 (§5.4, §8.5): the principal plus its full
+// credential-version list, newest first — metadata only, never touches
+// OpenBao and never returns a secret (§5.6). This service's only
+// steady-state read path (§21).
+func (s *PrincipalService) ReadPrincipal(ctx context.Context, tenantID, principalID uuid.UUID) (*ReadPrincipalResult, error) {
+	p, err := s.principals.FindByID(ctx, tenantID, principalID)
+	if err != nil {
+		return nil, err
+	}
+	creds, err := s.credentials.ListByPrincipal(ctx, tenantID, principalID)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]CredentialSummary, 0, len(creds))
+	for _, c := range creds {
+		summaries = append(summaries, CredentialSummary{
+			Version: c.Version, Status: c.Status, OpenBaoPath: c.OpenBaoPath,
+			IssuedAt: c.IssuedAt, ExpiresAt: c.ExpiresAt,
+		})
+	}
+	return &ReadPrincipalResult{
+		PrincipalID: p.ID, TenantID: p.TenantID, KeycloakClientID: p.KeycloakClientID,
+		PrincipalType: p.PrincipalType, Status: p.Status, RecordVersion: p.RecordVersion,
+		Credentials: summaries,
+	}, nil
+}

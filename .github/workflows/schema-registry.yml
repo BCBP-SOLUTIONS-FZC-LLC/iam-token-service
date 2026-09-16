@@ -1,0 +1,785 @@
+# Auto-registers iam-token-service's 5 JSON schemas in the single-producer
+# AWS Glue Schema Registry `iam-serviceaccount-events` (§7.3.1, §25).
+#
+# Unlike a sibling service's shared tenant-events registry (co-owned with
+# another producer), this registry has exactly one producer — this
+# service — so every schema name in it belongs here. There is no
+# shared-registry exclusion list to carry through validate/diff/register/
+# prune, unlike that sibling's workflow of the same name.
+#
+# AWS access is via OIDC (§13.5 — "no long-lived keys"), not static
+# access-key secrets: `permissions: id-token: write` plus
+# `aws-actions/configure-aws-credentials`'s `role-to-assume` input.
+#
+# Source of truth for schemas
+# ────────────────────────────
+# api/asyncapi.yaml  →  internal/eventschema/*.json (§25 frozen names)
+#
+# Triggers:
+#   pull_request → main (schema files changed)    → pr-check  (validate + diff; read-only)
+#   push → main  (schema files changed)           → staging   (validate + diff + register)
+#   release published                             → production
+#   workflow_dispatch                              → chosen environment
+#
+# Step order — staging / production jobs (full pipeline):
+#   1. Validate schemas        — schema-gov validate (JSON syntax, draft-07 meta-schema, enum
+#                                semantic drift, lifecycle annotations, AsyncAPI coverage/structure)
+#   2. Check schema freeze     — blocks AWS steps when SCHEMA_FREEZE=true
+#   3. Configure credentials   — AWS OIDC role assumption for Glue / CloudWatch
+#   4. Detect orphaned schemas — warn on Glue schemas without a repo file (never deletes;
+#                                informational only — production execute is handled by a
+#                                separate manual workflow, not built here yet)
+#   5. Assess event usage      — Prometheus per-event activity (or skipped if PROMETHEUS_URL unset); classify ACTIVE/COLD/NEVER_SEEN
+#   6. Enforce usage→lifecycle — dormant while PROMETHEUS_URL is unset (this service's 5 events
+#                                are frozen at LLD v1.0 and pre-production, must never be auto-deprecated)
+#   7. Stage produced schemas  — copy the 5 internal/eventschema/*.json files into .tmp/glue-schemas,
+#                                renamed to their PascalCase Glue name (schema-gov diff/register need
+#                                that name, not the snake_case filename)
+#   8. Diff vs. registry       — fail on breaking changes before any upload
+#   9. Register schemas        — idempotent create/update (registry ensured inside this step)
+#  10. Update schema changelog — prepend dated entry; commit + push
+#  11. Emit metrics            — CloudWatch + Prometheus + logs (always runs)
+#
+# Step order — pr-check job (read-only):
+#   1. Validate schemas
+#   2. Configure credentials   — read-only access to staging registry
+#   3. Stage produced schemas  — see step 7 above
+#   4. Diff vs. staging registry
+#   5. Emit metrics
+#
+# Required GitHub environment variables (per environment: staging / production):
+#   AWS_REGION, AWS_ROLE_ARN (OIDC role to assume), GLUE_REGISTRY_SERVICEACCOUNT_NAME
+#
+# Optional variables:
+#   SCHEMA_FREEZE, ORPHAN_ALERT_THRESHOLD, REGISTRATIONS_SPIKE_THRESHOLD,
+#   SCHEMA_VERSIONS_ALERT_THRESHOLD, USAGE_METRIC_NAME, USAGE_METRIC_DIMENSION,
+#   USAGE_LOOKBACK_DAYS, USAGE_COLD_THRESHOLD_DAYS, UNUSED_EVENTS_ALERT_THRESHOLD
+#   PROMETHEUS_URL       — Prometheus base URL for event usage classification (--source prometheus)
+#                          if unset, usage-check runs with --source disabled and lifecycle enforcement is skipped
+#                          (deliberately unset for this pre-production service)
+#
+# Optional secrets:
+#   PUSHGATEWAY_URL, ALARM_SNS_ARN
+name: Glue Schema Registry
+
+"on":
+  pull_request:
+    branches: [main]
+    paths:
+      - 'internal/eventschema/*.json'
+      - 'api/asyncapi.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'internal/eventschema/*.json'
+      - 'api/asyncapi.yaml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+      force:
+        description: 'Force registration even if SCHEMA_FREEZE is set'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
+
+jobs:
+  # ── Staging ─────────────────────────────────────────────────────────────────
+  staging:
+    name: Register schemas → staging
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+    environment: staging
+    permissions:
+      contents: write
+      id-token: write   # OIDC — AWS role assumption, no long-lived keys (§13.5)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2    # HEAD~1 needed for the enum semantic drift check
+
+      - name: Pull schema-gov image
+        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+
+      - name: Validate schemas
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema
+
+      # Runs before AWS credentials are configured so frozen environments skip
+      # credential setup entirely. Override with force=true on workflow_dispatch.
+      - name: Check schema freeze
+        env:
+          SCHEMA_FREEZE: ${{ vars.SCHEMA_FREEZE }}
+          FORCE_REGISTRATION: ${{ inputs.force }}
+          ENVIRONMENT: staging
+        run: |
+          if [ "${SCHEMA_FREEZE:-}" = "true" ] && [ "${FORCE_REGISTRATION}" != "true" ]; then
+            echo "::error title=Schema Registry Frozen::Registration is frozen for ${ENVIRONMENT}. Lift the freeze or re-trigger with force=true."
+            exit 1
+          fi
+          [ "${FORCE_REGISTRATION}" = "true" ] && [ "${SCHEMA_FREEZE:-}" = "true" ] && \
+            echo "::warning title=Freeze Override::SCHEMA_FREEZE set on ${ENVIRONMENT} but force=true — proceeding."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Dry-run prune: lists Glue schemas without a local repo file. Never
+      # blocks CI — this registry is single-producer, so every name found
+      # here genuinely belongs to (or was retired by) this service.
+      - name: Detect orphaned schemas
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" prune \
+            --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env      staging \
+            --output   /tmp/schema-prune-metrics.json
+
+      # Source selection (v0.4+):
+      #   PROMETHEUS_URL set → --source prometheus  (no AWS needed)
+      #   not set            → --source disabled   (enforce-lifecycle no-ops)
+      #
+      # PROMETHEUS_URL is deliberately unset today: this service is
+      # pre-production (no live Prometheus) and its 5 events were frozen at
+      # LLD v1.0 sign-off — they must never be auto-deprecated just because
+      # a pre-production environment has never published them. This keeps
+      # the capability wired but dormant, not deleted.
+      - name: Assess event usage
+        env:
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+        run: |
+          if [ -n "${PROMETHEUS_URL}" ]; then
+            SOURCE_FLAGS="--source prometheus --prometheus-url ${PROMETHEUS_URL}"
+          else
+            SOURCE_FLAGS="--source disabled"
+          fi
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
+            --schema-dir  internal/eventschema \
+            ${SOURCE_FLAGS} \
+            --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
+            --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
+            --lookback    "${{ vars.USAGE_LOOKBACK_DAYS || '30' }}" \
+            --cold        "${{ vars.USAGE_COLD_THRESHOLD_DAYS || '7' }}" \
+            --output      /tmp/schema-usage-metrics.json
+
+      - name: Enforce usage → lifecycle
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" enforce-lifecycle \
+            --usage-file /tmp/schema-usage-metrics.json \
+            --asyncapi   api/asyncapi.yaml
+
+      # Stages this service's 5 produced schemas under their PascalCase Glue
+      # name (internal/eventschema/*.json is snake_case) — schema-gov
+      # diff/register need the name every other reference to these events
+      # uses (eventschema's map keys, LLD §25, api/asyncapi.yaml).
+      - name: Stage produced Glue schemas
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
+      # Fetches current Glue definition per-schema (aws CLI) then diffs via
+      # the container. Runs MAX_PARALLEL diffs concurrently; output is
+      # buffered and printed in deterministic order. Fails on any breaking
+      # change.
+      - name: Diff schemas against registry
+        env:
+          REGISTRY_NAME: ${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ENVIRONMENT: staging
+        run: |
+          TEMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+
+          diff_schema() {
+            local SCHEMA_NAME="$1" FILE="$2"
+            local OUT="${TEMP_DIR}/${SCHEMA_NAME}.out"
+            local STATUS="${TEMP_DIR}/${SCHEMA_NAME}.status"
+            (
+              VER=$(aws glue get-schema \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --query 'LatestSchemaVersion' --output text \
+                --region "${AWS_REGION}" 2>/dev/null || echo "")
+
+              if [ -z "$VER" ] || [ "$VER" = "None" ]; then
+                echo "  ·  ${SCHEMA_NAME}: not in registry — first registration"
+                echo "ok" > "$STATUS"; exit 0
+              fi
+
+              aws glue get-schema-version \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --schema-version-number "VersionNumber=${VER}" \
+                --query 'SchemaDefinition' --output text \
+                --region "${AWS_REGION}" 2>/dev/null \
+                > "${TEMP_DIR}/${SCHEMA_NAME}.current.json" || {
+                echo "  ⚠  ${SCHEMA_NAME}: could not fetch definition — skipping diff"
+                echo "ok" > "$STATUS"; exit 0
+              }
+
+              docker run --rm \
+                -v "${{ github.workspace }}":/workspace \
+                -v "${TEMP_DIR}":/diff \
+                -e GITHUB_ACTIONS \
+                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
+                --current    "/diff/${SCHEMA_NAME}.current.json" \
+                --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
+                --schema-name "${SCHEMA_NAME}" \
+              && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
+            ) > "$OUT" 2>&1
+          }
+
+          MAX_PARALLEL="${MAX_PARALLEL:-5}"
+          PIDS=(); NAMES=(); _active=0
+          for FILE in .tmp/glue-schemas/*.json; do
+            [ -f "$FILE" ] || continue
+            SCHEMA_NAME=$(basename "$FILE" .json)
+            NAMES+=("$SCHEMA_NAME")
+            [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
+            diff_schema "$SCHEMA_NAME" "$FILE" &
+            PIDS+=($!); _active=$((_active + 1))
+          done
+          for PID in "${PIDS[@]}"; do wait "$PID" || true; done
+
+          BREAKING_COUNT=0; BREAKING_SCHEMAS=()
+          for SCHEMA_NAME in "${NAMES[@]}"; do
+            [ -f "${TEMP_DIR}/${SCHEMA_NAME}.out" ] && cat "${TEMP_DIR}/${SCHEMA_NAME}.out"
+            grep -q "^breaking$" "${TEMP_DIR}/${SCHEMA_NAME}.status" 2>/dev/null && {
+              BREAKING_COUNT=$((BREAKING_COUNT + 1))
+              BREAKING_SCHEMAS+=("$SCHEMA_NAME")
+            }
+          done
+
+          printf '{"breaking_count":%d}\n' "$BREAKING_COUNT" \
+            > "${{ runner.temp }}/schema-diff-metrics.json" 2>/dev/null || true
+
+          if [ "$BREAKING_COUNT" -gt 0 ]; then
+            for SCHEMA_NAME in "${BREAKING_SCHEMAS[@]}"; do
+              echo "::error title=Breaking schema change::${SCHEMA_NAME}: new Glue schema name + new AsyncAPI message + major version bump. See LLD §7.3.1 Schema-evolution rules."
+            done
+            exit 1
+          fi
+
+      # Registry creation is handled inside the register command
+      # (GlueAdapter.ensure_registry). Only registers the 5 staged schemas.
+      - name: Register schemas
+        env:
+          SCHEMA_FREEZE: ${{ vars.SCHEMA_FREEZE }}
+          SCHEMA_FREEZE_EXPIRES_AT: ${{ vars.SCHEMA_FREEZE_EXPIRES_AT }}
+        run: |
+          FORCE_FLAG=""
+          [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e SCHEMA_FREEZE \
+            -e SCHEMA_FREEZE_EXPIRES_AT \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" register \
+            --registry    "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --schema-dir  .tmp/glue-schemas \
+            --output      /tmp/schema-versions.json \
+            $FORCE_FLAG
+
+      - name: Update schema changelog
+        env:
+          SCHEMA_GOV_IMAGE: ${{ env.SCHEMA_GOV_IMAGE }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e GITHUB_ACTIONS \
+            "${SCHEMA_GOV_IMAGE}" changelog \
+            --versions-file /tmp/schema-versions.json \
+            --output        docs/schema-changelog.md \
+            --asyncapi      api/asyncapi.yaml \
+            --registry      "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env           staging \
+            --metrics-dir   /tmp
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/schema-changelog.md
+          if git diff --staged --quiet; then
+            echo "  ·  changelog unchanged — nothing to commit"
+          else
+            git commit -m "docs: update schema changelog for $(date -u +%Y-%m-%d)"
+            _MAX=3; _i=0
+            while [ "$_i" -lt "$_MAX" ]; do
+              _i=$((_i + 1))
+              git push origin HEAD && { echo "  ✔  pushed (attempt ${_i})"; break; }
+              [ "$_i" -ge "$_MAX" ] && { echo "  ⚠  push failed after ${_MAX} attempts — changelog deferred" >&2; break; }
+              echo "  ⟳  push rejected — rebasing and retrying..."
+              git fetch origin main
+              git rebase origin/main || { git rebase --skip || git rebase --abort || true; break; }
+            done
+          fi
+
+      - name: Emit metrics
+        if: always()
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+            --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env              staging \
+            --job-status       "${{ job.status }}" \
+            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
+            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
+            --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
+            --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
+            --metrics-dir      /tmp
+
+  # ── Production ───────────────────────────────────────────────────────────────
+  production:
+    name: Register schemas → production
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+          fetch-depth: 2
+
+      - name: Pull schema-gov image
+        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+
+      - name: Validate schemas
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema
+
+      - name: Check schema freeze
+        env:
+          SCHEMA_FREEZE: ${{ vars.SCHEMA_FREEZE }}
+          FORCE_REGISTRATION: ${{ inputs.force }}
+          ENVIRONMENT: production
+        run: |
+          if [ "${SCHEMA_FREEZE:-}" = "true" ] && [ "${FORCE_REGISTRATION}" != "true" ]; then
+            echo "::error title=Schema Registry Frozen::Registration is frozen for ${ENVIRONMENT}. Lift the freeze or re-trigger with force=true."
+            exit 1
+          fi
+          [ "${FORCE_REGISTRATION}" = "true" ] && [ "${SCHEMA_FREEZE:-}" = "true" ] && \
+            echo "::warning title=Freeze Override::SCHEMA_FREEZE set on ${ENVIRONMENT} but force=true — proceeding."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Detect orphaned schemas
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" prune \
+            --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env      production \
+            --output   /tmp/schema-prune-metrics.json
+
+      - name: Assess event usage
+        env:
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+        run: |
+          if [ -n "${PROMETHEUS_URL}" ]; then
+            SOURCE_FLAGS="--source prometheus --prometheus-url ${PROMETHEUS_URL}"
+          else
+            SOURCE_FLAGS="--source disabled"
+          fi
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
+            --schema-dir  internal/eventschema \
+            ${SOURCE_FLAGS} \
+            --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
+            --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
+            --lookback    "${{ vars.USAGE_LOOKBACK_DAYS || '30' }}" \
+            --cold        "${{ vars.USAGE_COLD_THRESHOLD_DAYS || '7' }}" \
+            --output      /tmp/schema-usage-metrics.json
+
+      - name: Enforce usage → lifecycle
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" enforce-lifecycle \
+            --usage-file /tmp/schema-usage-metrics.json \
+            --asyncapi   api/asyncapi.yaml
+
+      - name: Stage produced Glue schemas
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
+      - name: Diff schemas against registry
+        env:
+          REGISTRY_NAME: ${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ENVIRONMENT: production
+        run: |
+          TEMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+
+          diff_schema() {
+            local SCHEMA_NAME="$1" FILE="$2"
+            local OUT="${TEMP_DIR}/${SCHEMA_NAME}.out"
+            local STATUS="${TEMP_DIR}/${SCHEMA_NAME}.status"
+            (
+              VER=$(aws glue get-schema \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --query 'LatestSchemaVersion' --output text \
+                --region "${AWS_REGION}" 2>/dev/null || echo "")
+
+              if [ -z "$VER" ] || [ "$VER" = "None" ]; then
+                echo "  ·  ${SCHEMA_NAME}: not in registry — first registration"
+                echo "ok" > "$STATUS"; exit 0
+              fi
+
+              aws glue get-schema-version \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --schema-version-number "VersionNumber=${VER}" \
+                --query 'SchemaDefinition' --output text \
+                --region "${AWS_REGION}" 2>/dev/null \
+                > "${TEMP_DIR}/${SCHEMA_NAME}.current.json" || {
+                echo "  ⚠  ${SCHEMA_NAME}: could not fetch definition — skipping diff"
+                echo "ok" > "$STATUS"; exit 0
+              }
+
+              docker run --rm \
+                -v "${{ github.workspace }}":/workspace \
+                -v "${TEMP_DIR}":/diff \
+                -e GITHUB_ACTIONS \
+                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
+                --current    "/diff/${SCHEMA_NAME}.current.json" \
+                --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
+                --schema-name "${SCHEMA_NAME}" \
+              && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
+            ) > "$OUT" 2>&1
+          }
+
+          MAX_PARALLEL="${MAX_PARALLEL:-5}"
+          PIDS=(); NAMES=(); _active=0
+          for FILE in .tmp/glue-schemas/*.json; do
+            [ -f "$FILE" ] || continue
+            SCHEMA_NAME=$(basename "$FILE" .json)
+            NAMES+=("$SCHEMA_NAME")
+            [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
+            diff_schema "$SCHEMA_NAME" "$FILE" &
+            PIDS+=($!); _active=$((_active + 1))
+          done
+          for PID in "${PIDS[@]}"; do wait "$PID" || true; done
+
+          BREAKING_COUNT=0; BREAKING_SCHEMAS=()
+          for SCHEMA_NAME in "${NAMES[@]}"; do
+            [ -f "${TEMP_DIR}/${SCHEMA_NAME}.out" ] && cat "${TEMP_DIR}/${SCHEMA_NAME}.out"
+            grep -q "^breaking$" "${TEMP_DIR}/${SCHEMA_NAME}.status" 2>/dev/null && {
+              BREAKING_COUNT=$((BREAKING_COUNT + 1))
+              BREAKING_SCHEMAS+=("$SCHEMA_NAME")
+            }
+          done
+
+          printf '{"breaking_count":%d}\n' "$BREAKING_COUNT" \
+            > "${{ runner.temp }}/schema-diff-metrics.json" 2>/dev/null || true
+
+          if [ "$BREAKING_COUNT" -gt 0 ]; then
+            for SCHEMA_NAME in "${BREAKING_SCHEMAS[@]}"; do
+              echo "::error title=Breaking schema change::${SCHEMA_NAME}: new Glue schema name + new AsyncAPI message + major version bump. See LLD §7.3.1 Schema-evolution rules."
+            done
+            exit 1
+          fi
+
+      - name: Register schemas
+        env:
+          SCHEMA_FREEZE: ${{ vars.SCHEMA_FREEZE }}
+          SCHEMA_FREEZE_EXPIRES_AT: ${{ vars.SCHEMA_FREEZE_EXPIRES_AT }}
+        run: |
+          FORCE_FLAG=""
+          [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e SCHEMA_FREEZE \
+            -e SCHEMA_FREEZE_EXPIRES_AT \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" register \
+            --registry    "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --schema-dir  .tmp/glue-schemas \
+            --output      /tmp/schema-versions.json \
+            $FORCE_FLAG
+
+      # Production checks out the release tag (detached HEAD), so push
+      # targets refs/heads/main explicitly. Same concurrency guard as staging.
+      - name: Update schema changelog
+        env:
+          SCHEMA_GOV_IMAGE: ${{ env.SCHEMA_GOV_IMAGE }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e GITHUB_ACTIONS \
+            "${SCHEMA_GOV_IMAGE}" changelog \
+            --versions-file /tmp/schema-versions.json \
+            --output        docs/schema-changelog.md \
+            --asyncapi      api/asyncapi.yaml \
+            --registry      "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env           production \
+            --metrics-dir   /tmp
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/schema-changelog.md
+          if git diff --staged --quiet; then
+            echo "  ·  changelog unchanged — nothing to commit"
+          else
+            git commit -m "docs: update schema changelog for $(date -u +%Y-%m-%d) (production)"
+            _MAX=3; _i=0
+            while [ "$_i" -lt "$_MAX" ]; do
+              _i=$((_i + 1))
+              git push origin HEAD:refs/heads/main && { echo "  ✔  pushed (attempt ${_i})"; break; }
+              [ "$_i" -ge "$_MAX" ] && { echo "  ⚠  push failed after ${_MAX} attempts — changelog deferred" >&2; break; }
+              echo "  ⟳  push rejected — rebasing and retrying..."
+              git fetch origin main
+              git rebase origin/main || { git rebase --skip || git rebase --abort || true; break; }
+            done
+          fi
+
+      - name: Emit metrics
+        if: always()
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+            --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env              production \
+            --job-status       "${{ job.status }}" \
+            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
+            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
+            --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
+            --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
+            --metrics-dir      /tmp
+
+  # ── PR check (read-only) ─────────────────────────────────────────────────────
+  # Validates and diffs against the staging registry before merge so developers
+  # see breaking-change failures without waiting for a post-merge push to main.
+  # The AWS-dependent steps (credentials + registry diff) are individually
+  # skipped — not failed — when AWS credentials aren't configured for the
+  # staging environment (e.g. fork PRs, which don't receive environment
+  # secrets/vars, or repos where OIDC role trust hasn't been set up yet).
+  # GitHub Actions does not expose the `vars`/`secrets` context reliably in
+  # job-level `if:`, so the job itself always runs; schema validation (no
+  # AWS needed) always runs too.
+  pr-check:
+    name: Schema diff check (PR → staging)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Pull schema-gov image
+        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+
+      - name: Validate schemas
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema
+
+      - name: Check AWS OIDC role configured
+        id: aws_check
+        env:
+          HAS_ROLE: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [ -n "$HAS_ROLE" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=AWS OIDC role not configured::Skipping staging registry diff — vars.AWS_ROLE_ARN is not set for the staging environment (expected for fork PRs)."
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.aws_check.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Stage produced Glue schemas
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
+      - name: Diff schemas against staging registry
+        if: steps.aws_check.outputs.configured == 'true'
+        env:
+          REGISTRY_NAME: ${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ENVIRONMENT: staging
+        run: |
+          TEMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEMP_DIR"' EXIT
+
+          diff_schema() {
+            local SCHEMA_NAME="$1" FILE="$2"
+            local OUT="${TEMP_DIR}/${SCHEMA_NAME}.out"
+            local STATUS="${TEMP_DIR}/${SCHEMA_NAME}.status"
+            (
+              VER=$(aws glue get-schema \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --query 'LatestSchemaVersion' --output text \
+                --region "${AWS_REGION}" 2>/dev/null || echo "")
+
+              if [ -z "$VER" ] || [ "$VER" = "None" ]; then
+                echo "  ·  ${SCHEMA_NAME}: not in registry — first registration"
+                echo "ok" > "$STATUS"; exit 0
+              fi
+
+              aws glue get-schema-version \
+                --schema-id "RegistryName=${REGISTRY_NAME},SchemaName=${SCHEMA_NAME}" \
+                --schema-version-number "VersionNumber=${VER}" \
+                --query 'SchemaDefinition' --output text \
+                --region "${AWS_REGION}" 2>/dev/null \
+                > "${TEMP_DIR}/${SCHEMA_NAME}.current.json" || {
+                echo "  ⚠  ${SCHEMA_NAME}: could not fetch definition — skipping diff"
+                echo "ok" > "$STATUS"; exit 0
+              }
+
+              docker run --rm \
+                -v "${{ github.workspace }}":/workspace \
+                -v "${TEMP_DIR}":/diff \
+                -e GITHUB_ACTIONS \
+                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
+                --current    "/diff/${SCHEMA_NAME}.current.json" \
+                --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
+                --schema-name "${SCHEMA_NAME}" \
+              && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
+            ) > "$OUT" 2>&1
+          }
+
+          MAX_PARALLEL="${MAX_PARALLEL:-5}"
+          PIDS=(); NAMES=(); _active=0
+          for FILE in .tmp/glue-schemas/*.json; do
+            [ -f "$FILE" ] || continue
+            SCHEMA_NAME=$(basename "$FILE" .json)
+            NAMES+=("$SCHEMA_NAME")
+            [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
+            diff_schema "$SCHEMA_NAME" "$FILE" &
+            PIDS+=($!); _active=$((_active + 1))
+          done
+          for PID in "${PIDS[@]}"; do wait "$PID" || true; done
+
+          BREAKING_COUNT=0; BREAKING_SCHEMAS=()
+          for SCHEMA_NAME in "${NAMES[@]}"; do
+            [ -f "${TEMP_DIR}/${SCHEMA_NAME}.out" ] && cat "${TEMP_DIR}/${SCHEMA_NAME}.out"
+            grep -q "^breaking$" "${TEMP_DIR}/${SCHEMA_NAME}.status" 2>/dev/null && {
+              BREAKING_COUNT=$((BREAKING_COUNT + 1))
+              BREAKING_SCHEMAS+=("$SCHEMA_NAME")
+            }
+          done
+
+          printf '{"breaking_count":%d}\n' "$BREAKING_COUNT" \
+            > "${{ runner.temp }}/schema-diff-metrics.json" 2>/dev/null || true
+
+          if [ "$BREAKING_COUNT" -gt 0 ]; then
+            for SCHEMA_NAME in "${BREAKING_SCHEMAS[@]}"; do
+              echo "::error title=Breaking schema change::${SCHEMA_NAME}: new Glue schema name + new AsyncAPI message + major version bump. See LLD §7.3.1 Schema-evolution rules."
+            done
+            exit 1
+          fi
+
+      - name: Emit metrics
+        if: always()
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -v "${{ runner.temp }}":/tmp \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_REGION="${{ vars.AWS_REGION }}" \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+            --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --env              staging \
+            --job-status       "${{ job.status }}" \
+            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
+            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
+            --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
+            --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
+            --metrics-dir      /tmp

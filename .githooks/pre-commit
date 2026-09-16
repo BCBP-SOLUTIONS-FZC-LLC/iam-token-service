@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Local commit gates: formatting, vet, and lint.
+#
+# Deliberately does NOT run swag-check or schema-validate here, even though
+# this service has both (make swag / make schema-validate): swag-check
+# regenerates docs/swagger/ and diffs it, and schema-validate docker-pulls
+# platform-schemagov — both correct to enforce, but too slow for a
+# per-commit hook. CI (.github/workflows/validate-quality.yml) is the real
+# gate for those; this hook only covers the fast, always-cheap checks.
+set -euo pipefail
+
+echo "[pre-commit] running tidy..."
+make tidy
+
+echo "[pre-commit] running fmt-check..."
+make fmt-check
+
+echo "[pre-commit] running vet..."
+make vet
+
+echo "[pre-commit] running lint..."
+make lint

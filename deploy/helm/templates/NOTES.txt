@@ -1,0 +1,47 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} has been installed.
+
+Components deployed:
+  - {{ include "iam-token-service.fullname" . }}-server    (Deployment, {{ .Values.server.replicaCount }} replica(s)) — TS-1..TS-4 HTTP API
+  - {{ include "iam-token-service.fullname" . }}-consumer  (Deployment, {{ .Values.consumer.replicaCount }} replica(s)) — TenantMembershipsPurged offboarding cascade
+  - {{ include "iam-token-service.fullname" . }}-rotator   (CronJob, schedule "{{ .Values.rotator.schedule }}") — overlap-expiry sweep, orphan-material reconciler, prune
+
+This service has no public/tenant-facing route (§5.6) — every endpoint sits
+under /api/v1/internal/*, reachable only from in-mesh callers.
+
+━━ REQUIRED ACTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{ if not .Values.existingSecret -}}
+{{ if not .Values.database.existingSecretName -}}
+⚠  Credentials are stored in Helm release history (base64, not encrypted).
+   Migrate to External Secrets Operator or AWS Secrets Manager CSI:
+     existingSecret: "iam-token-service-secrets"
+   Then remove secretValues from your values file.
+
+{{ end -}}
+{{ end -}}
+{{ if not .Values.networkPolicy.enabled -}}
+⚠  networkPolicy.enabled is false. :{{ .Values.service.metricsPort }}/metrics is
+   unauthenticated and reachable by any pod in the cluster. Enable in
+   production:
+     networkPolicy.enabled: true
+
+{{ end -}}
+⚠  This service authenticates to OpenBao (§6.3, §10.5, TS-CONFIG-3) via
+   every pod's ServiceAccount JWT against OpenBao's Kubernetes auth method
+   — confirm an OpenBao role named .Values.openbao.authRole
+   ({{ .Values.openbao.authRole }}) is bound to this namespace/ServiceAccount
+   (see deploy/openbao/role.tf.example) before traffic hits TS-1/TS-2/TS-3.
+
+Before this chart is usable in a real environment:
+  1. Provide DATABASE_URL / MIGRATION_DATABASE_URL / RECONCILER_DATABASE_URL
+     via an existing Secret (values.database.existingSecretName) — the
+     serviceaccount_app / serviceaccount_migrator / serviceaccount_reconciler
+     roles must already exist (§4.4).
+  2. Set values.events.topicArn and values.events.glueRegistryName once the
+     iam-serviceaccount-events SNS topic and Glue registry are provisioned
+     (§25) — left empty, the server queues events in the outbox but never
+     publishes them (safe no-op, never crashes the pod).
+  3. Set values.sqs.offboardingQueueUrl once tenant-lifecycle-tokensvc-q
+     exists.
+  4. Confirm values.openbao.addr / authRole match the OpenBao Kubernetes
+     auth role bound to this chart's ServiceAccount (deploy/openbao/policy.hcl).

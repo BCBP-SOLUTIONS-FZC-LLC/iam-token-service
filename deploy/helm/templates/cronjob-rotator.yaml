@@ -1,0 +1,75 @@
+# The overlap-expiry sweep (§8.3), orphan-material reconciler (§8.6), and
+# outbox/processed_events prune (§4.2/§13.1) — one CronJob, one binary
+# invocation per fire, running all three tasks then exiting (see
+# cmd/rotator's package doc comment for why the reconciler/prune tasks run
+# on this same 5-minute cadence rather than their own "default hourly").
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-rotator
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rotator
+spec:
+  schedule: {{ .Values.rotator.schedule | quote }}
+  concurrencyPolicy: {{ .Values.rotator.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.rotator.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.rotator.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.rotator.activeDeadlineSeconds }}
+      # A crashing rotator retries at most twice before the Job is marked
+      # Failed rather than looping indefinitely within one 5-minute tick —
+      # the next scheduled fire (concurrencyPolicy: Forbid) picks up where
+      # this one left off, since every task the rotator runs is idempotent.
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "iam-token-service.componentSelectorLabels" (dict "component" "rotator" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 12 }}
+          annotations:
+            {{- with .Values.podAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            # Pod-level scrape annotation: this Job's iam_token_service_
+            # rotation_sweep_total / material_reconcile_total samples are
+            # only ever available during serveMetricsBriefly's grace
+            # window (see cmd/rotator/main.go) — there is no Pushgateway
+            # in this deployment.
+            prometheus.io/scrape: "true"
+            prometheus.io/port: {{ .Values.service.metricsPort | quote }}
+            prometheus.io/path: /metrics
+            {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
+            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+            {{- else }}
+            rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+            {{- end }}
+        spec:
+          serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: rotator
+              image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/iam-token-service-rotator"]
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              ports:
+                - name: metrics
+                  containerPort: {{ .Values.service.metricsPort }}
+              env:
+                {{- include "iam-token-service.commonEnv" . | nindent 16 }}
+                - name: METRICS_PORT
+                  value: {{ .Values.service.metricsPort | quote }}
+                - name: PROCESSED_EVENTS_TTL_DAYS
+                  value: {{ .Values.processedEvents.ttlDays | quote }}
+              resources:
+                {{- toYaml .Values.rotator.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

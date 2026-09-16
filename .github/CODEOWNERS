@@ -1,0 +1,32 @@
+# Default owner for anything not matched more specifically below.
+* @iam-team
+
+# CI/CD and dependency-update configuration — changes here affect every PR's
+# gate behavior, so require an explicit platform sign-off.
+/.github/                              @iam-team
+/.github/workflows/                    @iam-team
+/.github/dependabot.yml.disabled       @iam-team
+
+# Event contract (§7.3.1/§25 frozen names) — api/asyncapi.yaml and the Glue
+# JSON Schema files under internal/eventschema/ define this service's 5
+# published events on the single-producer iam-serviceaccount-events
+# registry. Any change here is a cross-service compatibility concern.
+/api/asyncapi.yaml                     @iam-team @platform-team
+/internal/eventschema/                 @iam-team @platform-team
+
+# Core domain (credential lifecycle invariants, §6/§8/§25 frozen names).
+/internal/core/domain/                 @iam-team
+
+# TS-INV-1 (no Keycloak Admin API dependency anywhere) and TS-CONFIG-3
+# (OpenBao via Kubernetes auth, never a static token or AWS IAM) both live
+# in this one adapter seam — changes here are reviewed by platform as well.
+/internal/adapter/outbound/openbao/    @iam-team @platform-team
+/deploy/openbao/                       @iam-team @platform-team
+
+# Database migrations and RLS policy (FORCE ROW LEVEL SECURITY, the three
+# serviceaccount_* roles, §4.4) — schema changes require platform sign-off.
+/internal/adapter/outbound/postgres/migrations/ @iam-team @platform-team
+
+# Deployment manifests (Helm chart, AWS IAM policy references) — changes
+# here affect production rollout behavior.
+/deploy/                               @iam-team @platform-team

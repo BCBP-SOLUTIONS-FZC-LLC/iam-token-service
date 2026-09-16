@@ -1,0 +1,64 @@
+%% Go import graph mirroring .go-arch-lint.yml's deps: block exactly.
+%% This is the enforceable contract — `make arch-lint` fails CI on any
+%% edge not drawn here.
+graph LR
+    domain["domain<br/>(anyVendorDeps only)"]
+    port["port"] --> domain
+    requestctx["requestctx<br/>(anyVendorDeps only)"]
+    service["service"] --> domain
+    service --> port
+    service --> requestctx
+
+    eventschema["eventschema<br/>(anyVendorDeps only)"]
+    apispec["apispec<br/>(anyVendorDeps only)"]
+    swaggerdocs["swaggerdocs<br/>(anyVendorDeps only)"]
+
+    observability["observability"] --> domain
+    observability --> port
+    observability --> service
+
+    postgres["postgres"] --> domain
+    postgres --> port
+
+    openbao["openbao"] --> domain
+    openbao --> port
+
+    adapters_outbound["adapters_outbound<br/>(eventbus)"] --> domain
+    adapters_outbound --> port
+    adapters_outbound --> service
+    adapters_outbound --> eventschema
+    adapters_outbound --> observability
+
+    adapters_inbound["adapters_inbound<br/>(http, consumer)"] --> domain
+    adapters_inbound --> port
+    adapters_inbound --> service
+    adapters_inbound --> requestctx
+    adapters_inbound --> apispec
+    adapters_inbound --> observability
+
+    reconciler_jobs["reconciler_jobs<br/>(cmd/rotator)"] --> domain
+    reconciler_jobs --> port
+    reconciler_jobs --> postgres
+    reconciler_jobs --> openbao
+    reconciler_jobs --> observability
+    reconciler_jobs --> adapters_outbound
+
+    cmd["cmd<br/>(server, consumer)"] --> domain
+    cmd --> port
+    cmd --> service
+    cmd --> requestctx
+    cmd --> eventschema
+    cmd --> apispec
+    cmd --> swaggerdocs
+    cmd --> postgres
+    cmd --> openbao
+    cmd --> adapters_inbound
+    cmd --> adapters_outbound
+    cmd --> observability
+    cmd --> reconciler_jobs
+
+    %% The one rule most worth calling out: reconciler_jobs may NOT
+    %% depend on service — cmd/rotator drives postgres/openbao directly
+    %% under BYPASSRLS, never through the RLS-scoped service layer.
+    style reconciler_jobs fill:#fce8e6,stroke:#c0392b
+    style service fill:#e8f4fc,stroke:#2980b9

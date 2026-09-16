@@ -1,0 +1,82 @@
+{{/*
+Restricts ingress to in-mesh callers only (§10.2): the Realm Provisioner,
+O&M, and the operator gateway on the server's HTTP port; Prometheus on the
+metrics port. There is no public/tenant-facing route at MVP (§5.6), so no
+ingress rule accepts traffic from outside the mesh namespace(s) — enforced
+by requiring a real namespaceSelector below; an empty `{}` selector would
+match every namespace in the cluster, not just the mesh, which is exactly
+the "no restriction at all" outcome this policy exists to prevent.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.ingressNamespaceSelector }}
+{{- fail "networkPolicy.ingressNamespaceSelector is required when networkPolicy.enabled is true — an empty selector matches every namespace in the cluster (no restriction). Set it to a real namespace label selector scoping ingress to your mesh namespace(s), e.g. {matchLabels: {mesh: iam}}. See values.yaml." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-server
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- .Values.networkPolicy.ingressNamespaceSelector | toYaml | nindent 12 }}
+      ports:
+        - port: http
+        - port: metrics
+  egress:
+    {{- include "iam-token-service.egressRules" . | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-consumer
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # The consumer's HTTP surface is only /healthz /readyz (probes) and
+    # /metrics — no business API (§7.1 — it is driven by SQS, not HTTP).
+    - from:
+        - namespaceSelector:
+            {{- .Values.networkPolicy.ingressNamespaceSelector | toYaml | nindent 12 }}
+      ports:
+        - port: http
+        - port: metrics
+  egress:
+    {{- include "iam-token-service.egressRules" . | nindent 4 }}
+---
+# The rotator CronJob's pods carry the same base selector labels
+# (app.kubernetes.io/name/instance) as the server/consumer, but no
+# component-specific ingress rule exists for it — it serves /metrics only
+# during its own brief post-run grace window (cmd/rotator/main.go's
+# serveMetricsBriefly) and accepts no inbound HTTP API traffic. It shares
+# this same outbound egress profile (Postgres, OpenBao, AWS, OTel).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-rotator
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "rotator" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "iam-token-service.egressRules" . | nindent 4 }}
+{{- end }}

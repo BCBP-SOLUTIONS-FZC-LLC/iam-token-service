@@ -1,0 +1,51 @@
+version: 2
+registries:
+  github-bcbp:
+    type: git
+    url: https://github.com/BCBP-SOLUTIONS-FZC-LLC
+    username: x-access-token
+    password: ${{secrets.GO_PRIVATE_TOKEN}}
+
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    registries:
+      - github-bcbp
+    labels:
+      - dependencies
+      - go
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+
+# This file is named dependabot.yml.disabled (not dependabot.yml) so
+# Dependabot does not act on it yet — this service has no released
+# dependents relying on pinned versions and the team has not yet decided on
+# an auto-merge policy for private-module updates.
+#
+# To enable:
+#   git mv .github/dependabot.yml.disabled .github/dependabot.yml
+#
+# The github-bcbp registry entry also requires a Dependabot secret named
+# GO_PRIVATE_TOKEN to be configured separately in
+# Settings → Secrets and variables → Dependabot (this is a distinct secret
+# store from Actions secrets — the same token used there does not
+# automatically apply here).

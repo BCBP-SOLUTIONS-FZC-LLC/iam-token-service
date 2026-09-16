@@ -1,0 +1,366 @@
+basePath: /api/v1/internal
+definitions:
+  http.ErrorResponse:
+    properties:
+      details:
+        additionalProperties: {}
+        type: object
+      error:
+        type: string
+      request_id:
+        type: string
+      status:
+        type: integer
+      trace_id:
+        type: string
+    type: object
+  http.credentialSummaryBody:
+    properties:
+      expires_at:
+        type: string
+      issued_at:
+        type: string
+      openbao_path:
+        type: string
+      status:
+        type: string
+      version:
+        type: integer
+    type: object
+  http.issueOrRotateRequestBody:
+    properties:
+      overlap_seconds:
+        type: integer
+      rotation_id:
+        type: string
+    type: object
+  http.issueOrRotateResponseBody:
+    properties:
+      expires_prior_at:
+        type: string
+      openbao_path:
+        type: string
+      record_version:
+        type: integer
+      secret:
+        type: string
+      version:
+        type: integer
+    type: object
+  http.principalResponseBody:
+    properties:
+      principal_id:
+        type: string
+      principal_type:
+        type: string
+      record_version:
+        type: integer
+      status:
+        type: string
+      tenant_id:
+        type: string
+    type: object
+  http.readPrincipalResponseBody:
+    properties:
+      credentials:
+        items:
+          $ref: '#/definitions/http.credentialSummaryBody'
+        type: array
+      keycloak_client_id:
+        type: string
+      principal_id:
+        type: string
+      principal_type:
+        type: string
+      record_version:
+        type: integer
+      status:
+        type: string
+      tenant_id:
+        type: string
+    type: object
+  http.registerRequestBody:
+    properties:
+      keycloak_client_id:
+        type: string
+      principal_sub:
+        type: string
+    type: object
+  http.revokeResponseBody:
+    properties:
+      keycloak_invalidation:
+        type: string
+      revoked_at:
+        type: string
+      status:
+        type: string
+      version:
+        type: integer
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: platform@bcbpsolutions.com
+    name: BCBP Solutions IAM Team
+  description: |-
+    Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-4).
+
+    **Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).
+    **Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).
+    **No Keycloak dependency:** This service manages its own credential material independently — it never calls the Keycloak Admin API (TS-INV-1).
+  license:
+    name: Proprietary
+  title: IAM Token Service API
+  version: "1.0"
+paths:
+  /tenants/{id}/service-accounts:
+    post:
+      consumes:
+      - application/json
+      description: Registers the per-tenant platform-automation service-account principal.
+        Idempotent on (tenant_id, keycloak_client_id) — repeating an already-registered
+        request returns 200 with the existing record instead of erroring.
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Principal registration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.registerRequestBody'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: already registered — idempotent repeat
+          schema:
+            $ref: '#/definitions/http.principalResponseBody'
+        "201":
+          description: created
+          schema:
+            $ref: '#/definitions/http.principalResponseBody'
+        "400":
+          description: invalid_request
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "401":
+          description: missing_identity_headers
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+      security:
+      - SystemRole: []
+      - TenantID: []
+      - UserID: []
+      summary: TS-4 — Register service-account principal
+      tags:
+      - ServiceAccounts
+  /tenants/{id}/service-accounts/{principal_id}:
+    get:
+      description: Returns principal metadata and a summary of every credential version
+        (status, OpenBao path, issued/expires timestamps) — never the credential plaintext
+        itself (§5.6).
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Principal UUID
+        format: uuid
+        in: path
+        name: principal_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.readPrincipalResponseBody'
+        "400":
+          description: invalid_request
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "401":
+          description: missing_identity_headers
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "404":
+          description: principal_not_found
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+      security:
+      - SystemRole: []
+      - TenantID: []
+      - UserID: []
+      summary: TS-3 — Read service-account principal
+      tags:
+      - ServiceAccounts
+  /tenants/{id}/service-accounts/{principal_id}/credentials:
+    post:
+      consumes:
+      - application/json
+      description: Issues the principal's first credential (version=1, 201) or rotates
+        to a new version (201) when one already exists. A rotation_id replay of an
+        already-committed request returns the stored result (200) instead of generating
+        new material (§9.2). Returns the credential plaintext exactly once — it is
+        never retrievable again (TS-INV-2).
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Principal UUID
+        format: uuid
+        in: path
+        name: principal_id
+        required: true
+        type: string
+      - description: rotation_id required; overlap_seconds optional (defaults to the
+          configured value, §12)
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.issueOrRotateRequestBody'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: rotation_id replay — already committed
+          schema:
+            $ref: '#/definitions/http.issueOrRotateResponseBody'
+        "201":
+          description: issued or rotated
+          schema:
+            $ref: '#/definitions/http.issueOrRotateResponseBody'
+        "400":
+          description: invalid_request
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "401":
+          description: missing_identity_headers
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "404":
+          description: principal_not_found
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "409":
+          description: rotation_in_flight OR optimistic_lock_conflict
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "422":
+          description: principal_revoked
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "502":
+          description: secret_store_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+      security:
+      - SystemRole: []
+      - TenantID: []
+      - UserID: []
+      summary: TS-1 — Issue or rotate credential
+      tags:
+      - Credentials
+  /tenants/{id}/service-accounts/{principal_id}/credentials/{version}/revoke:
+    post:
+      description: 'Revokes one credential version — deletes its OpenBao material
+        and marks it revoked. keycloak_invalidation is always "caller_responsibility":
+        this service never invalidates the token at Keycloak itself (two-halves invariant,
+        TS-INV-7).'
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Principal UUID
+        format: uuid
+        in: path
+        name: principal_id
+        required: true
+        type: string
+      - description: Credential version
+        in: path
+        name: version
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.revokeResponseBody'
+        "400":
+          description: invalid_request
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "401":
+          description: missing_identity_headers
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "404":
+          description: principal_not_found
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "409":
+          description: optimistic_lock_conflict
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "502":
+          description: secret_store_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+      security:
+      - SystemRole: []
+      - TenantID: []
+      - UserID: []
+      summary: TS-2 — Revoke credential version
+      tags:
+      - Credentials
+securityDefinitions:
+  SystemRole:
+    description: Must contain "iam-system". Injected by the API gateway / mesh; never
+      set by callers directly.
+    in: header
+    name: x-tenant-roles
+    type: apiKey
+  TenantID:
+    description: Tenant UUID injected by the API gateway. Must match the :id path
+      segment (§5.1).
+    in: header
+    name: x-tenant-id
+    type: apiKey
+  UserID:
+    description: Caller identity injected by the API gateway — recorded as the actor
+      on any mutation.
+    in: header
+    name: x-user-id
+    type: apiKey
+swagger: "2.0"

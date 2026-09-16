@@ -1,0 +1,317 @@
+asyncapi: 3.0.0
+
+info:
+  title: IAM Token Service Events
+  version: "1.0.0"
+  description: |
+    Domain events published by iam-token-service (LLD §7). This service is
+    the sole producer of the `iam-serviceaccount-events` SNS topic — unlike
+    the sibling Realm Provisioner's shared topic, this registry has exactly
+    one producer, this service.
+
+    All 5 events describe the platform-automation service-account
+    credential lifecycle (register / issue / rotate / revoke) and are
+    audit-only — no downstream authorization consumer subscribes, because
+    the automation principal carries no roles (TS-INV-4). The one consumer
+    at MVP is Audit Log, via `serviceaccount-audit-q`.
+
+    No payload — ever — carries a secret or a secret-derived value
+    (TS-INV-2, EVT-2); a negative contract test enforces this.
+
+    This service's one INBOUND subscription is TenantMembershipsPurged, on
+    `iam.tenant.events` via `tenant-lifecycle-tokensvc-q`
+    (DLQ `tenant-lifecycle-tokensvc-q-dlq`, maxReceiveCount=5), driving the
+    offboarding cascade (§8.4): hard-delete the tenant's `service_account_*`
+    rows and every credential's OpenBao material, then emit
+    ServiceAccountRevoked. Idempotent via `processed_events`
+    (consumer='tenant_offboarding'), keyed on the envelope id. The canonical
+    schema for TenantMembershipsPurged is owned by its producing service,
+    not this repo — the definition here is this service's own consumer-side
+    documentation, kept in sync with upstream, not the source of truth.
+
+    Wire format: each SNS message body is prefixed with an 18-byte AWS Glue
+    Schema Registry header before the EventEnvelope JSON:
+      byte 0     : header version (0x03)
+      byte 1     : compression    (0x00 = none)
+      bytes 2-17 : schema version UUID
+
+    Schema versioning: the authoritative version identifier is the 16-byte
+    UUID in the Glue wire-format header. The same UUID is echoed into the
+    envelope JSON as `dataschema`. In dev/test (NoopCodec) there is no Glue
+    header and `dataschema` is absent.
+
+  license:
+    name: Proprietary
+
+defaultContentType: application/json
+
+tags:
+  - $ref: '#/components/tags/published'
+  - $ref: '#/components/tags/consumed'
+
+servers:
+  snsServiceAccountEvents:
+    host: "sns.ap-south-1.amazonaws.com"
+    protocol: sns
+    description: |
+      The `iam-serviceaccount-events` SNS topic (single producer, this
+      service — frozen name, §25). Fans out to one consumer queue at MVP.
+    security:
+      - $ref: '#/components/securitySchemes/iamRole'
+
+  sqsOffboarding:
+    host: "sqs.ap-south-1.amazonaws.com"
+    protocol: sqs
+    description: |
+      Queue: tenant-lifecycle-tokensvc-q  |  DLQ: tenant-lifecycle-tokensvc-q-dlq  (maxReceiveCount=5)
+      SNS subscription filter: EventType = TenantMembershipsPurged
+      Source topic: iam.tenant.events (Core — tenant hard-delete / GDPR-wipe signal, ADR-0008).
+
+channels:
+  iamServiceAccountEvents:
+    address: "iam-serviceaccount-events"
+    servers:
+      - $ref: '#/servers/snsServiceAccountEvents'
+    description: |
+      This service's 5 published events (§7.5, frozen §25). Fans out to
+      `serviceaccount-audit-q` (DLQ `serviceaccount-audit-q-dlq`,
+      maxReceiveCount=5), owned by Audit Log — audit-only, §7.4.
+    messages:
+      ServiceAccountRegistered:
+        $ref: '#/components/messages/ServiceAccountRegistered'
+      ServiceAccountCredentialIssued:
+        $ref: '#/components/messages/ServiceAccountCredentialIssued'
+      ServiceAccountCredentialRotated:
+        $ref: '#/components/messages/ServiceAccountCredentialRotated'
+      ServiceAccountCredentialRevoked:
+        $ref: '#/components/messages/ServiceAccountCredentialRevoked'
+      ServiceAccountRevoked:
+        $ref: '#/components/messages/ServiceAccountRevoked'
+
+  tenantLifecycleTokensvcQueue:
+    address: "tenant-lifecycle-tokensvc-q"
+    servers:
+      - $ref: '#/servers/sqsOffboarding'
+    description: |
+      This service's one inbound subscription — TenantMembershipsPurged,
+      driving the offboarding cascade (§7.1, §8.4).
+    messages:
+      TenantMembershipsPurged:
+        $ref: '#/components/messages/TenantMembershipsPurged'
+
+operations:
+  sendServiceAccountRegistered:
+    action: send
+    channel:
+      $ref: '#/channels/iamServiceAccountEvents'
+    summary: TS-4 emits ServiceAccountRegistered when a principal is registered.
+    messages:
+      - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountRegistered'
+
+  sendServiceAccountCredentialIssued:
+    action: send
+    channel:
+      $ref: '#/channels/iamServiceAccountEvents'
+    summary: TS-1 emits ServiceAccountCredentialIssued on a principal's first-ever credential (version = 1).
+    messages:
+      - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountCredentialIssued'
+
+  sendServiceAccountCredentialRotated:
+    action: send
+    channel:
+      $ref: '#/channels/iamServiceAccountEvents'
+    summary: TS-1 emits ServiceAccountCredentialRotated on rotation (version > 1).
+    messages:
+      - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountCredentialRotated'
+
+  sendServiceAccountCredentialRevoked:
+    action: send
+    channel:
+      $ref: '#/channels/iamServiceAccountEvents'
+    summary: TS-2, the overlap-expiry sweep, or the offboarding cascade emits ServiceAccountCredentialRevoked for one revoked version.
+    messages:
+      - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountCredentialRevoked'
+
+  sendServiceAccountRevoked:
+    action: send
+    channel:
+      $ref: '#/channels/iamServiceAccountEvents'
+    summary: The offboarding cascade emits ServiceAccountRevoked when a principal is fully revoked.
+    messages:
+      - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountRevoked'
+
+  receiveTenantMembershipsPurged:
+    action: receive
+    channel:
+      $ref: '#/channels/tenantLifecycleTokensvcQueue'
+    summary: Consume Core's TenantMembershipsPurged to hard-delete the tenant's service_account_* rows and OpenBao material (§8.4).
+    messages:
+      - $ref: '#/channels/tenantLifecycleTokensvcQueue/messages/TenantMembershipsPurged'
+
+components:
+  securitySchemes:
+    iamRole:
+      type: httpApiKey
+      name: Authorization
+      in: header
+      description: AWS IAM role attached to the pod via IRSA (IAM Roles for Service Accounts).
+
+  tags:
+    published:
+      name: published
+      description: |
+        This service is the sole producer of iam-serviceaccount-events. All
+        5 event types — ServiceAccountRegistered,
+        ServiceAccountCredentialIssued, ServiceAccountCredentialRotated,
+        ServiceAccountCredentialRevoked, ServiceAccountRevoked — carry this
+        tag and are emitted via the transactional outbox (EVT-1).
+    consumed:
+      name: consumed
+      description: |
+        This service is the consumer, not the producer. Per §7.1, this
+        service subscribes to exactly one inbound queue —
+        tenant-lifecycle-tokensvc-q, Core's TenantMembershipsPurged — driving
+        the offboarding cascade (§8.4). Canonical schema ownership for
+        anything tagged consumed sits with the producing service's own
+        contract, not this file — treat this definition as this service's
+        consumer-side documentation, kept in sync with upstream, not as the
+        source of truth.
+
+  messageTraits:
+    glueWireFormat:
+      description: |
+        Message body is prefixed with the 18-byte Glue Schema Registry wire-format header:
+        [0x03][0x00][16-byte schema version UUID (big-endian)] followed by the JSON payload.
+        Consumers must strip this header before parsing the EventEnvelope JSON.
+
+  messages:
+    ServiceAccountRegistered:
+      title: ServiceAccountRegistered
+      tags:
+        - $ref: '#/components/tags/published'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/ServiceAccountRegisteredPayload'
+
+    ServiceAccountCredentialIssued:
+      title: ServiceAccountCredentialIssued
+      tags:
+        - $ref: '#/components/tags/published'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/ServiceAccountCredentialIssuedPayload'
+
+    ServiceAccountCredentialRotated:
+      title: ServiceAccountCredentialRotated
+      tags:
+        - $ref: '#/components/tags/published'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/ServiceAccountCredentialRotatedPayload'
+
+    ServiceAccountCredentialRevoked:
+      title: ServiceAccountCredentialRevoked
+      tags:
+        - $ref: '#/components/tags/published'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/ServiceAccountCredentialRevokedPayload'
+
+    ServiceAccountRevoked:
+      title: ServiceAccountRevoked
+      tags:
+        - $ref: '#/components/tags/published'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/ServiceAccountRevokedPayload'
+
+    TenantMembershipsPurged:
+      title: TenantMembershipsPurged
+      description: Consumed only — canonical schema owned by the producing service (Core). additionalProperties left open.
+      tags:
+        - $ref: '#/components/tags/consumed'
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/TenantMembershipsPurgedPayload'
+
+  schemas:
+    EventEnvelopeBase:
+      type: object
+      description: Shared envelope fields on every event this service publishes (§7.3).
+      required: [id, type, source, specversion, time, data, tenant_id]
+      properties:
+        id: { type: string, format: uuid, description: "UUID v7, consumer dedup key (EVT-3)" }
+        type: { type: string, description: "PascalCase event name" }
+        source: { type: string, const: "iam-token-service" }
+        specversion: { type: string, const: "1" }
+        time: { type: string, format: date-time }
+        tenant_id: { type: string, format: uuid }
+        trace_id: { type: string }
+        actor: { type: string, description: "x-user-id of the actor — iam-system on cron/RP paths" }
+        dataschema: { type: string, description: "Glue schema-version UUID" }
+
+    ServiceAccountRegisteredPayload:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, principal_id, principal_sub, keycloak_client_id, principal_type, created_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        principal_id: { type: string, format: uuid }
+        principal_sub: { type: string, format: uuid }
+        keycloak_client_id: { type: string, const: "platform-automation" }
+        principal_type: { type: string, enum: [platform_automation] }
+        created_at: { type: string, format: date-time }
+
+    ServiceAccountCredentialIssuedPayload:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, principal_id, version, issued_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        principal_id: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        issued_at: { type: string, format: date-time }
+
+    ServiceAccountCredentialRotatedPayload:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, principal_id, version, prior_version, expires_prior_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        principal_id: { type: string, format: uuid }
+        version: { type: integer, minimum: 2 }
+        prior_version: { type: integer, minimum: 1 }
+        expires_prior_at: { type: string, format: date-time }
+
+    ServiceAccountCredentialRevokedPayload:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, principal_id, version, revoked_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        principal_id: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+        revoked_at: { type: string, format: date-time }
+
+    ServiceAccountRevokedPayload:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, principal_id, revoked_at]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        principal_id: { type: string, format: uuid }
+        revoked_at: { type: string, format: date-time }
+
+    TenantMembershipsPurgedPayload:
+      type: object
+      description: Consumed only — this service reads only tenant_id; the producing service's schema may carry additional fields.
+      additionalProperties: true
+      required: [tenant_id]
+      properties:
+        tenant_id: { type: string, format: uuid }

@@ -1,0 +1,128 @@
+# Reusable workflow — test gate.
+# Race detector (unit · contract · postgres/RLS · integration) + merged
+# coverage + arch lint + e2e. Called by ci.yml and release.yml. Gates the
+# build-image job.
+#
+# `make test-ci` (Makefile) is the single source of truth for how these
+# four suites run and how their coverage profiles merge — this workflow
+# just invokes it, rather than duplicating the test/coverpkg/merge logic
+# inline in YAML (that duplication was a real, previously-undetected gap:
+# an earlier version of this file ran `go test` with no -coverpkg at all,
+# which for these all-external "_test" packages silently produced a
+# near-empty "[no statements]" profile). Mirrors the sibling
+# iam-org-membership service's own validate-test.yml.
+name: Validate / Test
+
+"on":
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (leave empty to use the caller ref)'
+        type: string
+        required: false
+        default: ''
+    outputs:
+      pct:
+        description: 'Total statement coverage percentage'
+        value: ${{ jobs.test.outputs.pct }}
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  # 90% — the Makefile's COVER_PKG_LIST scopes coverage to internal/+pkg/
+  # only (deliberately excluding cmd/: every cmd/*/main.go composition-root
+  # function cannot be unit-invoked at all — see the Makefile's own comment
+  # on COVER_PKG_LIST). Measured total on that scope sits at ~96%; this
+  # floor leaves a buffer for normal variance. Ratchet up over time; never
+  # lower it to make a failing PR pass.
+  COVERAGE_THRESHOLD: '98'
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      pct: ${{ steps.gate.outputs.pct }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Configure private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Build (all three binaries)
+        run: make build
+
+      # Mandatory blocking gate: runs unit + contract + postgres/RLS +
+      # integration (all four, in parallel via `make -j4`) with -race and
+      # coverage, merged into coverage.out via scripts/merge_coverage.py
+      # (max-count strategy). Any data race detected here blocks all
+      # downstream jobs (trivy, smoke, push, release). Do NOT remove or
+      # skip. TEST_POSTGRES_PARALLEL lowered from the Makefile's
+      # dev-machine default (4) — GitHub-hosted runners have far less
+      # CPU/RAM headroom for concurrent testcontainers Postgres instances.
+      - name: Tests — unit · contract · postgres/RLS · integration (race + coverage)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+        run: make test-ci TEST_POSTGRES_PARALLEL=2
+
+      - name: Coverage threshold gate
+        id: gate
+        run: bash .github/scripts/coverage-gate.sh
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.sha }}
+          path: coverage.out
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Enforces this service's Clean Architecture layering (defined in
+      # .go-arch-lint.yml, §3.4/§6): core/domain -> core/port ->
+      # service/postgres/openbao/eventbus/metrics ->
+      # adapters_inbound/adapters_outbound/reconciler_jobs -> cmd.
+      # reconciler_jobs (cmd/rotator) may not depend on service.
+      - name: Cache go-arch-lint binary
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: go-arch-lint-${{ runner.os }}-v1.15.0
+
+      - name: Architecture lint
+        run: bash .github/scripts/arch-lint.sh
+
+      # Black-box, real-Postgres, production-wired-router suite (§14.4 —
+      # RLS cross-tenant isolation, full TS-1..TS-4 lifecycle over real
+      # HTTP). Correctness-only: not part of the coverage gate above —
+      # mirrors how the sibling IAM services treat their own e2e suites.
+      - name: Tests — e2e (real router + real Postgres, testcontainers)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+        run: make test-e2e

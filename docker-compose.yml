@@ -1,0 +1,275 @@
+services:
+  server:
+    build:
+      context: .
+      secrets:
+        - go_private_token
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment: &common-env
+      APP_ENV: dev
+      APP_NAME: iam-token-service
+      APP_PORT: "8080"
+      METRICS_PORT: "9090"
+      LOG_LEVEL: debug
+      PG_HOST: pgbouncer
+      PG_PORT: "5432"
+      PG_USER: serviceaccount_app
+      PG_PASSWORD: devpassword
+      PG_DBNAME: serviceaccount
+      PG_SSLMODE: disable
+      PG_MAX_CONNS: "20"
+      PG_MIN_CONNS: "0"
+      PG_BOUNCER_MODE: "true"
+      MIGRATION_DATABASE_URL: postgres://serviceaccount_migrator:devpassword@postgres:5432/serviceaccount?sslmode=disable
+      RECONCILER_DATABASE_URL: postgres://serviceaccount_reconciler:devpassword@postgres:5432/serviceaccount?sslmode=disable
+      # OpenBao (§6.3, §10.5, TS-CONFIG-3) — this service's client ONLY
+      # supports Kubernetes auth (no static-token override), and this
+      # compose stack has no real Kubernetes cluster for it to authenticate
+      # against. The container below runs, and /healthz/liveness is
+      # unaffected, but any real Write/Read/Delete call will fail at the
+      # auth/kubernetes/login step until seeded by hand (`bao login <root
+      # token>` — see the openbao service's own comment) or exercised for
+      # real via `make test-integration` instead, which bootstraps a fake
+      # Kubernetes TokenReview server precisely to make this login succeed.
+      OPENBAO_ADDR: http://openbao:8200
+      OPENBAO_ROLE: iam-token-service
+      OPENBAO_KV_MOUNT: iam
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://floci:4566
+      # Glue Schema Registry + SNS topic (§7.3.1, §25 frozen names) — Floci
+      # provisions both on start via scripts/init-floci.sh, so the real
+      # GlueCodec wire format runs locally instead of falling back to
+      # NoopCodec (Floci includes Glue Schema Registry in its free tier,
+      # unlike LocalStack Community which gates it behind Pro).
+      GLUE_REGISTRY_NAME: iam-serviceaccount-events
+      SNS_TOPIC_ARN: "arn:aws:sns:ap-south-1:000000000000:iam-serviceaccount-events"
+      SNS_TOPIC_SERVICEACCOUNT_ARN: "arn:aws:sns:ap-south-1:000000000000:iam-serviceaccount-events"
+      OUTBOX_POLL_INTERVAL: "500ms"
+      OUTBOX_BATCH_SIZE: "50"
+      OUTBOX_MAX_ATTEMPTS: "5"
+      OUTBOX_DRAIN_TIMEOUT: "30s"
+      OUTBOX_PUBLISH_CONCURRENCY: "4"
+      OUTBOX_PUBLISH_TIMEOUT: "10s"
+      OUTBOX_STARTUP_JITTER: "2s"
+      OUTBOX_CLAIM_LEASE_DURATION: "10m"
+      ROTATION_DEFAULT_OVERLAP_SECONDS: "300"
+      ROTATION_DEFAULT_CADENCE_DAYS: "90"
+      DOCS_ENABLED: "true"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      floci:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # The offboarding-cascade consumer (§7.1/§8.4) — a separate process from
+  # `server` sharing the same image, entrypoint overridden per
+  # deploy/helm/templates/deployment-consumer.yaml's convention. Enqueue-only:
+  # no Glue/SNS credentials needed, but AWS_REGION/AWS_ENDPOINT_URL are still
+  # required for the SQS client itself.
+  consumer:
+    build:
+      context: .
+      secrets:
+        - go_private_token
+    entrypoint: ["/iam-token-service-consumer"]
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    environment:
+      <<: *common-env
+      SQS_QUEUE_URL: "http://floci:4566/000000000000/tenant-lifecycle-tokensvc-q"
+      SQS_OFFBOARDING_QUEUE_URL: "http://floci:4566/000000000000/tenant-lifecycle-tokensvc-q"
+      SQS_CONCURRENCY: "2"
+      SQS_OFFBOARDING_CONCURRENCY: "2"
+      SQS_MAX_MESSAGES: "10"
+      SQS_WAIT_SECONDS: "20"
+      SQS_VISIBILITY_TIMEOUT: "60s"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      floci:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # The overlap-expiry sweep + orphan-material reconciler + prune (§8.3/§8.6,
+  # cmd/rotator's package doc comment) — run-to-completion, exits when done,
+  # exactly like the CronJob it stands in for locally. Kept out of the
+  # default `docker compose up` via the "rotator" profile; invoke explicitly:
+  #   docker compose --profile rotator run --rm rotator
+  rotator:
+    build:
+      context: .
+      secrets:
+        - go_private_token
+    entrypoint: ["/iam-token-service-rotator"]
+    profiles: ["rotator"]
+    environment:
+      <<: *common-env
+      PROCESSED_EVENTS_TTL_DAYS: "8"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # Deliberately a neutral bootstrap identity, NOT serviceaccount_app —
+      # see scripts/init-db.sql's header comment for why conflating the two
+      # would silently defeat RLS-6/RLS-7 (Postgres refuses to let the
+      # bootstrap superuser strip its own SUPERUSER bit). init-db.sql
+      # creates serviceaccount/serviceaccount_app/_migrator/_reconciler
+      # itself, connected as this "postgres" superuser.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5535:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    ports:
+      - "5536:5432"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: serviceaccount_app
+      DB_PASSWORD: devpassword
+      DB_NAME: serviceaccount
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 100
+      DEFAULT_POOL_SIZE: 5
+      AUTH_TYPE: scram-sha-256
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+      SERVER_TLS_SSLMODE: disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U serviceaccount_app || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # OpenBao: this service's only OpenBao integration is the KV v2 client in
+  # internal/adapter/outbound/openbao/client.go (per-tenant credential
+  # material, never Postgres — §6.3/TS-INV-2). Dev-server mode (in-memory,
+  # auto-unsealed, KV v2 already mounted at "secret/" by default, though this
+  # service always addresses its own "iam" mount — see OPENBAO_KV_MOUNT
+  # above) — NOT for production use (production OpenBao is externally
+  # managed, credentials via Kubernetes auth only, never env/image/git,
+  # §10.5/§20). The container prints its dev root token to stdout on startup
+  # (`docker compose logs openbao`); no Kubernetes cluster exists in this
+  # compose stack, so OPENBAO_ROLE's Kubernetes-auth login the app performs
+  # at runtime will not actually succeed here — local dev work that needs a
+  # live credential round trip must seed OpenBao by hand (`bao login <root
+  # token>` against this container, then `bao secrets enable -path=iam
+  # kv-v2` and write test material directly) rather than relying on
+  # `docker compose up` alone; test/integration/openbao_test.go is what
+  # exercises the real Kubernetes-auth login end to end.
+  openbao:
+    image: openbao/openbao:latest
+    command: ["server", "-dev"]
+    ports:
+      - "8210:8200"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  floci:
+    # Floci — open-source (MIT), always-free AWS emulator; drop-in
+    # LocalStack replacement. Unlike LocalStack Community, Glue Schema
+    # Registry ships in the free tier, so this single service covers
+    # SNS + SQS + Glue with no Pro tier / auth token needed —
+    # scripts/init-floci.sh provisions the Glue registry, all 5 schemas,
+    # and the SNS/SQS topology alongside it.
+    image: floci/floci:2.1.0-compat
+    ports:
+      - "4568:4566"
+    environment:
+      FLOCI_DEFAULT_REGION: ap-south-1
+      FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
+      # Rewrites the host in SQS QueueUrl / SNS TopicArn responses (e.g.
+      # http://floci:4566/... instead of http://localhost:4566/...) so the
+      # floci-ui container below — which resolves those URLs directly,
+      # AWS-SDK-console fashion — can actually reach them from inside its
+      # own container.
+      FLOCI_HOSTNAME: floci
+      FLOCI_INIT_HOOKS_TIMEOUT_SECONDS: "60"
+    volumes:
+      - floci_data:/app/data
+      - ./scripts/init-floci.sh:/etc/floci/init/ready.d/init-floci.sh
+      - ./internal/eventschema:/etc/floci/init/schemas:ro
+    healthcheck:
+      # The compat image's AWS CLI defaults to region us-east-1 regardless
+      # of FLOCI_DEFAULT_REGION — floci treats region as an isolation
+      # boundary, so --region must be explicit here.
+      #
+      # Checks for the LAST resource init-floci.sh creates (the
+      # ServiceAccountRevoked Glue schema), not just SNS reachability — SNS
+      # topics exist a few seconds into the script while Glue registration
+      # is still running, so a shallow `sns list-topics` check would report
+      # "healthy" (and unblock the app services' depends_on) before
+      # GLUE_REGISTRY_NAME's schemas actually exist, crashing GlueCodec's
+      # startup prefetch.
+      test: ["CMD", "aws", "--region", "ap-south-1", "glue", "get-schema",
+             "--schema-id", "RegistryName=iam-serviceaccount-events,SchemaName=ServiceAccountRevoked"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  floci-ui:
+    # Web console for floci — browse SNS/SQS/Glue resources at
+    # http://localhost:4502 instead of the aws CLI.
+    image: floci/floci-ui:0.5.0
+    ports:
+      - "4502:4500"
+    environment:
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      FLOCI_ENDPOINT: http://floci:4566
+      AWS_ENDPOINT_URL: http://floci:4566
+      PORT: "4500"
+    depends_on:
+      floci:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  floci_data:
+
+secrets:
+  go_private_token:
+    file: .go_private_token

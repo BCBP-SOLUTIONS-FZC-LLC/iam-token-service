@@ -1,0 +1,32 @@
+%% Transactional outbox (LLD §7.3.1/§7.4, EVT-1). Enqueue-time validation
+%% is schema-check-only, plain JSON; Glue wire-encoding happens later, at
+%% publish time — so outbox_events.payload stays human-readable.
+sequenceDiagram
+    participant SVC as CredentialService / OffboardingConsumer
+    participant CODEC as ValidatingCodec
+    participant TX as Postgres transaction
+    participant OUT as outbox_events
+    participant RUNNER as outbox.Runner (500ms poll)
+    participant GLUE as GlueCodec
+    participant REG as AWS Glue Schema Registry<br/>(iam-serviceaccount-events)
+    participant SNS as SNS: iam.serviceaccount.events
+    participant SQS as serviceaccount-audit-q
+
+    SVC->>CODEC: Encode(eventType, jsonPayload) — validate only,<br/>encoded bytes discarded
+    CODEC-->>SVC: ok (schema-valid) or error
+    SVC->>TX: same RunInTx as the business write:<br/>INSERT/UPDATE credential row<br/>INSERT outbox_events (plain JSON envelope)
+    TX-->>SVC: commit — row and event are atomic (EVT-1)
+
+    loop every 500ms
+        RUNNER->>OUT: SELECT unrelayed rows (FOR UPDATE SKIP LOCKED)
+        OUT-->>RUNNER: batch
+        RUNNER->>GLUE: WithCodec(glueCodec).Encode(eventType, payload)
+        GLUE->>REG: fetch/cache schema version UUID for eventType
+        REG-->>GLUE: schema version id
+        GLUE-->>RUNNER: 18-byte Glue header + payload
+        RUNNER->>SNS: Publish(EventType attr, glue-wire-encoded body)
+        SNS-->>SQS: fan-out (SNS filter policy: EventType present)
+        RUNNER->>OUT: mark relayed
+    end
+
+    Note over SVC,SQS: 5 frozen event names (§25): ServiceAccountRegistered,<br/>...CredentialIssued, ...CredentialRotated, ...CredentialRevoked,<br/>ServiceAccountRevoked. Single producer, single registry.<br/>No payload ever carries a secret (TS-INV-2/EVT-2).
