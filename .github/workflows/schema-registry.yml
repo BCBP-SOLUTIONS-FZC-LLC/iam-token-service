@@ -91,6 +91,7 @@ name: Glue Schema Registry
 
 permissions:
   contents: read
+  packages: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -107,12 +108,20 @@ jobs:
     environment: staging
     permissions:
       contents: write
+      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write   # OIDC — AWS role assumption, no long-lived keys (§13.5)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 2    # HEAD~1 needed for the enum semantic drift check
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
@@ -382,6 +391,7 @@ jobs:
     environment: production
     permissions:
       contents: write
+      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write
     steps:
       - name: Checkout
@@ -389,6 +399,13 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
           fetch-depth: 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
@@ -643,12 +660,20 @@ jobs:
     environment: staging
     permissions:
       contents: read
+      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"

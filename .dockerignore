@@ -1,5 +1,6 @@
 .git
 .github
+.claude
 .coverage
 bin
 *.out
@@ -8,5 +9,11 @@ coverage.*
 .env-example
 test
 deploy
+# docs/ is otherwise pure documentation (LLD, architecture diagrams,
+# registry proposals) — EXCEPT docs/swagger/, which is generated Go
+# source (docs.go) that cmd/server/main.go imports as a real package;
+# excluding it entirely breaks the image build ("no required module
+# provides package .../docs/swagger").
 docs
+!docs/swagger
 *.md
