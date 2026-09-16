@@ -26,6 +26,8 @@ versions, custodies, tracks status); the **Realm Provisioner** is the sole
 [Credential issue/rotate flow](ARCHITECTURE.md#credential-issuerotate-flow-ts-1)
 for the exact hand-off.
 
+---
+
 ## Why this service exists
 
 The automation principal's credential needs a home that is neither
@@ -35,6 +37,8 @@ issue/rotate semantics, or the offboarding cascade. This service exists to
 be that home: a small, single-purpose credential authority with exactly one
 external secret-storage dependency (OpenBao) and zero Keycloak Admin API
 surface.
+
+---
 
 ## API overview
 
@@ -69,6 +73,8 @@ surface at MVP.
 There is no listing endpoint (`GET .../service-accounts`) at MVP — there is
 exactly one automation principal per tenant, read directly by TS-3.
 
+---
+
 ## Input validation
 
 Applied in the service layer before any write, so a validation failure
@@ -89,6 +95,8 @@ in `details.field`.
 - Mutation responses always include `record_version` so callers can
   round-trip the optimistic-concurrency token; no response body ever
   includes a stored secret except TS-1's freshly-generated plaintext.
+
+---
 
 ## Architecture
 
@@ -125,6 +133,8 @@ privilege no HTTP- or event-triggered code path may ever hold.
 outbox, SNS/SQS transport), `platform-gincommon` (HTTP middleware chain,
 health/readiness, structured logging), `openbao/openbao/api/v2` (the
 OpenBao SDK — Kubernetes auth method only).
+
+---
 
 ## Integrating with other services
 
@@ -196,6 +206,8 @@ behind a NetworkPolicy allow-list, not external/public traffic.
 reconciler on a cron schedule; both are read-only from any other service's
 perspective — they only ever touch this service's own rows and its own
 OpenBao paths.
+
+---
 
 ## Local development
 
@@ -272,29 +284,110 @@ emulator at `http://localhost:4502`; `make cover`/`make cover-func` render
 the merged coverage profile; `make pin-base-images` refreshes the
 Dockerfile's pinned digests.
 
+---
+
 ## Testing domain events locally
 
-1. **Start the stack**: `make docker-up` (brings up Floci, which
-   provisions the Glue registry, all 5 schemas, and the SNS/SQS topology
-   via `scripts/init-floci.sh` on startup).
-2. **Run the service**: `make run` (issues/rotations you trigger via curl
-   now enqueue real outbox rows and the outbox runner relays them through
-   Floci's SNS/SQS).
-3. **Watch the queue** in `floci-ui` at `http://localhost:4502`, or peek
-   via the AWS CLI against the emulator endpoint:
-   ```bash
-   aws --endpoint-url http://localhost:4568 --region ap-south-1 \
-     sqs receive-message --queue-url http://localhost:4568/000000000000/serviceaccount-audit-q
-   ```
-4. **Trigger an event**: call TS-1 (issue/rotate) or TS-2 (revoke) per the
-   curl examples above, then look for the corresponding
-   `ServiceAccountCredential{Issued,Rotated,Revoked}` message.
+Every mutating write publishes a domain event through a **transactional
+outbox → SNS → SQS** pipeline, same as the sibling IAM services.
 
-**Troubleshooting:** if `floci` never reports healthy, check
-`docker compose logs floci` — its healthcheck specifically waits for the
-`ServiceAccountRevoked` Glue schema to exist (the last resource
-`init-floci.sh` creates), not just SNS reachability, so a slow init looks
-like a stuck healthcheck rather than a real failure for the first ~10–20s.
+### How the pipeline works
+
+```
+HTTP write (TS-1/TS-2/TS-4) or cmd/rotator sweep
+    │
+    ▼
+service layer  ──(same tx)──▶  outbox_events (Postgres)
+                                      │
+                               outbox runner (OUTBOX_POLL_INTERVAL, 500 ms)
+                                      │
+                                      ▼
+                       SNS: iam-serviceaccount-events   (floci)
+                                      │
+                    SNS fan-out to serviceaccount-audit-q (local dev only)
+```
+
+An outbox insert is atomic with the business write — a `2xx` response
+guarantees an `outbox_events` row exists.
+
+### Step 1 — Start infrastructure
+
+```bash
+make docker-up
+```
+
+`scripts/init-floci.sh` runs automatically and provisions the SNS topic,
+the inbound `tenant-lifecycle-tokensvc-q` queue, the outbound
+`serviceaccount-audit-q` subscriber queue, and the `iam-serviceaccount-events`
+Glue registry + all 5 schemas — floci includes Glue Schema Registry in its
+free tier, so `GLUE_REGISTRY_NAME` is set by default in `.env-example` and
+the real Glue wire-format codec runs locally instead of falling back to
+`NoopCodec`.
+
+### Step 2 — Verify SNS/SQS/Glue exist
+
+```bash
+docker compose exec floci aws --region ap-south-1 sns list-topics
+docker compose exec floci aws --region ap-south-1 sqs list-queues
+docker compose exec floci aws --region ap-south-1 glue list-schemas --registry-id RegistryName=iam-serviceaccount-events
+```
+
+### Step 2b — Verify event delivery in the browser (floci-ui)
+
+`make docker-up` also starts **floci-ui**, a web console for floci, at
+**http://localhost:4502**. It's a faster way to confirm an event landed on
+the right queue than shelling into the CLI each time:
+
+1. Open **http://localhost:4502** → sidebar → **Integration → SQS**. You'll
+   see `serviceaccount-audit-q` and `tenant-lifecycle-tokensvc-q`, each with
+   a **Messages** column.
+2. Trigger an event — call TS-1 (issue/rotate) or TS-2 (revoke) per the
+   curl examples above.
+3. Refresh the SQS list. The **Messages** count on `serviceaccount-audit-q`
+   should go up by one — this registry is single-producer/single-topic
+   (§25), so every published event fans out to that one catch-all queue,
+   unlike a sibling service's per-`EventType` filter policies.
+
+### Step 2c — Retrieve the event body (CLI)
+
+```bash
+# Peek without deleting — the message stays and becomes visible again after
+# the queue's VisibilityTimeout (30s by default).
+docker compose exec floci aws --region ap-south-1 sqs receive-message \
+  --queue-url http://floci:4566/000000000000/serviceaccount-audit-q \
+  --max-number-of-messages 10 --message-attribute-names All
+```
+
+Or skip SQS entirely and read the outbox table directly — fastest during
+dev, and shows the plain-JSON payload before the Glue wire-format header is
+prepended at publish time:
+
+```bash
+docker compose exec postgres psql -U serviceaccount_app -d serviceaccount -c \
+  "SELECT event_type, jsonb_pretty(payload::jsonb) FROM outbox_events ORDER BY created_at DESC LIMIT 3;"
+```
+
+### Step 3 — Trigger an event and inspect the outbox
+
+```bash
+make run
+# ... issue a TS-1/TS-2/TS-4 call (see "Calling the API locally" above) ...
+
+docker compose exec postgres psql -U serviceaccount_app -d serviceaccount -c \
+  "SELECT id, event_type, published_at IS NOT NULL AS published, attempts
+   FROM outbox_events ORDER BY created_at DESC LIMIT 20;"
+```
+
+### Troubleshooting events
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `outbox_events` row never gets `published_at` set | `SNS_TOPIC_SERVICEACCOUNT_ARN` mismatch, or outbox runner not started | Re-check `.env` against `aws --region ap-south-1 sns list-topics` (or floci-ui at http://localhost:4502) |
+| `outbox_events` empty after a write | Row was published and pruned, or the write never committed | Re-check the HTTP response code — a `2xx` guarantees the row was committed |
+| Messages keep reappearing after `receive-message` | Normal — SQS visibility timeout, not deletion | Use `delete-message` |
+| `floci` never reports healthy | Its healthcheck specifically waits for the `ServiceAccountRevoked` Glue schema to exist (the last resource `init-floci.sh` creates), not just SNS reachability | Check `docker compose logs floci` — a slow init looks like a stuck healthcheck rather than a real failure for the first ~10–20s |
+
+---
 
 ## Testing
 
@@ -316,6 +409,8 @@ like a stuck healthcheck rather than a real failure for the first ~10–20s.
 never be unit-invoked; `test/e2e` proves it works instead), merges all
 profiles with a max-count strategy, and enforces the CI coverage floor in
 `.github/workflows/validate-test.yml`.
+
+---
 
 ## Environment variables
 
@@ -342,6 +437,8 @@ profiles with a max-count strategy, and enforces the CI coverage floor in
 See `.env-example` for the complete, currently-accurate list with inline
 comments — this table is a curated summary, not a substitute.
 
+---
+
 ## Security
 
 | Topic | Guidance |
@@ -357,6 +454,8 @@ comments — this table is a curated summary, not a substitute.
 | Break-glass revoke | TS-2 alone does not invalidate a live secret at Keycloak (TS-INV-7) — pair with the Realm Provisioner action |
 | NetworkPolicy ingress | `networkPolicy.ingressNamespaceSelector` has no safe default — the Helm render fails closed if left unset rather than falling back to an unrestricted `{}` selector |
 | Go-code SAST | `gosec` (`make sast`), distinct from `govulncheck` (dependency CVEs) and the release pipeline's Trivy scan (container/OS CVEs) |
+
+---
 
 ## Observability
 
@@ -409,6 +508,8 @@ event envelope's `trace_id` so a rotation is traceable end-to-end.
 Structured `slog` JSON logs carry `tenant_id`/`principal_id`/`version`/`op`/
 `result` — never a credential field.
 
+---
+
 ## Deployment
 
 ### Container image — three binaries
@@ -421,14 +522,21 @@ Structured `slog` JSON logs carry `tenant_id`/`principal_id`/`version`/`op`/
 
 ### Helm chart
 
-`deploy/helm/` — `Deployment` × 2 (server, consumer, each 2 replicas for
-HA, not load), `CronJob` × 1 (rotator — `activeDeadlineSeconds: 240s`,
+`deploy/helm/` — `Deployment` × 2 (server, consumer, each `replicaCount: 2`
+for HA, not load), `CronJob` × 1 (rotator — `activeDeadlineSeconds: 240s`,
 deliberately shorter than its 5-minute schedule so a run never eats into
 the next scheduled tick under `concurrencyPolicy: Forbid`), `NetworkPolicy`
 restricting ingress to in-mesh callers (`networkPolicy.ingressNamespaceSelector`
 is required — the render fails if left unset), `ServiceAccount` bound to
 the OpenBao Kubernetes-auth role, `PrometheusRule` + `ServiceMonitor`,
-`PodDisruptionBudget`.
+`PodDisruptionBudget` (`minAvailable: 1`).
+
+HPA (`autoscaling.enabled`, 2–8 replicas on CPU 70%/memory 75%) and
+Ingress/HTTPRoute/SecurityPolicy (`ingress.enabled`) both ship as
+disabled-by-default scaffolding, matching the sibling IAM services'
+chart shape — this service has no public surface today (all routes are
+`/api/v1/internal/*`) and a fixed `replicaCount` is the current scaling
+model, so neither actually renders unless explicitly turned on.
 
 ### Migration safety
 
@@ -438,22 +546,45 @@ session-scoped and breaks under transaction pooling. Nothing has been
 deployed to any environment yet, so migrations are outright (no
 expand/contract dance) — there is exactly one so far.
 
+---
+
 ## CI
 
-- **`validate-test.yml`** — `make test-ci` (unit + contract + Postgres +
-  integration, parallel, merged coverage) as one gate, plus a separate
-  `test-e2e` step and the architecture-lint script.
-- **`validate-quality.yml`** — format/vet/build across all build-tag
-  variants, `golangci-lint`, `govulncheck`, `gosec` (Go-code SAST).
-- **`ci.yml`** — the invariant gates (`no-gocloak`/TS-INV-1,
-  `no-secret-log`/TS-INV-2, `set-local-only`/RLS-6, `gincommon-obs`,
-  `metrics-taxonomy` — Enterprise Platform Observability Standard naming
-  compliance).
-- **`schema-registry.yml`** — `schema-gov validate`/`diff`/`register`
-  against `api/asyncapi.yaml` and the Glue registry.
+Nine workflow files:
+
+- **`ci.yml`** — orchestrator. Runs `validate-test.yml` and
+  `validate-quality.yml` in parallel with `build-image` (Buildx cached
+  build → Trivy CVE scan → smoke tests). On push to `main`: builds+pushes
+  to GHCR.
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + contract +
+  Postgres/RLS + integration, `-race`, merged coverage) → coverage
+  threshold gate (**98%**) → `go-arch-lint` → Swagger staleness check →
+  event-schema sync check → `test-e2e`.
+- **`validate-quality.yml`** (reusable) — `go mod verify` → `gofmt` check →
+  `go mod tidy` drift check → `go vet` → `golangci-lint` → the invariant
+  gates (`no-gocloak`/TS-INV-1, `no-secret-log`/TS-INV-2,
+  `set-local-only`/RLS-6, `gincommon-obs`, `metrics-taxonomy`) →
+  `govulncheck` → `gosec` (SAST).
 - **`changelog-check.yml`** — requires a `CHANGELOG.md` entry on every PR
   touching runtime behavior.
-- **`release.yml`** — SBOM + Trivy + Cosign image signing on tag push.
+- **`release.yml`** — tag-triggered release pipeline: re-validate →
+  build+cross-compile → Docker build/push/sign → GitHub Release publish.
+- **`schema-registry.yml`** — registers this service's 5 event schemas to
+  the single-producer `iam-serviceaccount-events` Glue registry: PR
+  read-only validate+diff, push-to-`main` full
+  validate→diff→register→changelog.
+- **`schema-prune.yml`** — monthly dry-run orphan-schema report plus an
+  operator execute path.
+- **`schema-health-quarterly.yml`** — read-only quarterly
+  lifecycle-annotation lint + Glue version-accumulation scan.
+- **`freeze-watchdog.yml`** — daily cron alerting when a schema-registry
+  `SCHEMA_FREEZE` has been left active too long.
+
+**Required GitHub Actions repository secret: `GO_PRIVATE_TOKEN`** — every
+workflow that runs `go mod download`, or installs `schema-gov` from source
+(the private `platform-schemagov` repo), needs it.
+
+---
 
 ## Docker
 
@@ -489,6 +620,8 @@ OPENBAO_ADDR=http://localhost:8210 OPENBAO_ROLE=iam-token-service OPENBAO_KV_MOU
 AWS_REGION=ap-south-1 AWS_ENDPOINT_URL=http://localhost:4568 GLUE_REGISTRY_NAME=iam-serviceaccount-events
 ```
 
+---
+
 ## Cross-service dependencies
 
 | Direction | Service | Relationship |
@@ -499,6 +632,8 @@ AWS_REGION=ap-south-1 AWS_ENDPOINT_URL=http://localhost:4568 GLUE_REGISTRY_NAME=
 | Consumes from | Org & Membership / Core | `TenantMembershipsPurged` (tenant-lifecycle topic) |
 | Publishes to | Audit Log | 5 events on `iam-serviceaccount-events` |
 | Never calls | Keycloak Admin API | TS-INV-1 — zero `gocloak` dependency |
+
+---
 
 ## Out of scope
 
@@ -511,11 +646,28 @@ AWS_REGION=ap-south-1 AWS_ENDPOINT_URL=http://localhost:4568 GLUE_REGISTRY_NAME=
   of the same schema, not built).
 - A public/tenant-facing API surface (MVP is internal-mesh-only).
 
+---
+
 ## Contributing
 
-See `CONTRIBUTING.md` if present, or open a PR against `main` — CI must
-pass (`make lint`, `make gates`, `make test-ci`) and `CHANGELOG.md` must be
-updated for any runtime-behavior change.
+Open a PR against `main` — CI must pass (`make lint`, `make gates`,
+`make test-ci`) and `CHANGELOG.md` must be updated for any
+runtime-behavior change. There is no separate `CONTRIBUTING.md` in this
+repo yet; the tables below are the closest thing to a contributor guide.
+
+| Document | Description |
+|---|---|
+| [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | Top-level guidance for Claude Code working in this repo |
+| [`.claude/architecture.md`](.claude/architecture.md) | Package layout, `.go-arch-lint.yml` dependency rules |
+| [`.claude/database-schema.md`](.claude/database-schema.md) | Tables, RLS, triggers, invariants |
+| [`.claude/api-events.md`](.claude/api-events.md) | Endpoint catalogue, event contract |
+| [`.claude/request-flows.md`](.claude/request-flows.md) | Per-flow walkthroughs, concurrency, failure handling |
+| [`.claude/operations.md`](.claude/operations.md) | Security, observability, config, deployment, testing |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Detailed architecture narrative with diagrams |
+| [`docs/iam-lld-token-service.md`](docs/iam-lld-token-service.md) | Full LLD (rev 1.0, Approved) — §16 open questions, §17 error taxonomy, §25 frozen name inventory |
+| [`docs/observability-registry-proposals.md`](docs/observability-registry-proposals.md) | Tier-1/Tier-2 metric registry submissions pending ratification |
+
+---
 
 ## License / ownership
 
