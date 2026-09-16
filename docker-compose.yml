@@ -230,7 +230,7 @@ services:
     volumes:
       - floci_data:/app/data
       - ./scripts/init-floci.sh:/etc/floci/init/ready.d/init-floci.sh
-      - ./internal/eventschema:/etc/floci/init/schemas:ro
+      - ./internal/adapter/outbound/eventbus/schemas:/etc/floci/init/schemas:ro
     healthcheck:
       # The compat image's AWS CLI defaults to region us-east-1 regardless
       # of FLOCI_DEFAULT_REGION — floci treats region as an isolation

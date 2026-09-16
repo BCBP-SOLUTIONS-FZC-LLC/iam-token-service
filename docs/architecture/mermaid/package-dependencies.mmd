@@ -9,7 +9,6 @@ graph LR
     service --> port
     service --> requestctx
 
-    eventschema["eventschema<br/>(anyVendorDeps only)"]
     apispec["apispec<br/>(anyVendorDeps only)"]
     swaggerdocs["swaggerdocs<br/>(anyVendorDeps only)"]
 
@@ -26,7 +25,6 @@ graph LR
     adapters_outbound["adapters_outbound<br/>(eventbus)"] --> domain
     adapters_outbound --> port
     adapters_outbound --> service
-    adapters_outbound --> eventschema
     adapters_outbound --> observability
 
     adapters_inbound["adapters_inbound<br/>(http, consumer)"] --> domain
@@ -47,7 +45,6 @@ graph LR
     cmd --> port
     cmd --> service
     cmd --> requestctx
-    cmd --> eventschema
     cmd --> apispec
     cmd --> swaggerdocs
     cmd --> postgres

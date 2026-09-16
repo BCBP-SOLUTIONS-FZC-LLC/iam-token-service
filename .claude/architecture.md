@@ -23,12 +23,12 @@ internal/
       postgres/   repositories, RLS GUC binding, TxRunner, migrations/
       openbao/    KV v2 client, Kubernetes auth (client.go)
       eventbus/   Publisher, ValidatingCodec, GlueCodec
+        schemas/  embedded JSON Schemas (5 published + 1 consumed)
       metrics/    Prometheus instruments (3-tier taxonomy)
 pkg/
   requestctx/  request-scoped context helpers
 api/           embedded asyncapi.yaml
 docs/swagger/  generated OpenAPI (make swag)
-internal/eventschema/  embedded JSON Schemas for the 5 published events
 ```
 
 ## Shared library dependencies
@@ -48,7 +48,7 @@ internal/eventschema/  embedded JSON Schemas for the 5 published events
 | `observability` (`adapter/outbound/metrics`) | `domain`, `port`, `service` |
 | `postgres` | `domain`, `port` |
 | `openbao` | `domain`, `port` |
-| `adapters_outbound` (`eventbus`) | `domain`, `port`, `service`, `eventschema`, `observability` |
+| `adapters_outbound` (`eventbus`) | `domain`, `port`, `service`, `observability` |
 | `adapters_inbound` (`http`, `consumer`) | `domain`, `port`, `service`, `requestctx`, `apispec`, `observability` |
 | `reconciler_jobs` (`cmd/rotator`) | `domain`, `port`, `postgres`, `openbao`, `observability`, `adapters_outbound` — **never `service`** |
 | `cmd` (`server`, `consumer`) | everything |

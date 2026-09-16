@@ -122,7 +122,7 @@ jobs:
         run: bash .github/scripts/check-swagger-stale.sh
 
       # api/asyncapi.yaml is the single source of truth for event payload schemas.
-      # internal/eventschema/*.json are derived from it and read by the
+      # internal/adapter/outbound/eventbus/schemas/*.json are derived from it and read by the
       # schema-gov governance tool. --check mode exits 1 if any file would
       # change without writing.
       #
@@ -150,7 +150,7 @@ jobs:
         run: |
           schema-gov extract \
             --asyncapi   api/asyncapi.yaml \
-            --schema-dir internal/eventschema \
+            --schema-dir internal/adapter/outbound/eventbus/schemas \
             --check
 
       # Black-box, real-Postgres, production-wired-router suite (§14.4 —

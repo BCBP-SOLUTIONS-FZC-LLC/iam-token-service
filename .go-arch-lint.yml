@@ -32,11 +32,6 @@ components:
   requestctx:
     in: pkg/requestctx
 
-  # Embedded JSON schemas for the 5 published events, validated at
-  # outbox-enqueue time by the eventbus adapter's ValidatingCodec (§7.3.1).
-  eventschema:
-    in: internal/eventschema
-
   # Embedded AsyncAPI spec asset (api/asyncapi.yaml, api/embed.go) — single
   # source of truth for the event contract (§7.3).
   apispec:
@@ -108,9 +103,6 @@ deps:
   requestctx:
     anyVendorDeps: true
 
-  eventschema:
-    anyVendorDeps: true
-
   apispec:
     anyVendorDeps: true
 
@@ -139,7 +131,6 @@ deps:
       - domain
       - port
       - service
-      - eventschema
       - observability
 
   adapters_inbound:
@@ -166,7 +157,6 @@ deps:
       - port
       - service
       - requestctx
-      - eventschema
       - apispec
       - swaggerdocs
       - postgres

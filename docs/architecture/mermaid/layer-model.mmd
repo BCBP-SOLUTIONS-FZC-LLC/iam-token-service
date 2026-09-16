@@ -31,7 +31,6 @@ graph TD
     end
 
     REQCTX["pkg/requestctx"]
-    ESCHEMA["internal/eventschema<br/>embedded JSON Schemas"]
     APISPEC["api<br/>embedded asyncapi.yaml"]
     SWAGGERDOCS["docs/swagger<br/>generated OpenAPI"]
 
@@ -53,7 +52,6 @@ graph TD
     CONS --> PORT
     CONS --> OBS
     EVENTBUS --> SERVICE
-    EVENTBUS --> ESCHEMA
     POSTGRES --> PORT
     OPENBAO --> PORT
     OBS --> SERVICE

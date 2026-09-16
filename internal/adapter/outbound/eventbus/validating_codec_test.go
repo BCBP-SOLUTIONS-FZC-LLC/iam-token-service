@@ -24,14 +24,16 @@ func (r *recordingCodec) Encode(_ context.Context, eventType string, payload []b
 func TestNewValidatingCodec_CompilesAllEmbeddedSchemas(t *testing.T) {
 	c, err := NewValidatingCodec(NoopCodec{})
 	require.NoError(t, err)
-	// 5 frozen produced events (§25).
-	assert.Len(t, c.schemas, 5)
+	// 5 frozen produced events (§25) + TenantMembershipsPurged (consumed,
+	// kept for schema-gov coverage) — every schemas/*.json file compiles.
+	assert.Len(t, c.schemas, 6)
 	for _, name := range []string{
 		"ServiceAccountRegistered",
 		"ServiceAccountCredentialIssued",
 		"ServiceAccountCredentialRotated",
 		"ServiceAccountCredentialRevoked",
 		"ServiceAccountRevoked",
+		"TenantMembershipsPurged",
 	} {
 		assert.Contains(t, c.schemas, name)
 	}
@@ -87,9 +89,11 @@ func TestValidatingCodec_Encode_NonJSONPayloadFails(t *testing.T) {
 }
 
 // TestValidatingCodec_Encode_UnregisteredEventTypePassesThroughUnvalidated
-// covers the pass-through branch for an event type with no embedded
-// schema — TenantMembershipsPurged is this service's one *consumed* event
-// (api/asyncapi.yaml), never produced/validated here.
+// covers the pass-through branch for an event type with no embedded schema
+// at all — every event type this service actually publishes or consumes
+// has one (all 6 schemas/*.json files compile, TestNewValidatingCodec_
+// CompilesAllEmbeddedSchemas above), so this only protects a future caller
+// invoking Encode with an unrelated string.
 func TestValidatingCodec_Encode_UnregisteredEventTypePassesThroughUnvalidated(t *testing.T) {
 	c, err := NewValidatingCodec(NoopCodec{})
 	require.NoError(t, err)
@@ -98,12 +102,35 @@ func TestValidatingCodec_Encode_UnregisteredEventTypePassesThroughUnvalidated(t 
 	c2 := &ValidatingCodec{inner: inner, schemas: c.schemas}
 
 	payload := []byte(`{"anything":"goes"}`)
-	encoded, schemaVersionID, err := c2.Encode(context.Background(), "TenantMembershipsPurged", payload)
+	encoded, schemaVersionID, err := c2.Encode(context.Background(), "SomeFutureEventTypeWithNoSchema", payload)
 	require.NoError(t, err)
 	assert.Equal(t, "inner-version", schemaVersionID)
 	assert.Equal(t, payload, encoded)
 	assert.Equal(t, 1, inner.calls)
-	assert.Equal(t, "TenantMembershipsPurged", inner.gotType)
+	assert.Equal(t, "SomeFutureEventTypeWithNoSchema", inner.gotType)
+}
+
+// TestValidatingCodec_Encode_ConsumedEventSchemaIsAlsoValidated covers
+// TenantMembershipsPurged — this service's one *consumed* event
+// (api/asyncapi.yaml). Its schema is compiled the same as every produced
+// one (NewValidatingCodec compiles every schemas/*.json file), so a call
+// with that event type is validated too, even though this service never
+// produces it in practice.
+func TestValidatingCodec_Encode_ConsumedEventSchemaIsAlsoValidated(t *testing.T) {
+	c, err := NewValidatingCodec(NoopCodec{})
+	require.NoError(t, err)
+
+	t.Run("valid payload passes", func(t *testing.T) {
+		payload := []byte(`{"tenant_id": "11111111-1111-1111-1111-111111111111"}`)
+		_, _, err := c.Encode(context.Background(), "TenantMembershipsPurged", payload)
+		require.NoError(t, err)
+	})
+
+	t.Run("missing required tenant_id fails", func(t *testing.T) {
+		_, _, err := c.Encode(context.Background(), "TenantMembershipsPurged", []byte(`{}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "validate TenantMembershipsPurged")
+	})
 }
 
 func TestValidatingCodec_Encode_ValidPayloadForEveryProducedEvent(t *testing.T) {

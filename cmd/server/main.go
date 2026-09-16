@@ -30,7 +30,6 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/openbao"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/eventschema"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
@@ -197,8 +196,12 @@ func main() {
 	// never hardcoded in this binary (TS-CONFIG-1).
 	validateRequiredEnv(appEnv)
 
-	schemaNames := make([]string, 0, len(eventschema.ByEventType))
-	for name := range eventschema.ByEventType {
+	producedSchemas, err := eventbusadapter.ProducedSchemas()
+	if err != nil {
+		panic(fmt.Sprintf("load produced event schemas: %v", err))
+	}
+	schemaNames := make([]string, 0, len(producedSchemas))
+	for name := range producedSchemas {
 		schemaNames = append(schemaNames, name)
 	}
 	glueCodec, err := buildGlueCodec(ctx, glueClient, os.Getenv("GLUE_REGISTRY_NAME"), schemaNames, log)

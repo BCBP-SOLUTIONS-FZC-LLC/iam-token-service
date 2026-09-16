@@ -1,4 +1,4 @@
-package eventschema_test
+package eventbus
 
 import (
 	"os"
@@ -10,22 +10,20 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/eventschema"
 )
 
 // TestAsyncAPIVsSchemaDrift is this service's asyncapi-vs-Glue drift gate
 // substitute for CI environments without live AWS credentials (§13.4): it
 // asserts api/asyncapi.yaml's 5 `send` message definitions on the
 // iamServiceAccountEvents channel name exactly the 5 events this service
-// has an embedded JSON Schema for (internal/eventschema.ByEventType) — the
-// same 5 names frozen in LLD §25. A mismatch here means either a new event
-// was added to the AsyncAPI spec without a schema (or vice versa), which is
+// has an embedded, produced JSON Schema for (ProducedSchemas) — the same 5
+// names frozen in LLD §25. A mismatch here means either a new event was
+// added to the AsyncAPI spec without a schema (or vice versa), which is
 // exactly the class of drift the Glue-registry gate exists to catch.
 func TestAsyncAPIVsSchemaDrift(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	require.True(t, ok)
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "..")
 	specPath := filepath.Join(repoRoot, "api", "asyncapi.yaml")
 	spec, err := os.ReadFile(specPath)
 	require.NoError(t, err, "api/asyncapi.yaml must exist and be readable")
@@ -48,12 +46,14 @@ func TestAsyncAPIVsSchemaDrift(t *testing.T) {
 	}
 	sort.Strings(specNames)
 
+	schemas, err := ProducedSchemas()
+	require.NoError(t, err)
 	var schemaNames []string
-	for name := range eventschema.ByEventType {
+	for name := range schemas {
 		schemaNames = append(schemaNames, name)
 	}
 	sort.Strings(schemaNames)
 
 	assert.Equal(t, schemaNames, specNames,
-		"api/asyncapi.yaml's iamServiceAccountEvents.messages must name exactly the 5 events embedded in internal/eventschema — update both together on any change (§7.3.1, §25)")
+		"api/asyncapi.yaml's iamServiceAccountEvents.messages must name exactly the 5 events in eventbus.ProducedSchemas — update both together on any change (§7.3.1, §25)")
 }

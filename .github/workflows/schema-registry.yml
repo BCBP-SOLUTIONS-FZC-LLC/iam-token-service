@@ -13,7 +13,7 @@
 #
 # Source of truth for schemas
 # ────────────────────────────
-# api/asyncapi.yaml  →  internal/eventschema/*.json (§25 frozen names)
+# api/asyncapi.yaml  →  internal/adapter/outbound/eventbus/schemas/*.json (§25 frozen names)
 #
 # Triggers:
 #   pull_request → main (schema files changed)    → pr-check  (validate + diff; read-only)
@@ -32,7 +32,7 @@
 #   5. Assess event usage      — Prometheus per-event activity (or skipped if PROMETHEUS_URL unset); classify ACTIVE/COLD/NEVER_SEEN
 #   6. Enforce usage→lifecycle — dormant while PROMETHEUS_URL is unset (this service's 5 events
 #                                are frozen at LLD v1.0 and pre-production, must never be auto-deprecated)
-#   7. Stage produced schemas  — copy the 5 internal/eventschema/*.json files into .tmp/glue-schemas,
+#   7. Stage produced schemas  — copy the 5 internal/adapter/outbound/eventbus/schemas/*.json files into .tmp/glue-schemas,
 #                                renamed to their PascalCase Glue name (schema-gov diff/register need
 #                                that name, not the snake_case filename)
 #   8. Diff vs. registry       — fail on breaking changes before any upload
@@ -66,12 +66,12 @@ name: Glue Schema Registry
   pull_request:
     branches: [main]
     paths:
-      - 'internal/eventschema/*.json'
+      - 'internal/adapter/outbound/eventbus/schemas/*.json'
       - 'api/asyncapi.yaml'
   push:
     branches: [main]
     paths:
-      - 'internal/eventschema/*.json'
+      - 'internal/adapter/outbound/eventbus/schemas/*.json'
       - 'api/asyncapi.yaml'
   release:
     types: [published]
@@ -133,7 +133,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" validate \
             --asyncapi   api/asyncapi.yaml \
-            --schema-dir internal/eventschema
+            --schema-dir internal/adapter/outbound/eventbus/schemas
 
       # Runs before AWS credentials are configured so frozen environments skip
       # credential setup entirely. Override with force=true on workflow_dispatch.
@@ -197,7 +197,7 @@ jobs:
             -e AWS_REGION="${{ vars.AWS_REGION }}" \
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
-            --schema-dir  internal/eventschema \
+            --schema-dir  internal/adapter/outbound/eventbus/schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -216,9 +216,9 @@ jobs:
             --asyncapi   api/asyncapi.yaml
 
       # Stages this service's 5 produced schemas under their PascalCase Glue
-      # name (internal/eventschema/*.json is snake_case) — schema-gov
+      # name (internal/adapter/outbound/eventbus/schemas/*.json is snake_case) — schema-gov
       # diff/register need the name every other reference to these events
-      # uses (eventschema's map keys, LLD §25, api/asyncapi.yaml).
+      # uses (eventbus.ProducedSchemas' map keys, LLD §25, api/asyncapi.yaml).
       - name: Stage produced Glue schemas
         run: |
           rm -rf .tmp/glue-schemas
@@ -417,7 +417,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" validate \
             --asyncapi   api/asyncapi.yaml \
-            --schema-dir internal/eventschema
+            --schema-dir internal/adapter/outbound/eventbus/schemas
 
       - name: Check schema freeze
         env:
@@ -467,7 +467,7 @@ jobs:
             -e AWS_REGION="${{ vars.AWS_REGION }}" \
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
-            --schema-dir  internal/eventschema \
+            --schema-dir  internal/adapter/outbound/eventbus/schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -685,7 +685,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" validate \
             --asyncapi   api/asyncapi.yaml \
-            --schema-dir internal/eventschema
+            --schema-dir internal/adapter/outbound/eventbus/schemas
 
       - name: Check AWS OIDC role configured
         id: aws_check

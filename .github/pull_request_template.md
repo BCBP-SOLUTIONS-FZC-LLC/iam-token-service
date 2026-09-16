@@ -27,7 +27,7 @@
 - [ ] No new `golangci-lint` findings
 - [ ] Every frozen name (env var, header, metric, event name, OpenBao path shape) matches LLD §25 character-for-character
 
-### Event Contract (if `api/asyncapi.yaml` or `internal/eventschema/` changed)
+### Event Contract (if `api/asyncapi.yaml` or `internal/adapter/outbound/eventbus/schemas/` changed)
 - [ ] `api/asyncapi.yaml` updated in the same commit as any schema change
 - [ ] Change is additive (new optional field) — a breaking change requires a new Glue schema name, not an in-place edit (§7.3.1 compaction discipline)
 

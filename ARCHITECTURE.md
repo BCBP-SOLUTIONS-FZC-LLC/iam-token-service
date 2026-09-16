@@ -52,7 +52,6 @@ graph TD
     end
 
     REQCTX["pkg/requestctx"]
-    ESCHEMA["internal/eventschema<br/>embedded JSON Schemas"]
     APISPEC["api<br/>embedded asyncapi.yaml"]
     SWAGGERDOCS["docs/swagger<br/>generated OpenAPI"]
 
@@ -74,7 +73,6 @@ graph TD
     CONS --> PORT
     CONS --> OBS
     EVENTBUS --> SERVICE
-    EVENTBUS --> ESCHEMA
     POSTGRES --> PORT
     OPENBAO --> PORT
     OBS --> SERVICE
@@ -100,7 +98,7 @@ graph TD
 | `observability` | `internal/adapter/outbound/metrics` | `domain`, `port`, `service` |
 | `postgres` | `internal/adapter/outbound/postgres` | `domain`, `port` |
 | `openbao` | `internal/adapter/outbound/openbao` | `domain`, `port` |
-| `adapters_outbound` | `internal/adapter/outbound/eventbus` | `domain`, `port`, `service`, `eventschema`, `observability` |
+| `adapters_outbound` | `internal/adapter/outbound/eventbus` | `domain`, `port`, `service`, `observability` |
 | `adapters_inbound` | `internal/adapter/inbound/{http,consumer}` | `domain`, `port`, `service`, `requestctx`, `apispec`, `observability` |
 | `reconciler_jobs` | `cmd/rotator` | `domain`, `port`, `postgres`, `openbao`, `observability`, `adapters_outbound` — **never `service`** |
 | `cmd` | `cmd/{server,consumer}` | everything |
@@ -123,7 +121,6 @@ graph LR
     service --> port
     service --> requestctx
 
-    eventschema["eventschema<br/>(anyVendorDeps only)"]
     apispec["apispec<br/>(anyVendorDeps only)"]
     swaggerdocs["swaggerdocs<br/>(anyVendorDeps only)"]
 
@@ -140,7 +137,6 @@ graph LR
     adapters_outbound["adapters_outbound<br/>(eventbus)"] --> domain
     adapters_outbound --> port
     adapters_outbound --> service
-    adapters_outbound --> eventschema
     adapters_outbound --> observability
 
     adapters_inbound["adapters_inbound<br/>(http, consumer)"] --> domain
@@ -161,7 +157,6 @@ graph LR
     cmd --> port
     cmd --> service
     cmd --> requestctx
-    cmd --> eventschema
     cmd --> apispec
     cmd --> swaggerdocs
     cmd --> postgres
@@ -807,7 +802,8 @@ coverage floor.
 Database migrations live in `internal/adapter/outbound/postgres/migrations`
 and are outright (no expand/contract) at this dev stage — there has only
 ever been one. Event schemas are the other axis: each of the 5 published
-event types has a JSON Schema embedded at `internal/eventschema/*.json`,
+event types has a JSON Schema embedded at
+`internal/adapter/outbound/eventbus/schemas/*.json`,
 registered as its own Glue schema version in the single
 `iam-serviceaccount-events` registry. `api/asyncapi.yaml` is the
 design-time contract; the Glue registry is the runtime enforcement point —

@@ -47,7 +47,6 @@ TEST_INTERNAL_PKGS := ./cmd/rotator/... \
                       ./internal/core/port/... \
                       ./internal/core/domain/... \
                       ./internal/core/service/... \
-                      ./internal/eventschema/... \
                       ./pkg/...
 
 # Coverage scope — internal/+pkg/ only, deliberately excluding cmd/: every
@@ -136,7 +135,7 @@ help:
 	@echo "  make mod-verify      - go mod verify"
 	@echo "  make vuln-check      - govulncheck on internal + pkg"
 	@echo "  make sast            - gosec static-analysis scan (SAST)"
-	@echo "  make extract-schemas - derive internal/eventschema/*.json"
+	@echo "  make extract-schemas - derive internal/adapter/outbound/eventbus/schemas/*.json"
 	@echo "  make swag            - regenerate docs/swagger/ from handler annotations (mirrors sibling iam-org-membership)"
 	@echo "  make swag-check      - fail if Swagger regeneration would change docs/swagger/ (CI drift gate)"
 	@echo "  make install-hooks   - install .githooks/pre-commit into .git/hooks"
@@ -436,8 +435,8 @@ extract-schemas:
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" extract \
 	  --asyncapi   api/asyncapi.yaml \
-	  --schema-dir internal/eventschema
-	@echo "Done. Run 'git add internal/eventschema/' to stage."
+	  --schema-dir internal/adapter/outbound/eventbus/schemas
+	@echo "Done. Run 'git add internal/adapter/outbound/eventbus/schemas/' to stage."
 
 .PHONY: schema-validate
 schema-validate: extract-schemas
@@ -445,7 +444,7 @@ schema-validate: extract-schemas
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" validate \
 	  --asyncapi   api/asyncapi.yaml \
-	  --schema-dir internal/eventschema
+	  --schema-dir internal/adapter/outbound/eventbus/schemas
 
 .PHONY: schema-diff
 schema-diff:
@@ -462,7 +461,7 @@ schema-diff:
 
 # schema-register: register this service's 5 event schemas to Glue (requires
 # AWS credentials or floci). Only ever registers the files present under
-# internal/eventschema/. Set AWS_ENDPOINT_URL=http://localhost:4568 in .env
+# internal/adapter/outbound/eventbus/schemas/. Set AWS_ENDPOINT_URL=http://localhost:4568 in .env
 # for floci. Note: `make docker-up` already registers schemas via
 # scripts/init-floci.sh — this target is for re-registering after a schema
 # change without a full container restart, or for registering against real AWS.
@@ -484,7 +483,7 @@ schema-register:
 	  --schema-dir .tmp/glue-schemas
 
 # schema-verify: fail if any of this service's 5 frozen PascalCase schema
-# names (internal/eventschema.ByEventType, §25) is missing from the Glue
+# names (eventbus.ProducedSchemas, §25) is missing from the Glue
 # registry. Requires GLUE_REGISTRY_SERVICEACCOUNT_NAME and AWS credentials.
 .PHONY: schema-verify
 schema-verify:

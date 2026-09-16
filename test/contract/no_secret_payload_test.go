@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/eventbus"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/eventschema"
 )
 
 // forbiddenFieldName matches a credential/secret field name — the same
@@ -60,8 +60,10 @@ func TestNoSecretFieldInPayloadStructs(t *testing.T) {
 // (EVT-2) — the schema-level counterpart to the Go-struct check above, so
 // a schema hand-edited independently of the Go type is still caught.
 func TestNoSecretFieldInEventSchemas(t *testing.T) {
-	require.NotEmpty(t, eventschema.ByEventType, "eventschema.ByEventType must not be empty")
-	for name, raw := range eventschema.ByEventType {
+	schemas, err := eventbus.ProducedSchemas()
+	require.NoError(t, err)
+	require.NotEmpty(t, schemas, "eventbus.ProducedSchemas() must not be empty")
+	for name, raw := range schemas {
 		t.Run(name, func(t *testing.T) {
 			var doc struct {
 				Properties map[string]json.RawMessage `json:"properties"`
@@ -77,8 +79,8 @@ func TestNoSecretFieldInEventSchemas(t *testing.T) {
 }
 
 // TestEventTypeConstantsMatchSchemas asserts the frozen event-type
-// constants (domain/events.go, §25) and the embedded schema set
-// (eventschema.ByEventType) name exactly the same 5 events — a schema
+// constants (domain/events.go, §25) and the produced embedded schema set
+// (eventbus.ProducedSchemas) name exactly the same 5 events — a schema
 // added/renamed without updating the other would otherwise silently ship
 // unvalidated.
 func TestEventTypeConstantsMatchSchemas(t *testing.T) {
@@ -89,9 +91,11 @@ func TestEventTypeConstantsMatchSchemas(t *testing.T) {
 		domain.EventServiceAccountCredentialRevoked,
 		domain.EventServiceAccountRevoked,
 	}
-	require.Len(t, eventschema.ByEventType, len(constants))
+	schemas, err := eventbus.ProducedSchemas()
+	require.NoError(t, err)
+	require.Len(t, schemas, len(constants))
 	for _, c := range constants {
-		_, ok := eventschema.ByEventType[c]
+		_, ok := schemas[c]
 		assert.True(t, ok, "no embedded schema for event type constant %q", c)
 	}
 }

@@ -19,7 +19,7 @@
 #   1 Glue registry — iam-serviceaccount-events (§25)
 #   5 Glue schemas  — this service's 5 produced events, registered from the
 #                     same JSON Schema Draft-07 files eventbus.GlueCodec
-#                     ships (internal/eventschema/*.json), so
+#                     ships (internal/adapter/outbound/eventbus/schemas/*.json), so
 #                     GLUE_REGISTRY_NAME/SNS_TOPIC_SERVICEACCOUNT_ARN can be
 #                     set in the app service's environment and it runs with
 #                     the real Glue wire-format codec locally — Floci
@@ -27,7 +27,7 @@
 #                     LocalStack Community, which gates it behind Pro), so
 #                     there's no NoopCodec fallback needed for local dev.
 #
-# The docker-compose `floci` service mounts this repo's internal/eventschema/
+# The docker-compose `floci` service mounts this repo's internal/adapter/outbound/eventbus/schemas/
 # directory read-only at /etc/floci/init/schemas so this script can read the
 # schema definitions straight from source — one place to update when a
 # schema changes.

@@ -19,7 +19,7 @@ assignees: ''
 - [ ] `cmd/server` — HTTP API
 - [ ] `cmd/consumer` — offboarding cascade
 - [ ] `cmd/rotator` — sweep / reconciler / prune
-- [ ] Event contract (`api/asyncapi.yaml`, `internal/eventschema/`)
+- [ ] Event contract (`api/asyncapi.yaml`, `internal/adapter/outbound/eventbus/schemas/`)
 - [ ] OpenBao integration
 - [ ] Database schema
 - [ ] Deployment (Helm chart / CI)

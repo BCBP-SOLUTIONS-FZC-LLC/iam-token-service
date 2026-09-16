@@ -188,12 +188,12 @@ iam-token-service/
 │   │       │   └── migrations/            # 000001_schema.up.sql/.down.sql (consolidated base)
 │   │       ├── openbao/                   # KV v2 secret store (OpenBao SDK; Kubernetes auth, §10.5)
 │   │       ├── eventbus/                  # SNS publisher + Glue codec + ValidatingCodec (enqueue-time JSON Schema check)
+│   │       │   └── schemas/               # embedded JSON Schemas: the 5 events + TenantMembershipsPurged (consumed)
+│   │       │       ├── service_account_registered.json / service_account_credential_issued.json
+│   │       │       ├── service_account_credential_rotated.json / service_account_credential_revoked.json
+│   │       │       ├── service_account_revoked.json
+│   │       │       └── tenant_memberships_purged.json
 │   │       └── metrics/                   # business metrics (Prometheus, iam_token_service_*)
-│   └── eventschema/                       # JSON Schemas for the 5 events + loader
-│       ├── service_account_registered.json / service_account_credential_issued.json
-│       ├── service_account_credential_rotated.json / service_account_credential_revoked.json
-│       ├── service_account_revoked.json
-│       └── schemas.go
 ├── pkg/
 │   └── requestctx/                        # request-scoped tenant/user/trace context (exported package)
 │       └── context.go
