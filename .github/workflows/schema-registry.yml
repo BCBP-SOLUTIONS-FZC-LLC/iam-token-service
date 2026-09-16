@@ -11,6 +11,12 @@
 # access-key secrets: `permissions: id-token: write` plus
 # `aws-actions/configure-aws-credentials`'s `role-to-assume` input.
 #
+# schema-gov is installed from source (pip install git+.../platform-schemagov)
+# rather than pulled as a prebuilt GHCR image — that package's Actions-access
+# allow-list doesn't include this repo, and GO_PRIVATE_TOKEN (already used for
+# private Go module access elsewhere) authorizes the git clone via a
+# completely separate mechanism from GHCR package auth.
+#
 # Source of truth for schemas
 # ────────────────────────────
 # api/asyncapi.yaml  →  internal/adapter/outbound/eventbus/schemas/*.json (§25 frozen names)
@@ -27,8 +33,8 @@
 #   2. Check schema freeze     — blocks AWS steps when SCHEMA_FREEZE=true
 #   3. Configure credentials   — AWS OIDC role assumption for Glue / CloudWatch
 #   4. Detect orphaned schemas — warn on Glue schemas without a repo file (never deletes;
-#                                informational only — production execute is handled by a
-#                                separate manual workflow, not built here yet)
+#                                informational only — actual retirement/deletion is a
+#                                separate, manually-triggered workflow: schema-prune.yml)
 #   5. Assess event usage      — Prometheus per-event activity (or skipped if PROMETHEUS_URL unset); classify ACTIVE/COLD/NEVER_SEEN
 #   6. Enforce usage→lifecycle — dormant while PROMETHEUS_URL is unset (this service's 5 events
 #                                are frozen at LLD v1.0 and pre-production, must never be auto-deprecated)
@@ -91,11 +97,9 @@ name: Glue Schema Registry
 
 permissions:
   contents: read
-  packages: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
 
 jobs:
   # ── Staging ─────────────────────────────────────────────────────────────────
@@ -108,7 +112,6 @@ jobs:
     environment: staging
     permissions:
       contents: write
-      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write   # OIDC — AWS role assumption, no long-lived keys (§13.5)
     steps:
       - name: Checkout
@@ -116,22 +119,18 @@ jobs:
         with:
           fetch-depth: 2    # HEAD~1 needed for the enum semantic drift check
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+      - name: Set up Python (schema-gov)
+        uses: actions/setup-python@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.14'
 
-      - name: Pull schema-gov image
-        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+      - name: Install schema-gov (platform-schemagov v0.4.0)
+        run: |
+          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+          schema-gov validate \
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/adapter/outbound/eventbus/schemas
 
@@ -161,16 +160,10 @@ jobs:
       # here genuinely belongs to (or was retired by) this service.
       - name: Detect orphaned schemas
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" prune \
+          schema-gov prune \
             --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env      staging \
-            --output   /tmp/schema-prune-metrics.json
+            --output   "${{ runner.temp }}/schema-prune-metrics.json"
 
       # Source selection (v0.4+):
       #   PROMETHEUS_URL set → --source prometheus  (no AWS needed)
@@ -190,29 +183,19 @@ jobs:
           else
             SOURCE_FLAGS="--source disabled"
           fi
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
+          schema-gov usage-check \
             --schema-dir  internal/adapter/outbound/eventbus/schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
             --lookback    "${{ vars.USAGE_LOOKBACK_DAYS || '30' }}" \
             --cold        "${{ vars.USAGE_COLD_THRESHOLD_DAYS || '7' }}" \
-            --output      /tmp/schema-usage-metrics.json
+            --output      "${{ runner.temp }}/schema-usage-metrics.json"
 
       - name: Enforce usage → lifecycle
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" enforce-lifecycle \
-            --usage-file /tmp/schema-usage-metrics.json \
+          schema-gov enforce-lifecycle \
+            --usage-file "${{ runner.temp }}/schema-usage-metrics.json" \
             --asyncapi   api/asyncapi.yaml
 
       # Stages this service's 5 produced schemas under their PascalCase Glue
@@ -262,12 +245,8 @@ jobs:
                 echo "ok" > "$STATUS"; exit 0
               }
 
-              docker run --rm \
-                -v "${{ github.workspace }}":/workspace \
-                -v "${TEMP_DIR}":/diff \
-                -e GITHUB_ACTIONS \
-                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
-                --current    "/diff/${SCHEMA_NAME}.current.json" \
+              schema-gov diff \
+                --current    "${TEMP_DIR}/${SCHEMA_NAME}.current.json" \
                 --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
                 --schema-name "${SCHEMA_NAME}" \
               && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
@@ -314,35 +293,21 @@ jobs:
         run: |
           FORCE_FLAG=""
           [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e SCHEMA_FREEZE \
-            -e SCHEMA_FREEZE_EXPIRES_AT \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" register \
+          schema-gov register \
             --registry    "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --schema-dir  .tmp/glue-schemas \
-            --output      /tmp/schema-versions.json \
+            --output      "${{ runner.temp }}/schema-versions.json" \
             $FORCE_FLAG
 
       - name: Update schema changelog
-        env:
-          SCHEMA_GOV_IMAGE: ${{ env.SCHEMA_GOV_IMAGE }}
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e GITHUB_ACTIONS \
-            "${SCHEMA_GOV_IMAGE}" changelog \
-            --versions-file /tmp/schema-versions.json \
+          schema-gov changelog \
+            --versions-file "${{ runner.temp }}/schema-versions.json" \
             --output        docs/schema-changelog.md \
             --asyncapi      api/asyncapi.yaml \
             --registry      "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env           staging \
-            --metrics-dir   /tmp
+            --metrics-dir   "${{ runner.temp }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/schema-changelog.md
@@ -364,13 +329,7 @@ jobs:
       - name: Emit metrics
         if: always()
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+          schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              staging \
             --job-status       "${{ job.status }}" \
@@ -379,7 +338,7 @@ jobs:
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
-            --metrics-dir      /tmp
+            --metrics-dir      "${{ runner.temp }}"
 
   # ── Production ───────────────────────────────────────────────────────────────
   production:
@@ -391,7 +350,6 @@ jobs:
     environment: production
     permissions:
       contents: write
-      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write
     steps:
       - name: Checkout
@@ -400,22 +358,18 @@ jobs:
           ref: ${{ github.event.release.tag_name || github.ref }}
           fetch-depth: 2
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+      - name: Set up Python (schema-gov)
+        uses: actions/setup-python@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.14'
 
-      - name: Pull schema-gov image
-        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+      - name: Install schema-gov (platform-schemagov v0.4.0)
+        run: |
+          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+          schema-gov validate \
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/adapter/outbound/eventbus/schemas
 
@@ -440,16 +394,10 @@ jobs:
 
       - name: Detect orphaned schemas
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" prune \
+          schema-gov prune \
             --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env      production \
-            --output   /tmp/schema-prune-metrics.json
+            --output   "${{ runner.temp }}/schema-prune-metrics.json"
 
       - name: Assess event usage
         env:
@@ -460,29 +408,19 @@ jobs:
           else
             SOURCE_FLAGS="--source disabled"
           fi
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
+          schema-gov usage-check \
             --schema-dir  internal/adapter/outbound/eventbus/schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
             --lookback    "${{ vars.USAGE_LOOKBACK_DAYS || '30' }}" \
             --cold        "${{ vars.USAGE_COLD_THRESHOLD_DAYS || '7' }}" \
-            --output      /tmp/schema-usage-metrics.json
+            --output      "${{ runner.temp }}/schema-usage-metrics.json"
 
       - name: Enforce usage → lifecycle
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" enforce-lifecycle \
-            --usage-file /tmp/schema-usage-metrics.json \
+          schema-gov enforce-lifecycle \
+            --usage-file "${{ runner.temp }}/schema-usage-metrics.json" \
             --asyncapi   api/asyncapi.yaml
 
       - name: Stage produced Glue schemas
@@ -524,12 +462,8 @@ jobs:
                 echo "ok" > "$STATUS"; exit 0
               }
 
-              docker run --rm \
-                -v "${{ github.workspace }}":/workspace \
-                -v "${TEMP_DIR}":/diff \
-                -e GITHUB_ACTIONS \
-                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
-                --current    "/diff/${SCHEMA_NAME}.current.json" \
+              schema-gov diff \
+                --current    "${TEMP_DIR}/${SCHEMA_NAME}.current.json" \
                 --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
                 --schema-name "${SCHEMA_NAME}" \
               && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
@@ -574,37 +508,23 @@ jobs:
         run: |
           FORCE_FLAG=""
           [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e SCHEMA_FREEZE \
-            -e SCHEMA_FREEZE_EXPIRES_AT \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" register \
+          schema-gov register \
             --registry    "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --schema-dir  .tmp/glue-schemas \
-            --output      /tmp/schema-versions.json \
+            --output      "${{ runner.temp }}/schema-versions.json" \
             $FORCE_FLAG
 
       # Production checks out the release tag (detached HEAD), so push
       # targets refs/heads/main explicitly. Same concurrency guard as staging.
       - name: Update schema changelog
-        env:
-          SCHEMA_GOV_IMAGE: ${{ env.SCHEMA_GOV_IMAGE }}
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e GITHUB_ACTIONS \
-            "${SCHEMA_GOV_IMAGE}" changelog \
-            --versions-file /tmp/schema-versions.json \
+          schema-gov changelog \
+            --versions-file "${{ runner.temp }}/schema-versions.json" \
             --output        docs/schema-changelog.md \
             --asyncapi      api/asyncapi.yaml \
             --registry      "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env           production \
-            --metrics-dir   /tmp
+            --metrics-dir   "${{ runner.temp }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/schema-changelog.md
@@ -626,13 +546,7 @@ jobs:
       - name: Emit metrics
         if: always()
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+          schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              production \
             --job-status       "${{ job.status }}" \
@@ -641,7 +555,7 @@ jobs:
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
-            --metrics-dir      /tmp
+            --metrics-dir      "${{ runner.temp }}"
 
   # ── PR check (read-only) ─────────────────────────────────────────────────────
   # Validates and diffs against the staging registry before merge so developers
@@ -660,7 +574,6 @@ jobs:
     environment: staging
     permissions:
       contents: read
-      packages: read     # ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov is a private package
       id-token: write
     steps:
       - name: Checkout
@@ -668,22 +581,18 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4.6.0
+      - name: Set up Python (schema-gov)
+        uses: actions/setup-python@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.14'
 
-      - name: Pull schema-gov image
-        run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
+      - name: Install schema-gov (platform-schemagov v0.4.0)
+        run: |
+          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" validate \
+          schema-gov validate \
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/adapter/outbound/eventbus/schemas
 
@@ -746,12 +655,8 @@ jobs:
                 echo "ok" > "$STATUS"; exit 0
               }
 
-              docker run --rm \
-                -v "${{ github.workspace }}":/workspace \
-                -v "${TEMP_DIR}":/diff \
-                -e GITHUB_ACTIONS \
-                "${{ env.SCHEMA_GOV_IMAGE }}" diff \
-                --current    "/diff/${SCHEMA_NAME}.current.json" \
+              schema-gov diff \
+                --current    "${TEMP_DIR}/${SCHEMA_NAME}.current.json" \
                 --proposed   ".tmp/glue-schemas/${SCHEMA_NAME}.json" \
                 --schema-name "${SCHEMA_NAME}" \
               && echo "ok" > "$STATUS" || echo "breaking" > "$STATUS"
@@ -792,13 +697,7 @@ jobs:
       - name: Emit metrics
         if: always()
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/workspace \
-            -v "${{ runner.temp }}":/tmp \
-            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-            -e AWS_REGION="${{ vars.AWS_REGION }}" \
-            -e GITHUB_ACTIONS \
-            "${{ env.SCHEMA_GOV_IMAGE }}" metrics \
+          schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              staging \
             --job-status       "${{ job.status }}" \
@@ -807,4 +706,4 @@ jobs:
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
-            --metrics-dir      /tmp
+            --metrics-dir      "${{ runner.temp }}"
