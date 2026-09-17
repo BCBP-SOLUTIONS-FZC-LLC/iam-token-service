@@ -1,19 +1,50 @@
+# Version control
 .git
+.gitignore
 .github
-.claude
-.coverage
-bin
-*.out
-coverage.*
+
+# Environment files — never bake secrets into the image
 .env
+.env.*
+*.env
 .env-example
-test
-deploy
+.go_private_token
+
+# Development tooling and docs
+.claude/
+docs/
 # docs/ is otherwise pure documentation (LLD, architecture diagrams,
 # registry proposals) — EXCEPT docs/swagger/, which is generated Go
 # source (docs.go) that cmd/server/main.go imports as a real package;
 # excluding it entirely breaks the image build ("no required module
 # provides package .../docs/swagger").
-docs
-!docs/swagger
+!docs/swagger/
+deploy/
+scripts/
 *.md
+
+# Local compose (host-only)
+docker-compose.yml
+
+# Test artefacts
+test/
+coverage.out
+coverage.html
+*.coverprofile
+coverage.*
+*.out
+**/*_test.go
+
+# Build artefacts already compiled outside Docker
+bin/
+.coverage/
+
+# IDE and OS noise
+.idea/
+.vscode/
+*.DS_Store
+*.swp
+*.swo
+
+# Go tool cache (not needed in image)
+vendor/
