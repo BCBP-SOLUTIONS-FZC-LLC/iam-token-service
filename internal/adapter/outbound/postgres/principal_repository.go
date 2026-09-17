@@ -37,6 +37,20 @@ func scanPrincipal(row pgx.Row) (*domain.ServiceAccountPrincipal, error) {
 	return &p, nil
 }
 
+// scanPrincipalInserted scans the same columns as scanPrincipal plus a
+// trailing `(xmax = 0) AS inserted` projection — Postgres's standard way
+// to distinguish a fresh INSERT from an ON CONFLICT DO UPDATE within one
+// RETURNING row (Register's created-vs-updated distinction).
+func scanPrincipalInserted(row pgx.Row, inserted *bool) (*domain.ServiceAccountPrincipal, error) {
+	var p domain.ServiceAccountPrincipal
+	err := row.Scan(&p.ID, &p.TenantID, &p.PrincipalSub, &p.KeycloakClientID, &p.PrincipalType, &p.Status,
+		&p.RecordVersion, &p.CreatedAt, &p.UpdatedAt, &p.DeletedAt, inserted)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 // FindByID returns the (tenantID, principalID) principal under the
 // caller's RLS-scoped tenant, or domain.ErrPrincipalNotFound (§5.5).
 func (r *PrincipalRepository) FindByID(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
@@ -62,29 +76,45 @@ func (r *PrincipalRepository) FindByID(ctx context.Context, tenantID, principalI
 }
 
 // Register inserts p if no principal yet exists for
-// (tenant_id, principal_type) (uq_sap_active_principal); a repeat call
-// returns the existing row and created=false (TS-4, §5.4).
-func (r *PrincipalRepository) Register(ctx context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, error) {
+// (tenant_id, principal_type) (uq_sap_active_principal). A repeat call
+// whose principal_sub/keycloak_client_id are unchanged is a true no-op —
+// it returns the existing row with created=false, updated=false. A
+// repeat call whose principal_sub or keycloak_client_id differ (RP-3
+// conversion carry-over, §8.1) updates the row in place and returns
+// updated=true, rather than leaving a stale Keycloak identity on record
+// (TS-4, §5.4).
+func (r *PrincipalRepository) Register(ctx context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
 	var out *domain.ServiceAccountPrincipal
 	created := false
+	updated := false
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			INSERT INTO service_account_principals (id, tenant_id, principal_sub, keycloak_client_id, principal_type)
 			VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5)
-			ON CONFLICT (tenant_id, principal_type) DO NOTHING
-			RETURNING `+principalColumns,
+			ON CONFLICT (tenant_id, principal_type) DO UPDATE
+				SET principal_sub = EXCLUDED.principal_sub, keycloak_client_id = EXCLUDED.keycloak_client_id
+				WHERE service_account_principals.principal_sub != EXCLUDED.principal_sub
+				   OR service_account_principals.keycloak_client_id != EXCLUDED.keycloak_client_id
+			RETURNING `+principalColumns+`, (xmax = 0) AS inserted`,
 			nullableUUID(p.ID), p.TenantID, p.PrincipalSub, p.KeycloakClientID, p.PrincipalType)
-		found, scanErr := scanPrincipal(row)
+		var inserted bool
+		found, scanErr := scanPrincipalInserted(row, &inserted)
 		if scanErr == nil {
-			created = true
 			out = found
+			if inserted {
+				created = true
+			} else {
+				updated = true
+			}
 			return nil
 		}
 		if !errors.Is(scanErr, pgx.ErrNoRows) {
 			return scanErr
 		}
-		// Conflict — fetch the existing row for the idempotent-repeat
-		// response (TS-4 200, §5.4).
+		// True no-op repeat (principal_sub/keycloak_client_id unchanged) —
+		// the ON CONFLICT ... WHERE guard didn't fire, so RETURNING gave no
+		// row; fetch the existing row for the idempotent-repeat response
+		// (TS-4 200, §5.4).
 		selRow := tx.QueryRow(ctx, `
 			SELECT `+principalColumns+` FROM service_account_principals
 			WHERE tenant_id = $1 AND principal_type = $2 AND deleted_at IS NULL`, p.TenantID, p.PrincipalType)
@@ -96,9 +126,9 @@ func (r *PrincipalRepository) Register(ctx context.Context, p *domain.ServiceAcc
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	return out, created, nil
+	return out, created, updated, nil
 }
 
 // ListByTenant returns every principal row for tenantID (§8.4).

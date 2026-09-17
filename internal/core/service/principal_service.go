@@ -52,8 +52,8 @@ func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req
 		return nil, domain.NewError(domain.ErrInvalidRequest, "principal_sub is required").
 			WithDetails(map[string]any{"field": "principal_sub"})
 	}
-	if req.KeycloakClientID != domain.KeycloakClientPlatformAutomation {
-		return nil, domain.NewError(domain.ErrInvalidRequest, "keycloak_client_id must be 'platform-automation' at MVP").
+	if !domain.ValidPlatformAutomationClientID(req.KeycloakClientID, tenantID) {
+		return nil, domain.NewError(domain.ErrInvalidRequest, "keycloak_client_id must be 'platform-automation' or 'platform-automation-<tenant_id>' at MVP").
 			WithDetails(map[string]any{"field": "keycloak_client_id"})
 	}
 
@@ -63,14 +63,14 @@ func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req
 	}
 
 	var result *domain.ServiceAccountPrincipal
-	var created bool
+	var created, updated bool
 	err := s.tx.RunInTx(ctx, func(ctx context.Context) error {
 		var err error
-		result, created, err = s.principals.Register(ctx, candidate)
+		result, created, updated, err = s.principals.Register(ctx, candidate)
 		if err != nil {
 			return err
 		}
-		if !created {
+		if !created && !updated {
 			return nil
 		}
 		pub, ok := port.EventPublisherFromContext(ctx)

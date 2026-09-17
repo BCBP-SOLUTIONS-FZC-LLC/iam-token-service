@@ -75,14 +75,24 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 	return &cp, nil
 }
 
-func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, error) {
+func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
 	if f.forceRegisterErr != nil {
-		return nil, false, f.forceRegisterErr
+		return nil, false, false, f.forceRegisterErr
 	}
 	for _, existing := range f.byID {
 		if existing.TenantID == p.TenantID && existing.PrincipalType == p.PrincipalType {
+			// A true no-op repeat (identity unchanged) leaves the row alone;
+			// a carry-over (RP-3 conversion, differing principal_sub/
+			// keycloak_client_id) updates it in place — mirrors the
+			// postgres adapter's ON CONFLICT ... WHERE ... DO UPDATE.
+			if existing.PrincipalSub == p.PrincipalSub && existing.KeycloakClientID == p.KeycloakClientID {
+				cp := *existing
+				return &cp, false, false, nil
+			}
+			existing.PrincipalSub = p.PrincipalSub
+			existing.KeycloakClientID = p.KeycloakClientID
 			cp := *existing
-			return &cp, false, nil
+			return &cp, false, true, nil
 		}
 	}
 	np := *p
@@ -95,7 +105,7 @@ func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceA
 	np.RecordVersion = 1
 	f.put(&np)
 	cp := np
-	return &cp, true, nil
+	return &cp, true, false, nil
 }
 
 func (f *fakePrincipalRepository) ListByTenant(_ context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {

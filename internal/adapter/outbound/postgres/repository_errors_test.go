@@ -224,10 +224,11 @@ func TestPrincipalRepository_Register_InsertScanErrorPropagates(t *testing.T) {
 	wantErr := errors.New("insert scan boom")
 	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: wantErr}}}
 
-	got, created, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
+	got, created, updated, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 	assert.False(t, created)
+	assert.False(t, updated)
 }
 
 func TestPrincipalRepository_Register_ConflictFallbackSelectScanErrorPropagates(t *testing.T) {
@@ -238,10 +239,11 @@ func TestPrincipalRepository_Register_ConflictFallbackSelectScanErrorPropagates(
 		errRow{err: wantErr},
 	}}
 
-	got, created, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
+	got, created, updated, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 	assert.False(t, created)
+	assert.False(t, updated)
 }
 
 func TestPrincipalRepository_ListByTenant_QueryErrorPropagates(t *testing.T) {

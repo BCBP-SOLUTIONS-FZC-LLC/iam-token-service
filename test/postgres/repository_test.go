@@ -15,8 +15,10 @@ import (
 )
 
 // TestPrincipalRepository_RegisterIsIdempotent — TS-4: a repeat Register
-// for the same (tenant_id, principal_type) returns the existing row and
-// created=false, never a duplicate (§5.4, uq_sap_active_principal).
+// for the same (tenant_id, principal_type) with an unchanged
+// principal_sub/keycloak_client_id is a true no-op — it returns the
+// existing row with created=false, updated=false, never a duplicate
+// (§5.4, uq_sap_active_principal).
 func TestPrincipalRepository_RegisterIsIdempotent(t *testing.T) {
 	t.Parallel()
 	appPool, _, _ := setupTestDB(t)
@@ -33,36 +35,86 @@ func TestPrincipalRepository_RegisterIsIdempotent(t *testing.T) {
 	}
 
 	var created1, created2 *domain.ServiceAccountPrincipal
-	var wasCreated1, wasCreated2 bool
+	var wasCreated1, wasCreated2, wasUpdated1, wasUpdated2 bool
 	err := txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
 		var err error
-		created1, wasCreated1, err = repo.Register(ctx, first)
+		created1, wasCreated1, wasUpdated1, err = repo.Register(ctx, first)
 		return err
 	})
 	require.NoError(t, err)
 	assert.True(t, wasCreated1)
+	assert.False(t, wasUpdated1)
 	require.NotNil(t, created1)
 	assert.Equal(t, tenantID, created1.TenantID)
 
-	// Repeat with a different (but harmless — real callers always resend
-	// the same principal_sub) PrincipalSub: it must be ignored because the
-	// conflict target is (tenant_id, principal_type), not principal_sub.
+	// Repeat with the identical principal_sub/keycloak_client_id — a true
+	// no-op replay (e.g. a lost-response retry of the same RP-1/RP-2 call).
 	second := &domain.ServiceAccountPrincipal{
 		TenantID:         tenantID,
-		PrincipalSub:     uuid.New(),
+		PrincipalSub:     first.PrincipalSub,
 		KeycloakClientID: testKeycloakClientID,
 		PrincipalType:    domain.PrincipalTypePlatformAutomation,
 	}
 	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
 		var err error
-		created2, wasCreated2, err = repo.Register(ctx, second)
+		created2, wasCreated2, wasUpdated2, err = repo.Register(ctx, second)
 		return err
 	})
 	require.NoError(t, err)
 	assert.False(t, wasCreated2, "a repeat register must not create a second row")
+	assert.False(t, wasUpdated2, "an identical repeat must not be reported as an update")
 	require.NotNil(t, created2)
 	assert.Equal(t, created1.ID, created2.ID, "repeat register must return the original principal")
-	assert.Equal(t, created1.PrincipalSub, created2.PrincipalSub, "the original principal_sub must be preserved, not overwritten")
+	assert.Equal(t, created1.PrincipalSub, created2.PrincipalSub, "an identical repeat must preserve principal_sub")
+}
+
+// TestPrincipalRepository_RegisterUpdatesOnCarryOver — RP-3 conversion:
+// re-registering (tenant_id, principal_type) with a DIFFERENT
+// principal_sub/keycloak_client_id (a newly-minted dedicated-realm
+// Keycloak client replacing the trial-realm one) updates the existing
+// row in place rather than silently keeping the stale identity.
+func TestPrincipalRepository_RegisterUpdatesOnCarryOver(t *testing.T) {
+	t.Parallel()
+	appPool, _, _ := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	repo := pgadapter.NewPrincipalRepository(appPool)
+	txRunner := pgadapter.NewTxRunner(appPool, nil)
+
+	first := &domain.ServiceAccountPrincipal{
+		TenantID:         tenantID,
+		PrincipalSub:     uuid.New(),
+		KeycloakClientID: domain.KeycloakClientPlatformAutomation + "-" + tenantID.String(),
+		PrincipalType:    domain.PrincipalTypePlatformAutomation,
+	}
+	var created1 *domain.ServiceAccountPrincipal
+	err := txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		var err error
+		created1, _, _, err = repo.Register(ctx, first)
+		return err
+	})
+	require.NoError(t, err)
+
+	second := &domain.ServiceAccountPrincipal{
+		TenantID:         tenantID,
+		PrincipalSub:     uuid.New(),
+		KeycloakClientID: domain.KeycloakClientPlatformAutomation,
+		PrincipalType:    domain.PrincipalTypePlatformAutomation,
+	}
+	var created2 *domain.ServiceAccountPrincipal
+	var wasCreated2, wasUpdated2 bool
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		var err error
+		created2, wasCreated2, wasUpdated2, err = repo.Register(ctx, second)
+		return err
+	})
+	require.NoError(t, err)
+	assert.False(t, wasCreated2, "a carry-over must not report as a fresh create")
+	assert.True(t, wasUpdated2, "a differing principal_sub/keycloak_client_id must be reported as an update")
+	require.NotNil(t, created2)
+	assert.Equal(t, created1.ID, created2.ID, "carry-over must update the same principal row, not create a new one")
+	assert.Equal(t, second.PrincipalSub, created2.PrincipalSub, "carry-over must adopt the new principal_sub")
+	assert.Equal(t, second.KeycloakClientID, created2.KeycloakClientID, "carry-over must adopt the new keycloak_client_id")
 }
 
 // TestCredentialRepository_IssueRotateOverlapRevoke exercises the full

@@ -26,10 +26,23 @@ const (
 	PrincipalStatusRevoked PrincipalStatus = "revoked"
 )
 
-// KeycloakClientPlatformAutomation is the frozen Keycloak client name for
-// the automation principal, minted by the Realm Provisioner, one per
-// tenant (§25).
+// KeycloakClientPlatformAutomation is the base Keycloak client name for
+// the automation principal, minted by the Realm Provisioner (§25). A
+// dedicated-realm tenant's client is named exactly this; a shared-realm
+// (trial) tenant's client is tenant-scoped (see
+// ValidPlatformAutomationClientID) since a shared realm cannot hold two
+// clients with the same clientId.
 const KeycloakClientPlatformAutomation = "platform-automation"
+
+// ValidPlatformAutomationClientID reports whether clientID is an
+// acceptable Keycloak client name for a platform-automation principal
+// (§10.3, TS-4): either the literal base name (a dedicated-realm tenant,
+// RP-2/RP-3) or the base name suffixed with the owning tenant's UUID (a
+// shared-realm/trial tenant, RP-1).
+func ValidPlatformAutomationClientID(clientID string, tenantID uuid.UUID) bool {
+	return clientID == KeycloakClientPlatformAutomation ||
+		clientID == KeycloakClientPlatformAutomation+"-"+tenantID.String()
+}
 
 // SystemPrincipalID is the reserved `iam-system` subject accepted only on
 // /api/v1/internal/* (RLS-5, frozen §25/§5.2). It is the `granted_by`
