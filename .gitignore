@@ -35,6 +35,16 @@ go.work.sum
 .coverage/
 bin/
 
+# macOS
+.DS_Store
+
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Claude Code agent worktrees (temporary, not project code)
+.claude/worktrees/
+
+# Staged PascalCase Glue schema copies (from make schema-register / CI —
+# see .github/scripts/stage-produced-event-schemas.sh)
+.tmp/
