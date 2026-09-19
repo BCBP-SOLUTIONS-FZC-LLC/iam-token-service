@@ -75,6 +75,15 @@ func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceA
 	return p, true, false, nil
 }
 
+func (f *fakePrincipalRepository) FindByPrincipalSub(_ context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	for _, p := range f.byTenant[tenantID] {
+		if p.PrincipalSub == principalSub {
+			return p, nil
+		}
+	}
+	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+}
+
 func (f *fakePrincipalRepository) ListByTenant(_ context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
 	if f.listByTenantErr != nil {
 		return nil, f.listByTenantErr

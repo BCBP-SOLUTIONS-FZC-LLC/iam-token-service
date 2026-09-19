@@ -5,6 +5,7 @@ package postgres_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
@@ -216,6 +217,70 @@ func TestCredentialRepository_IssueRotateOverlapRevoke(t *testing.T) {
 	assert.Equal(t, domain.CredentialStatusRevoked, revoked.Status)
 }
 
+// TestCredentialRepository_CadenceRoundTrip — §16 TSQ-6 Resolved:
+// rotation_cadence_days/next_rotation_at survive an Insert+FindActive
+// round trip, and a subsequent demote-to-rotating Update nulls both out
+// (only the current `active` row is ever "due", §4.2). Regression
+// coverage for scanCredential's column list actually matching its Scan
+// destinations — a mismatch here fails every credential read, not just
+// this one.
+func TestCredentialRepository_CadenceRoundTrip(t *testing.T) {
+	t.Parallel()
+	appPool, _, rawPool := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	principalID := seedPrincipal(t, ctx, rawPool, tenantID)
+	repo := pgadapter.NewCredentialRepository(appPool)
+	txRunner := pgadapter.NewTxRunner(appPool, nil)
+
+	cadenceDays := 90
+	nextRotationAt := time.Now().UTC().AddDate(0, 0, cadenceDays).Truncate(time.Microsecond)
+	v1 := &domain.Credential{
+		TenantID: tenantID, PrincipalID: principalID, Version: 1,
+		Status: domain.CredentialStatusActive, OpenBaoPath: domain.OpenBaoPathFor(tenantID, testKeycloakClientID, 1),
+		GrantedBy:           domain.SystemPrincipalID,
+		RotationCadenceDays: &cadenceDays, NextRotationAt: &nextRotationAt,
+	}
+	err := txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		return repo.Insert(ctx, v1)
+	})
+	require.NoError(t, err)
+
+	var active *domain.Credential
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		var err error
+		active, err = repo.FindActive(ctx, tenantID, principalID)
+		return err
+	})
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotNil(t, active.RotationCadenceDays)
+	assert.Equal(t, cadenceDays, *active.RotationCadenceDays)
+	require.NotNil(t, active.NextRotationAt)
+	assert.WithinDuration(t, nextRotationAt, *active.NextRotationAt, time.Second)
+
+	// Demote to rotating, clearing cadence state (the write the service
+	// layer performs on rotate, §16 TSQ-6 Resolved).
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		active.Status = domain.CredentialStatusRotating
+		active.RotationCadenceDays = nil
+		active.NextRotationAt = nil
+		return repo.Update(ctx, active)
+	})
+	require.NoError(t, err)
+
+	var demoted *domain.Credential
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		var err error
+		demoted, err = repo.FindByVersion(ctx, tenantID, principalID, 1)
+		return err
+	})
+	require.NoError(t, err)
+	require.NotNil(t, demoted)
+	assert.Nil(t, demoted.RotationCadenceDays)
+	assert.Nil(t, demoted.NextRotationAt)
+}
+
 // TestCredentialRepository_UpdateOptimisticLockConflict — a stale
 // record_version is rejected, never silently overwritten (CONC-1).
 func TestCredentialRepository_UpdateOptimisticLockConflict(t *testing.T) {
@@ -372,6 +437,61 @@ func TestPrincipalRepository_FindByID(t *testing.T) {
 	otherTenant := uuid.New()
 	err = txRunner.RunInTx(withTenant(ctx, otherTenant), func(ctx context.Context) error {
 		_, err := repo.FindByID(ctx, tenantID, principalID)
+		return err
+	})
+	require.Error(t, err)
+	domainErr, ok = err.(*domain.Error)
+	require.True(t, ok, "expected *domain.Error, got %T: %v", err, err)
+	assert.Equal(t, domain.ErrPrincipalNotFound, domainErr.Code)
+}
+
+// TestPrincipalRepository_FindByPrincipalSub covers the same found,
+// not-found, and cross-tenant-invisible branches as FindByID, but keyed by
+// the Keycloak sub (TS-5, AUTH-9) — the identifier org-membership's
+// service-account-not-grantable check actually has, since it never sees
+// Token Service's own internal principal id.
+func TestPrincipalRepository_FindByPrincipalSub(t *testing.T) {
+	t.Parallel()
+	appPool, _, rawPool := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	principalSub := uuid.New()
+	principalID := uuid.New()
+	_, err := rawPool.Exec(ctx, `
+		INSERT INTO service_account_principals (id, tenant_id, principal_sub, keycloak_client_id)
+		VALUES ($1, $2, $3, $4)`, principalID, tenantID, principalSub, testKeycloakClientID)
+	require.NoError(t, err)
+	repo := pgadapter.NewPrincipalRepository(appPool)
+	txRunner := pgadapter.NewTxRunner(appPool, nil)
+
+	var found *domain.ServiceAccountPrincipal
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		var err error
+		found, err = repo.FindByPrincipalSub(ctx, tenantID, principalSub)
+		return err
+	})
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, principalID, found.ID)
+	assert.Equal(t, tenantID, found.TenantID)
+	assert.Equal(t, principalSub, found.PrincipalSub)
+
+	// Not found: a random sub under the correct tenant GUC — the expected,
+	// common case for every real human user checked.
+	err = txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+		_, err := repo.FindByPrincipalSub(ctx, tenantID, uuid.New())
+		return err
+	})
+	require.Error(t, err)
+	domainErr, ok := err.(*domain.Error)
+	require.True(t, ok, "expected *domain.Error, got %T: %v", err, err)
+	assert.Equal(t, domain.ErrPrincipalNotFound, domainErr.Code)
+
+	// Cross-tenant invisible: the real principal_sub, but a caller GUC bound
+	// to a different tenant — RLS hides it (§5.5).
+	otherTenant := uuid.New()
+	err = txRunner.RunInTx(withTenant(ctx, otherTenant), func(ctx context.Context) error {
+		_, err := repo.FindByPrincipalSub(ctx, tenantID, principalSub)
 		return err
 	})
 	require.Error(t, err)

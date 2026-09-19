@@ -30,12 +30,21 @@ type PrincipalMaterialState struct {
 	CommittedVersions []int
 }
 
-// ReconcilerRepository implements the two cross-tenant enumeration reads
-// the §8.3/§8.6 cmd/rotator jobs need. Both methods MUST be called against
-// the read-only, BYPASSRLS `serviceaccount_reconciler` pool (§4.3/RLS-7) —
-// they scan across every tenant by design, which an RLS-scoped connection
-// cannot do. Enumeration only: neither method writes. Every resulting
-// write (a revoke) goes through a separate RLS-scoped CredentialRepository
+// DueForRotation is one `active` credential cmd/scheduler must rotate: its
+// next_rotation_at has passed (§16 TSQ-6 Resolved, TS-D14, idx_sac_next_rotation).
+type DueForRotation struct {
+	TenantID    uuid.UUID
+	PrincipalID uuid.UUID
+	Version     int
+}
+
+// ReconcilerRepository implements the cross-tenant enumeration reads the
+// §8.3/§8.6 cmd/rotator jobs and the §16 TSQ-6 cmd/scheduler job need.
+// Every method MUST be called against the read-only, BYPASSRLS
+// `serviceaccount_reconciler` pool (§4.3/RLS-7) — they scan across every
+// tenant by design, which an RLS-scoped connection cannot do. Enumeration
+// only: no method writes. Every resulting write (a revoke, or
+// cmd/scheduler's IssueOrRotate call) goes through a separate RLS-scoped
 // call bound to that row's own tenant.
 type ReconcilerRepository interface {
 	// ListExpiredRotating enumerates every `rotating` credential across all
@@ -48,4 +57,9 @@ type ReconcilerRepository interface {
 	// version below MaxVersion with no committed row) and missing material
 	// (a committed version whose OpenBao entry is gone).
 	ListPrincipalMaterialStates(ctx context.Context) ([]PrincipalMaterialState, error)
+
+	// ListDueForRotation enumerates every `active` credential across all
+	// tenants whose next_rotation_at has passed (§16 TSQ-6 Resolved,
+	// idx_sac_next_rotation) — cmd/scheduler's due-list scan.
+	ListDueForRotation(ctx context.Context) ([]DueForRotation, error)
 }

@@ -22,6 +22,77 @@ const docTemplate = `{
     "basePath": "{{.BasePath}}",
     "paths": {
         "/tenants/{id}/service-accounts": {
+            "get": {
+                "security": [
+                    {
+                        "SystemRole": []
+                    },
+                    {
+                        "TenantID": []
+                    },
+                    {
+                        "UserID": []
+                    }
+                ],
+                "description": "Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer \"does this subject resolve to a service_account-typed Keycloak principal\" without ever generating principal_sub itself (TS-INV-1).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "ServiceAccounts"
+                ],
+                "summary": "TS-5 — Find service-account principal by Keycloak sub",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Tenant UUID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Keycloak sub UUID",
+                        "name": "principal_sub",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.principalResponseBody"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_request",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "missing_identity_headers",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "principal_not_found",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    }
+                }
+            },
             "post": {
                 "security": [
                     {
@@ -97,6 +168,54 @@ const docTemplate = `{
                     },
                     "503": {
                         "description": "db_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/tenants/{id}/service-accounts/platform-automation/jwks.json": {
+            "get": {
+                "description": "Public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches to verify that principal's client_assertion (§2.5). Always 200 with a (possibly empty) keys array; an unknown tenant or absent principal is never distinguished from a principal with zero live keys, since this route has no caller identity to authorize a 404 against.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "ServiceAccounts"
+                ],
+                "summary": "EXT-6 — Platform-automation JWKS",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Tenant UUID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.jwksResponseBody"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_request",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "429": {
+                        "description": "rate_limited",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
@@ -190,7 +309,7 @@ const docTemplate = `{
                         "UserID": []
                     }
                 ],
-                "description": "Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns the credential plaintext exactly once — it is never retrievable again (TS-INV-2).",
+                "description": "Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache.",
                 "consumes": [
                     "application/json"
                 ],
@@ -398,8 +517,14 @@ const docTemplate = `{
                 "issued_at": {
                     "type": "string"
                 },
+                "next_rotation_at": {
+                    "type": "string"
+                },
                 "openbao_path": {
                     "type": "string"
+                },
+                "rotation_cadence_days": {
+                    "type": "integer"
                 },
                 "status": {
                     "type": "string"
@@ -437,6 +562,18 @@ const docTemplate = `{
                 },
                 "version": {
                     "type": "integer"
+                }
+            }
+        },
+        "http.jwksResponseBody": {
+            "type": "object",
+            "properties": {
+                "keys": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": {}
+                    }
                 }
             }
         },

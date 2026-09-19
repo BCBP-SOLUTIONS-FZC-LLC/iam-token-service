@@ -170,6 +170,51 @@ spec:
               exists in Postgres with no corresponding OpenBao secret.
               Investigate immediately; this principal cannot authenticate.
 
+        # ── Cadence-driven rotation failed (§16 TSQ-6 Resolved, TS-D14) —
+        #    page-worthy per §11.5: this can mean IssueOrRotate committed
+        #    but the RP-17 key-refresh then failed (TS-INV-7-style
+        #    two-halves gap, TS-D15), which does NOT self-heal on the next
+        #    scan since next_rotation_at has already advanced ────────────
+        - alert: IAMTokenServiceCadenceRotationFailures
+          expr: |
+            increase(iam_token_service_cadence_rotation_total{job={{ printf "%s-scheduler" $job | quote }}, result="failed"}[1h]) > 0
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-token-service automatic cadence-driven rotation is failing
+            description: >-
+              {{ "{{ $value | humanize }}" }} failed result(s) from the §16 TSQ-6
+              cadence scheduler in the last hour — either IssueOrRotate
+              itself failed (retried next scan), or it committed but the
+              RP-17 ClearServiceAccountKeysCache call then failed (TS-D15),
+              which will NOT self-heal: the affected principal's
+              next_rotation_at has already advanced. Check scheduler
+              CronJob logs for the tenant/principal/version and complete
+              the missed RP-17 call by hand if needed.
+
+        # ── JWKS route couldn't serve a live credential's key (EXT-6,
+        #    TS-D15) — page-worthy per §11.5: this service believes the
+        #    credential is live, so this is a real per-credential Keycloak
+        #    auth outage silently returned as 200, not a routine "unknown
+        #    tenant" empty response ────────────────────────────────────
+        - alert: IAMTokenServiceJWKSKeyErrors
+          expr: |
+            increase(iam_token_service_jwks_key_errors_total{job={{ printf "%s-server" $job | quote }}}[15m]) > 0
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-token-service JWKS route could not serve a live credential's key
+            description: >-
+              {{ "{{ $value | humanize }}" }} unreadable/unparseable credential(s)
+              in the last 15 minutes (§5.4, EXT-6) — Keycloak's client-jwt
+              authenticator cannot validate that principal's assertion
+              until this is fixed. Check server logs for "jwks: skipping
+              unreadable credential"
+              (tenant_id/principal_id/credential_id/version) and
+              investigate the OpenBao entry at that credential's path.
+
     - name: iam_token_service_latency
       rules:
 

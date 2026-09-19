@@ -33,6 +33,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/openbao"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/realmprovisioner"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 
 	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
@@ -105,7 +106,14 @@ func main() {
 		log.Warn("RECONCILER_DATABASE_URL not set — reconciler pool reuses app DSN; cross-tenant queries will be RLS-filtered", nil)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), envDuration("ROTATOR_RUN_TIMEOUT", 5*time.Minute))
+	// Deliberately shorter than the CronJob's activeDeadlineSeconds (240s
+	// default, deploy/helm/values.yaml) — production-readiness review,
+	// TS-D15: the prior 5-minute default was LONGER than that k8s deadline,
+	// so a run that legitimately used its own budget could never reach the
+	// graceful exit path (log summary, serveMetricsBriefly, pool drain)
+	// below before Kubernetes SIGKILLs the Pod first. 180s leaves a ~60s
+	// margin for that cleanup to actually run.
+	ctx, cancel := context.WithTimeout(context.Background(), envDuration("ROTATOR_RUN_TIMEOUT", 180*time.Second))
 	defer cancel()
 
 	if err := outbox.ApplySchema(ctx, &pgmigrate.Runner{DSN: migrationDSN}); err != nil {
@@ -126,6 +134,15 @@ func main() {
 	}
 
 	instrumentedSecrets := metrics.NewInstrumentedSecretStore(openbaoClient) // iam_token_service_openbao_call_duration_seconds
+
+	// ── Realm Provisioner client (RP-17) — the sweep's revoke must trigger
+	// ClearServiceAccountKeysCache the same way cmd/scheduler's rotate does
+	// (EXT-6, rev 1.3, TS-INV-7): a cached Keycloak key otherwise keeps
+	// authenticating indefinitely, since there is no Keycloak-side TTL. ────
+	rpClient := realmprovisioner.New(
+		mustEnv("REALM_PROVISIONER_BASE_URL", appEnv, "http://iam-realm-provisioner.iam.svc.cluster.local:8080"),
+		log,
+	)
 
 	// ── Repositories + enqueue-only TxRunner (no Glue/SNS — see package
 	// doc comment) ────────────────────────────────────────────────────────
@@ -157,7 +174,7 @@ func main() {
 	// pattern as iam-org-membership cmd/reconciler), so CronJob work shows
 	// up in traces even though this binary has no HTTP middleware.
 	sweepCtx, endSweep := startJobSpan(ctx, cfg.ServiceName, "overlap_sweep")
-	sweep := runOverlapSweep(sweepCtx, reconcilerRepo, credentialRepo, instrumentedSecrets, txRunner, log)
+	sweep := runOverlapSweep(sweepCtx, reconcilerRepo, credentialRepo, instrumentedSecrets, txRunner, rpClient, log)
 	log.Info("overlap sweep complete", fieldsWithTrace(sweepCtx, map[string]interface{}{"revoked": sweep.Revoked, "skipped": sweep.Skipped, "failed": sweep.Failed}))
 	endSweep()
 	recordSweepMetric(sweep)

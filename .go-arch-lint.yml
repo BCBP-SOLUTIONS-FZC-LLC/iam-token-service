@@ -57,6 +57,14 @@ components:
   openbao:
     in: internal/adapter/outbound/openbao
 
+  # httpx is the shared outbound-HTTP transport (traceparent injection +
+  # client spans, §11.3) every outbound HTTP adapter builds on — currently
+  # only realmprovisioner (§16 TSQ-6 Resolved). Its own component so it can
+  # be depended on by adapters_outbound without adapters_outbound depending
+  # on itself.
+  httpx:
+    in: internal/adapter/outbound/httpx
+
   # Cross-cutting Prometheus counters. Not a business adapter —
   # instrumentation is imported by inbound consumers (skipDuplicate /
   # ackUnknown) and the composition root, matching iam-user-profile /
@@ -67,6 +75,10 @@ components:
   adapters_outbound:
     in:
       - internal/adapter/outbound/eventbus
+      # realmprovisioner is cmd/scheduler's outbound RP-17 relay (§16
+      # TSQ-6 Resolved, TS-D14) — the one outbound HTTP dependency this
+      # service has on another IAM service.
+      - internal/adapter/outbound/realmprovisioner
 
   adapters_inbound:
     in:
@@ -81,6 +93,11 @@ components:
       - cmd/server
       - cmd/consumer
       - cmd/rotator
+      # cmd/scheduler (§16 TSQ-6 Resolved, TS-D14) — unlike cmd/rotator,
+      # it depends on `service` directly (rotating a credential is a
+      # service-layer write path), so it is NOT also listed under
+      # reconciler_jobs.
+      - cmd/scheduler
 
 deps:
   # domain: no internal (project) imports — pure value types + invariants
@@ -132,6 +149,7 @@ deps:
       - port
       - service
       - observability
+      - httpx
 
   adapters_inbound:
     mayDependOn:

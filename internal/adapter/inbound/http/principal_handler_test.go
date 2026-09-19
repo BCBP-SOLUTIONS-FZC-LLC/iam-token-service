@@ -18,6 +18,7 @@ func newPrincipalTestRouter(svc PrincipalService) *gin.Engine {
 	h := NewPrincipalHandler(svc)
 	return newTenantScopedTestRouter(func(g *gin.RouterGroup) {
 		g.POST("/service-accounts", h.Register)
+		g.GET("/service-accounts", h.FindBySub)
 		g.GET("/service-accounts/:principal_id", h.Read)
 	})
 }
@@ -148,6 +149,52 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		r := newPrincipalTestRouter(svc)
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts/"+principalID.String(), sysHeaders(tenantID), nil)
 		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+func TestPrincipalHandler_FindBySub(t *testing.T) {
+	tenantID := uuid.New()
+	principalID := uuid.New()
+	principalSub := uuid.New()
+
+	t.Run("200 found", func(t *testing.T) {
+		svc := &fakePrincipalService{findBySubResult: &service.FindBySubResult{
+			PrincipalID: principalID, TenantID: tenantID, PrincipalType: domain.PrincipalTypePlatformAutomation,
+			Status: domain.PrincipalStatusActive, RecordVersion: 1,
+		}}
+		r := newPrincipalTestRouter(svc)
+		var body principalResponseBody
+		rec := doJSON(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), sysHeaders(tenantID), nil, &body)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, principalID, body.PrincipalID)
+		assert.Equal(t, "active", body.Status)
+	})
+
+	t.Run("404 not found — the common case for a real human user", func(t *testing.T) {
+		svc := &fakePrincipalService{findBySubErr: domain.NewError(domain.ErrPrincipalNotFound, "no principal")}
+		r := newPrincipalTestRouter(svc)
+		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), sysHeaders(tenantID), nil)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("401 missing identity headers", func(t *testing.T) {
+		r := newPrincipalTestRouter(&fakePrincipalService{})
+		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), nil, nil)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
+
+	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
+		r := newPrincipalTestRouter(&fakePrincipalService{})
+		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub=not-a-uuid", sysHeaders(tenantID), nil)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		er := decodeErrorBody(t, rec)
+		assert.Equal(t, "principal_sub", er.Details["field"])
+	})
+
+	t.Run("400 missing principal_sub", func(t *testing.T) {
+		r := newPrincipalTestRouter(&fakePrincipalService{})
+		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts", sysHeaders(tenantID), nil)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 }
 

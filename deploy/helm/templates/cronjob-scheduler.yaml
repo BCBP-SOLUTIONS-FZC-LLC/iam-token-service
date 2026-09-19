@@ -1,0 +1,80 @@
+# The automatic cadence-driven rotation scan (§16 TSQ-6 Resolved, TS-D14) —
+# one CronJob, one binary invocation per fire: scan
+# service_account_credentials for every `active` row past next_rotation_at
+# (idx_sac_next_rotation) and rotate each one via TS-1's own
+# CredentialService.IssueOrRotate in-process, then relay to the Realm
+# Provisioner's RP-17. A separate CronJob from -rotator (cmd/rotator) —
+# cmd/rotator never calls TS-1 and never will (TS-D14); this is the one
+# component that does.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-scheduler
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: {{ .Values.scheduler.schedule | quote }}
+  concurrencyPolicy: {{ .Values.scheduler.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.scheduler.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.scheduler.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.scheduler.activeDeadlineSeconds }}
+      # Mirrors -rotator's rationale: every due-list rotation is
+      # independently idempotent (§9.2, a fresh rotation_id per row), so a
+      # crashing run retries at most twice before the next scheduled fire
+      # (concurrencyPolicy: Forbid) picks up any principal it missed.
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "iam-token-service.componentSelectorLabels" (dict "component" "scheduler" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 12 }}
+          annotations:
+            {{- with .Values.podAnnotations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            # Pod-level scrape annotation: this Job's
+            # iam_token_service_cadence_rotation_total samples are only
+            # ever available during serveMetricsBriefly's grace window
+            # (cmd/scheduler/main.go) — there is no Pushgateway in this
+            # deployment.
+            prometheus.io/scrape: "true"
+            prometheus.io/port: {{ .Values.service.metricsPort | quote }}
+            prometheus.io/path: /metrics
+            {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
+            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+            {{- else }}
+            rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+            {{- end }}
+        spec:
+          serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: scheduler
+              image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/iam-token-service-scheduler"]
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              ports:
+                - name: metrics
+                  containerPort: {{ .Values.service.metricsPort }}
+              env:
+                {{- include "iam-token-service.commonEnv" . | nindent 16 }}
+                - name: METRICS_PORT
+                  value: {{ .Values.service.metricsPort | quote }}
+                - name: ROTATION_DEFAULT_CADENCE_DAYS
+                  value: {{ .Values.rotation.defaultCadenceDays | quote }}
+                - name: REALM_PROVISIONER_BASE_URL
+                  value: {{ .Values.realmProvisioner.baseUrl | quote }}
+              resources:
+                {{- toYaml .Values.scheduler.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

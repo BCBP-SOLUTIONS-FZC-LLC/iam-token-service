@@ -86,6 +86,26 @@ var (
 	// credential-material reconciliation is unique to this service.
 	MaterialReconcileTotal *prometheus.CounterVec
 
+	// CadenceRotationTotal counts cmd/scheduler's automatic cadence-driven
+	// rotation outcomes (§16 TSQ-6 Resolved, TS-D14) by result
+	// (rotated|skipped|failed). failed is page-worthy (§11.5): it may mean
+	// IssueOrRotate committed but the RP-17 relay failed, leaving Keycloak
+	// out of sync with this service's own record (cmd/scheduler/scan.go).
+	// Service-specific: automatic cadence-driven rotation is unique to
+	// this service.
+	CadenceRotationTotal *prometheus.CounterVec
+
+	// JWKSKeyErrorsTotal counts live (active/rotating) credentials the
+	// JWKS route (§5.4, EXT-6) could not serve — its OpenBao material was
+	// unreadable or unparseable (production-readiness review, TS-D15).
+	// Page-worthy (§11.5): unlike an unknown tenant (an intentionally
+	// unsignaled 200 with zero keys), this is a credential this service
+	// itself believes is live, so >0 means a real per-credential Keycloak
+	// auth outage masquerading as a 200. No `result` label (unlike the
+	// counters above) — there is exactly one outcome this counts.
+	// Service-specific: JWKS custody is unique to this service.
+	JWKSKeyErrorsTotal prometheus.Counter
+
 	// ProcessedEventsDuplicates counts SQS redeliveries filtered by the
 	// processed_events composite PK, matching iam-user-profile /
 	// iam-org-membership. Legacy Tier-3 name kept for the compatibility
@@ -188,10 +208,10 @@ func withEnvironment(base prometheus.Labels) prometheus.Labels {
 // injected `environment` label — instrumentation call sites never set it
 // themselves, per requirement #8: labels must be injected centrally so
 // they cannot be omitted or misspelled). Idempotent. Every one of
-// cmd/server, cmd/consumer, and cmd/rotator calls this — the instruments
-// used by a given binary are simply the ones that binary's code paths
-// touch; registering the full set everywhere keeps one source of truth
-// instead of three partial ones.
+// cmd/server, cmd/consumer, cmd/rotator, and cmd/scheduler calls this —
+// the instruments used by a given binary are simply the ones that
+// binary's code paths touch; registering the full set everywhere keeps
+// one source of truth instead of four partial ones.
 func Register(env string) {
 	registerOnce.Do(func() {
 		environment = env
@@ -242,6 +262,12 @@ func registerMetrics() {
 		ConstLabels: t3,
 	}, []string{"result"})
 
+	CadenceRotationTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "cadence_rotation_total",
+		Help:        "cmd/scheduler's automatic cadence-driven rotation outcomes (§16 TSQ-6 Resolved) by result (rotated|skipped|failed). failed is page-worthy.",
+		ConstLabels: t3,
+	}, []string{"result"})
+
 	ProcessedEventsDuplicates = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name:        tier3Prefix + "processed_events_duplicates_total",
 		Help:        "[Legacy — see platform_duplicate_messages_total] Inbound SQS messages skipped because event_id was already in processed_events.",
@@ -275,6 +301,12 @@ func registerMetrics() {
 		ConstLabels: t2,
 	}, []string{"outcome"})
 
+	JWKSKeyErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        tier3Prefix + "jwks_key_errors_total",
+		Help:        "Live credentials the JWKS route (EXT-6) could not serve — OpenBao material unreadable/unparseable. Page-worthy: a real per-credential Keycloak auth outage.",
+		ConstLabels: t3,
+	})
+
 	gincommon.MetricsRegisterer().MustRegister(
 		CredentialsIssuedTotal,
 		RotationOverlapActive,
@@ -282,6 +314,13 @@ func registerMetrics() {
 		OffboardingCascadeTotal,
 		RotationSweepTotal,
 		MaterialReconcileTotal,
+		// CadenceRotationTotal was defined but never registered until this
+		// production-readiness review (TS-D15) — iam_token_service_
+		// cadence_rotation_total never actually reached /metrics, so the
+		// IAMTokenServiceCadenceRotationFailures alert added alongside it
+		// could never have fired.
+		CadenceRotationTotal,
+		JWKSKeyErrorsTotal,
 		ProcessedEventsDuplicates,
 		UnknownEventAcknowledged,
 		DependencyRequestDuration,

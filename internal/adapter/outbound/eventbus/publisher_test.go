@@ -37,8 +37,12 @@ func (f *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.Comman
 
 type failingCodec struct{ err error }
 
-func (f failingCodec) Encode(context.Context, string, []byte) ([]byte, string, error) {
+func (f failingCodec) Encode(context.Context, string, json.RawMessage) ([]byte, string, error) {
 	return nil, "", f.err
+}
+
+func (f failingCodec) Decode(context.Context, string, []byte) (json.RawMessage, error) {
+	return nil, f.err
 }
 
 func newTestEvent(tenantID uuid.UUID) *domain.Event {
@@ -52,6 +56,13 @@ func newTestEvent(tenantID uuid.UUID) *domain.Event {
 			CreatedAt: "2026-01-01T00:00:00Z",
 		},
 	}
+}
+
+func TestPublisher_New_NilCodecBecomesNoop(t *testing.T) {
+	p := New("iam-token-service", nil)
+	require.NotNil(t, p)
+	err := p.Enqueue(port.WithTx(context.Background(), &fakeTx{}), newTestEvent(uuid.New()))
+	require.NoError(t, err)
 }
 
 func TestPublisher_Enqueue_HappyPath_InsertsIntoOutbox(t *testing.T) {

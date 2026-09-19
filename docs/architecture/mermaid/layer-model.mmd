@@ -2,11 +2,18 @@
 %% (outer layers depend on inner layers, never the reverse). cmd/rotator
 %% (reconciler_jobs) is deliberately barred from depending on service —
 %% it talks to postgres/openbao directly under BYPASSRLS (§4.3/RLS-7).
+%% cmd/scheduler (§16 TSQ-6 Resolved, TS-D14) also connects under
+%% BYPASSRLS for its own cross-tenant due-list scan, but is NOT barred
+%% from service — every rotation it performs goes through
+%% CredentialService.IssueOrRotate, the same call cmd/server's HTTP
+%% handler makes; it lives under the `cmd` component, not
+%% `reconciler_jobs`.
 graph TD
     subgraph cmd["cmd/* — composition roots"]
         SERVER["cmd/server<br/>HTTP API + outbox runner"]
         CONSUMER["cmd/consumer<br/>offboarding SQS subscriber"]
         ROTATOR["cmd/rotator<br/>sweep + reconciler + prune CronJob"]
+        SCHEDULER["cmd/scheduler<br/>cadence scan + RP-17 key-refresh"]
     end
 
     subgraph inbound["adapters_inbound"]
@@ -16,11 +23,13 @@ graph TD
 
     subgraph outbound["adapters_outbound"]
         EVENTBUS["internal/adapter/outbound/eventbus<br/>Publisher, ValidatingCodec, GlueCodec"]
+        REALMPROV["internal/adapter/outbound/realmprovisioner<br/>RP-17 client"]
     end
 
     subgraph isolated["single-purpose outbound components"]
         POSTGRES["postgres<br/>repositories, RLS GUC binding, TxRunner"]
         OPENBAO["openbao<br/>KV v2 client, Kubernetes auth"]
+        HTTPX["httpx<br/>traceparent injection, client spans"]
         OBS["observability<br/>Prometheus metrics"]
     end
 
@@ -47,11 +56,18 @@ graph TD
     ROTATOR --> OPENBAO
     ROTATOR --> EVENTBUS
     ROTATOR --> OBS
+    SCHEDULER --> POSTGRES
+    SCHEDULER --> OPENBAO
+    SCHEDULER --> SERVICE
+    SCHEDULER --> REALMPROV
+    SCHEDULER --> OBS
 
     HTTP --> SERVICE
     CONS --> PORT
     CONS --> OBS
     EVENTBUS --> SERVICE
+    REALMPROV --> PORT
+    REALMPROV --> HTTPX
     POSTGRES --> PORT
     OPENBAO --> PORT
     OBS --> SERVICE
@@ -65,5 +81,6 @@ graph TD
     HTTP --> APISPEC
 
     style ROTATOR fill:#fce8e6,stroke:#c0392b
+    style SCHEDULER fill:#fff4e0,stroke:#e67e22
     style SERVICE fill:#e8f4fc,stroke:#2980b9
     style DOMAIN fill:#eafaf1,stroke:#27ae60

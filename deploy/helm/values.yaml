@@ -57,6 +57,19 @@ rotator:
     requests: { cpu: 100m, memory: 64Mi }
     limits: { cpu: 250m, memory: 128Mi }
 
+# scheduler: the §16 TSQ-6 Resolved automatic cadence-driven rotation scan
+# (TS-D14) — a separate CronJob from rotator above; rotator never calls
+# TS-1 and never will.
+scheduler:
+  schedule: "*/5 * * * *" # ROTATION_SCHEDULER_POLL_INTERVAL semantics (§16 TSQ-6 Resolved) — a Helm-level cron expression, not an env var this binary reads
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  activeDeadlineSeconds: 240
+  resources:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+
 service:
   port: 8080
   metricsPort: 9090
@@ -76,12 +89,15 @@ autoscaling:
   targetRPSPerReplica: 500
 
 # Restricts ingress to in-mesh callers only (§10.2) — Realm Provisioner,
-# O&M, the operator gateway, and this service's own rotator CronJob (which
-# never calls the server's HTTP API, but shares the mesh). No public/edge
-# route exists (§5.6). Egress is an explicit allow-list (DNS, Postgres,
-# OpenBao, AWS HTTPS for SNS/Glue, OTel) shared by every workload this
-# chart creates (server, consumer, rotator) — see
-# templates/_helpers.tpl's egressRules.
+# O&M, the operator gateway, and this service's own rotator/scheduler
+# CronJobs (which never call the server's HTTP API, but share the mesh),
+# PLUS Keycloak (TS-D15, EXT-6/rev 1.3) for its own outbound JWKS fetch —
+# see keycloakNamespaceSelector below. No public/edge route exists (§5.6).
+# Egress is an explicit allow-list (DNS, Postgres, OpenBao, AWS HTTPS for
+# SNS/Glue, OTel, and — for rotator/scheduler only — the Realm
+# Provisioner's RP-17) shared by every workload this chart creates
+# (server, consumer, rotator, scheduler) — see templates/_helpers.tpl's
+# egressRules.
 networkPolicy:
   enabled: true
   # Required whenever enabled: true — a NetworkPolicy `namespaceSelector: {}`
@@ -95,9 +111,27 @@ networkPolicy:
   # matching whatever namespace label your mesh/cluster convention uses for
   # "in-mesh" namespaces (Realm Provisioner, O&M, the operator gateway).
   ingressNamespaceSelector: {}
+  # Required whenever enabled: true, same fail-closed posture as
+  # ingressNamespaceSelector above (TS-D15, EXT-6/rev 1.3 completeness
+  # fix) — Keycloak's own outbound client-jwt/jwks.url fetch against the
+  # platform-automation JWKS route carries no caller identity, so it
+  # can't be authenticated by header the way every other route on this
+  # port is; it must be admitted at the network layer instead, separately
+  # from ingressNamespaceSelector since Keycloak may not run in the same
+  # namespace as the RP/O&M/operator mesh, e.g.:
+  #   keycloakNamespaceSelector:
+  #     matchLabels:
+  #       app: keycloak
+  keycloakNamespaceSelector: {}
   postgresPort: 5432
   openbaoPort: 8200
   otelPort: 4317
+  # realmProvisionerPort: cmd/rotator's and cmd/scheduler's shared egress
+  # target (RP-17, §16 TSQ-6 Resolved / TS-D15) — the overlap-expiry sweep
+  # and the cadence scan both call ClearServiceAccountKeysCache after
+  # every revoke/rotate (EXT-6/rev 1.3); no other workload in this chart
+  # calls out to it.
+  realmProvisionerPort: 8080
   additionalEgressRules: []
 
 # podDisruptionBudget — ensures at least 1 pod survives voluntary
@@ -182,10 +216,25 @@ openbao:
   authRole: iam-token-service
   kvMount: iam
 
+# realmProvisioner: the sibling Realm Provisioner's internal API — the
+# RP-17 relay cmd/scheduler calls after TS-1 (§16 TSQ-6 Resolved, TS-D14).
+# No other binary this service ships makes an outbound call here.
+realmProvisioner:
+  baseUrl: "http://iam-realm-provisioner.iam.svc.cluster.local:8080"
+
 # rotation: overlap-window and cadence tuning (§6.2, §8.3).
 rotation:
   defaultOverlapSeconds: 300
   defaultCadenceDays: 90
+
+# jwks: rate limit on the unauthenticated-by-header JWKS route (EXT-6,
+# TS-D15) — it reads a private key out of OpenBao per live credential on
+# every hit and has no caller-identity gate to lean on otherwise. A
+# process-wide (not per-tenant) token bucket; well above realistic
+# Keycloak fetch volume, low enough to bound OpenBao read amplification.
+jwks:
+  rateLimitRPS: 20
+  rateLimitBurst: 40
 
 # events: SNS/Glue (§7.3.1, §25 frozen names). topicArn and glueRegistryName
 # are supplied via env/secret in real environments — empty here means

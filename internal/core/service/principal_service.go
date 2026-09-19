@@ -96,6 +96,36 @@ func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req
 	}, nil
 }
 
+// FindBySubResult is the TS-5 response body (AUTH-9) — deliberately lighter
+// than ReadPrincipalResult: callers checking "is this subject a service
+// account" need identity/status only, never credential metadata.
+type FindBySubResult struct {
+	PrincipalID   uuid.UUID
+	TenantID      uuid.UUID
+	PrincipalType domain.PrincipalType
+	Status        domain.PrincipalStatus
+	RecordVersion int
+}
+
+// FindPrincipalBySub implements TS-5 (AUTH-9): looks up a principal by its
+// Keycloak sub rather than Token Service's own internal id — the signal
+// org-membership's service-account-not-grantable defense-in-depth check
+// needs, since a subject's Keycloak sub is the only identifier it ever
+// sees (as user_id) and this service never generates principal_sub itself
+// (TS-INV-1). Returns domain.ErrPrincipalNotFound when absent — expected
+// for the overwhelming majority of calls (real human users, not the
+// tenant's automation principal).
+func (s *PrincipalService) FindPrincipalBySub(ctx context.Context, tenantID, principalSub uuid.UUID) (*FindBySubResult, error) {
+	p, err := s.principals.FindByPrincipalSub(ctx, tenantID, principalSub)
+	if err != nil {
+		return nil, err
+	}
+	return &FindBySubResult{
+		PrincipalID: p.ID, TenantID: p.TenantID,
+		PrincipalType: p.PrincipalType, Status: p.Status, RecordVersion: p.RecordVersion,
+	}, nil
+}
+
 // CredentialSummary is one entry in ReadPrincipalResult.Credentials (§5.4
 // TS-3) — metadata only, never a secret.
 type CredentialSummary struct {
@@ -104,6 +134,13 @@ type CredentialSummary struct {
 	OpenBaoPath string
 	IssuedAt    time.Time
 	ExpiresAt   *time.Time
+
+	// RotationCadenceDays/NextRotationAt (§16 TSQ-6 Resolved) are non-nil
+	// only on the `active` entry — cleared on every superseded version
+	// (§4.2), so O&M sees exactly one "when is this due" answer per
+	// principal.
+	RotationCadenceDays *int
+	NextRotationAt      *time.Time
 }
 
 // ReadPrincipalResult is the TS-3 response body (§5.4).
@@ -135,6 +172,7 @@ func (s *PrincipalService) ReadPrincipal(ctx context.Context, tenantID, principa
 		summaries = append(summaries, CredentialSummary{
 			Version: c.Version, Status: c.Status, OpenBaoPath: c.OpenBaoPath,
 			IssuedAt: c.IssuedAt, ExpiresAt: c.ExpiresAt,
+			RotationCadenceDays: c.RotationCadenceDays, NextRotationAt: c.NextRotationAt,
 		})
 	}
 	return &ReadPrincipalResult{

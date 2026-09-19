@@ -37,6 +37,7 @@ func (d DocsConfig) active() bool {
 type Handlers struct {
 	Principal  *PrincipalHandler
 	Credential *CredentialHandler
+	JWKS       *JWKSHandler
 }
 
 // RouterConfig bundles every dependency NewRouter needs.
@@ -80,6 +81,7 @@ func NewRouter(cfg RouterConfig) *Router {
 
 	registerInfraRoutes(r, cfg)
 	registerDocsRoutes(r, cfg)
+	registerJWKSRoutes(r, cfg)
 	registerInternalRoutes(r, cfg)
 
 	return &Router{engine: r}
@@ -205,6 +207,18 @@ func registerDocsRoutes(r *gin.Engine, cfg RouterConfig) {
 	r.GET("/asyncapi.yaml", secHeaders, authMiddleware, AsyncAPIYAMLHandler)
 }
 
+// ── JWKS (EXT-6, §2.5) — unauthenticated by header, RLS-scoped from the
+// path instead; registered before registerInternalRoutes' protected group
+// so this one path never picks up ProtectedMiddlewares/GUCBridgeMiddleware ──
+
+func registerJWKSRoutes(r *gin.Engine, cfg RouterConfig) {
+	h := cfg.Handlers
+	if h.JWKS == nil {
+		return
+	}
+	r.GET("/api/v1/internal/tenants/:id/service-accounts/platform-automation/jwks.json", h.JWKS.JWKS)
+}
+
 // ── Credential-lifecycle API — /api/v1/internal/* (TS-1..TS-4, §5.1/§25) ──
 
 func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
@@ -221,6 +235,7 @@ func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 
 	tenantScoped := internal.Group("/tenants/:id", RequireTenantPathMatch())
 	tenantScoped.POST("/service-accounts", h.Principal.Register)                                          // TS-4
+	tenantScoped.GET("/service-accounts", h.Principal.FindBySub)                                          // TS-5 (AUTH-9)
 	tenantScoped.GET("/service-accounts/:principal_id", h.Principal.Read)                                 // TS-3
 	tenantScoped.POST("/service-accounts/:principal_id/credentials", h.Credential.IssueOrRotate)          // TS-1
 	tenantScoped.POST("/service-accounts/:principal_id/credentials/:version/revoke", h.Credential.Revoke) // TS-2

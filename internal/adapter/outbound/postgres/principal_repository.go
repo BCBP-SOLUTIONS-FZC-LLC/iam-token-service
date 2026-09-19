@@ -75,6 +75,31 @@ func (r *PrincipalRepository) FindByID(ctx context.Context, tenantID, principalI
 	return out, nil
 }
 
+// FindByPrincipalSub returns the (tenantID, principalSub) principal under
+// the caller's RLS-scoped tenant, or domain.ErrPrincipalNotFound — the
+// TS-5 lookup-by-Keycloak-sub (§5.5, AUTH-9).
+func (r *PrincipalRepository) FindByPrincipalSub(ctx context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	var out *domain.ServiceAccountPrincipal
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+principalColumns+` FROM service_account_principals
+			WHERE tenant_id = $1 AND principal_sub = $2 AND deleted_at IS NULL`, tenantID, principalSub)
+		found, scanErr := scanPrincipal(row)
+		if scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				return domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+			}
+			return scanErr
+		}
+		out = found
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Register inserts p if no principal yet exists for
 // (tenant_id, principal_type) (uq_sap_active_principal). A repeat call
 // whose principal_sub/keycloak_client_id are unchanged is a true no-op —

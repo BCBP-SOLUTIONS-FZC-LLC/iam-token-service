@@ -2,10 +2,13 @@ package eventbus
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
 type recordingCodec struct {
@@ -14,11 +17,15 @@ type recordingCodec struct {
 	gotPayload []byte
 }
 
-func (r *recordingCodec) Encode(_ context.Context, eventType string, payload []byte) ([]byte, string, error) {
+func (r *recordingCodec) Encode(_ context.Context, eventType string, payload json.RawMessage) ([]byte, string, error) {
 	r.calls++
 	r.gotType = eventType
 	r.gotPayload = payload
 	return payload, "inner-version", nil
+}
+
+func (r *recordingCodec) Decode(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+	return encoded, nil
 }
 
 func TestNewValidatingCodec_CompilesAllEmbeddedSchemas(t *testing.T) {
@@ -178,4 +185,18 @@ func TestValidatingCodec_Encode_ValidPayloadForEveryProducedEvent(t *testing.T) 
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestValidatingCodec_Decode_DelegatesToInner(t *testing.T) {
+	inner := &recordingCodec{}
+	c := &ValidatingCodec{inner: inner}
+	got, err := c.Decode(context.Background(), "schema-id", []byte(`{"k":"v"}`))
+	require.NoError(t, err)
+	assert.Equal(t, json.RawMessage(`{"k":"v"}`), got)
+}
+
+func TestNewValidatingCodec_NilInnerBecomesNoop(t *testing.T) {
+	c, err := NewValidatingCodec(nil)
+	require.NoError(t, err)
+	assert.Equal(t, events.NoopCodec{}, c.inner)
 }

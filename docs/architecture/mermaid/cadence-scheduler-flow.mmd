@@ -1,0 +1,39 @@
+%% cmd/scheduler — run-to-completion CronJob (§16 TSQ-6 Resolved, TS-D14).
+%% Connects as serviceaccount_reconciler (BYPASSRLS, SELECT-only) for its
+%% own cross-tenant due-list scan, exactly like cmd/rotator (§4.3/RLS-7) —
+%% but, unlike cmd/rotator, every actual write goes through
+%% CredentialService.IssueOrRotate (the `service` layer), the same call
+%% cmd/server's TS-1 HTTP handler makes.
+flowchart TD
+    START(["CronJob fires<br/>(one binary invocation)"])
+    START --> SCAN
+
+    subgraph SCAN["1. Due-list scan"]
+        L1["ReconcilerRepository.ListDueForRotation()<br/>BYPASSRLS — cross-tenant, status=active<br/>AND next_rotation_at < now()"]
+    end
+
+    SCAN --> LOOP
+
+    subgraph LOOP["2. Per due principal (rotateOneDue)"]
+        C1["bind app.tenant_id GUC to this row's tenant"]
+        C2["CredentialService.IssueOrRotate()<br/>fresh rotation_id, RLS-scoped serviceaccount_app write —<br/>same code path cmd/server's TS-1 handler calls"]
+        C3{"result"}
+        C4["principal_revoked / rotation_in_flight:<br/>a concurrent offboarding or operator/O&amp;M<br/>rotation already won the race → Skipped"]
+        C5["other error<br/>(OpenBao/DB unavailable) → Failed"]
+        C6["success: RealmProvisionerClient.RefreshKeys (RP-17)<br/>— no key material sent, RP just triggers<br/>ClearServiceAccountKeysCache"]
+        C7{"RP-17 call"}
+        C8["ok → Rotated"]
+        C9["fails: TS-1 already committed, but Keycloak is<br/>now out of sync — next_rotation_at already<br/>advanced, so this principal will NOT reappear<br/>next scan → Failed (page-worthy, TS-INV-7-style<br/>two-halves gap; tenant/principal/version logged,<br/>never key material) — needs a manual RP-17 call"]
+        C1 --> C2 --> C3
+        C3 -->|principal_revoked or rotation_in_flight| C4
+        C3 -->|other error| C5
+        C3 -->|success| C6 --> C7
+        C7 -->|204| C8
+        C7 -->|error| C9
+    end
+
+    LOOP --> DONE(["metrics.CadenceRotationTotal{result}<br/>Exit — Kubernetes recreates the Pod<br/>on the next schedule"])
+
+    style L1 fill:#e8f4fc,stroke:#2980b9
+    style C2 fill:#e8f4fc,stroke:#2980b9
+    style C9 fill:#fce8e6,stroke:#c0392b

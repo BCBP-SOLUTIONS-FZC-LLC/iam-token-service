@@ -41,6 +41,43 @@ func TestReconcilerRepository_ListExpiredRotating(t *testing.T) {
 	assert.Equal(t, 2, rows[0].Version)
 }
 
+// TestReconcilerRepository_ListDueForRotation — §16 TSQ-6 Resolved: only
+// an `active` row whose next_rotation_at has passed is returned; a
+// `rotating` row (cadence fields always NULL, §4.2) and an `active` row
+// not yet due are excluded.
+func TestReconcilerRepository_ListDueForRotation(t *testing.T) {
+	t.Parallel()
+	_, reconcilerPool, rawPool := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	principalID := seedPrincipal(t, ctx, rawPool, tenantID)
+
+	dueID := seedCredential(t, ctx, rawPool, tenantID, principalID, 2, "active")
+	_, err := rawPool.Exec(ctx, `UPDATE service_account_credentials SET rotation_cadence_days = 90, next_rotation_at = now() - interval '1 minute' WHERE id = $1`, dueID)
+	require.NoError(t, err)
+
+	notYetDueTenant := uuid.New()
+	notYetDuePrincipal := seedPrincipal(t, ctx, rawPool, notYetDueTenant)
+	notYetDueID := seedCredential(t, ctx, rawPool, notYetDueTenant, notYetDuePrincipal, 1, "active")
+	_, err = rawPool.Exec(ctx, `UPDATE service_account_credentials SET rotation_cadence_days = 90, next_rotation_at = now() + interval '1 hour' WHERE id = $1`, notYetDueID)
+	require.NoError(t, err)
+
+	// A `rotating` row past what would have been its next_rotation_at must
+	// never surface — only `active` rows are ever "due" (§4.2).
+	rotatingID := seedCredential(t, ctx, rawPool, tenantID, principalID, 1, "rotating")
+	_, err = rawPool.Exec(ctx, `UPDATE service_account_credentials SET next_rotation_at = now() - interval '1 hour' WHERE id = $1`, rotatingID)
+	require.NoError(t, err)
+
+	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
+	rows, err := repo.ListDueForRotation(ctx)
+	require.NoError(t, err)
+
+	require.Len(t, rows, 1)
+	assert.Equal(t, tenantID, rows[0].TenantID)
+	assert.Equal(t, principalID, rows[0].PrincipalID)
+	assert.Equal(t, 2, rows[0].Version)
+}
+
 // TestReconcilerRepository_ListPrincipalMaterialStates — §8.6: MaxVersion
 // and CommittedVersions reflect exactly the committed rows across tenants;
 // a principal with no credential rows yields MaxVersion=0 and an empty set.

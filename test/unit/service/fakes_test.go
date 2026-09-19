@@ -53,6 +53,11 @@ type fakePrincipalRepository struct {
 	// forceRegisterErr, when non-nil, is returned by Register instead of
 	// its normal idempotent-create logic.
 	forceRegisterErr error
+
+	// forceListByTenantErr, when non-nil, is returned by ListByTenant
+	// instead of its normal listing — exercises JWKSService.PublicKeys'
+	// repository-error branch.
+	forceListByTenantErr error
 }
 
 func newFakePrincipalRepository() *fakePrincipalRepository {
@@ -108,7 +113,23 @@ func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceA
 	return &cp, true, false, nil
 }
 
+func (f *fakePrincipalRepository) FindByPrincipalSub(_ context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	if f.forceFindByIDErr != nil {
+		return nil, f.forceFindByIDErr
+	}
+	for _, p := range f.byID {
+		if p.TenantID == tenantID && p.PrincipalSub == principalSub {
+			cp := *p
+			return &cp, nil
+		}
+	}
+	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+}
+
 func (f *fakePrincipalRepository) ListByTenant(_ context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	if f.forceListByTenantErr != nil {
+		return nil, f.forceListByTenantErr
+	}
 	var out []*domain.ServiceAccountPrincipal
 	for k, p := range f.byID {
 		if k.tenantID == tenantID {

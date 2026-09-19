@@ -1,8 +1,9 @@
 # Database schema
 
 Summarized from `internal/adapter/outbound/postgres/migrations/000001_schema.up.sql`
-(the only migration so far — dev stage, nothing deployed). Read that file
-directly for exact DDL; this is "what the schema means," not the literal SQL.
+and `000002_rotation_cadence.up.sql` (two migrations so far — dev stage,
+nothing deployed). Read those files directly for exact DDL; this is "what
+the schema means," not the literal SQL.
 
 ## Extensions and enums
 
@@ -38,7 +39,11 @@ itself**), `granted_by` (the actor), `rotation_id` (nullable — the
 caller's idempotency key; null for the offboarding-revoke path),
 `record_version`, `issued_at`, `updated_at`, `rotated_at`, `expires_at`
 (nullable — the rotation-overlap cutoff for a `rotating` row),
-`revoked_at`, `deleted_at`.
+`revoked_at`, `deleted_at`, `rotation_cadence_days`/`next_rotation_at`
+(`000002_rotation_cadence` — §16 TSQ-6 Resolved; set on the `active` row
+at issue/rotate time, default cadence 90 days, cleared back to `NULL` the
+instant that row is demoted to `rotating`/`revoked` — only the current
+`active` version is ever "due").
 
 - `fk_sac_principal FOREIGN KEY (principal_id, tenant_id) REFERENCES service_account_principals (id, tenant_id) ON DELETE CASCADE` —
   the composite FK that makes a cross-tenant credential row structurally
@@ -59,6 +64,8 @@ caller's idempotency key; null for the offboarding-revoke path),
   run afterward.
 - `idx_sac_overlap (expires_at) WHERE status = 'rotating' AND expires_at IS NOT NULL` —
   the exact partial index the §8.3 overlap-expiry sweep scans.
+- `idx_sac_next_rotation (next_rotation_at) WHERE status = 'active' AND next_rotation_at IS NOT NULL AND deleted_at IS NULL` —
+  `cmd/scheduler`'s due-list scan (§16 TSQ-6 Resolved).
 - `idx_sac_principal (principal_id, version DESC)` — TS-3's metadata read.
 
 ### `processed_events` (RLS-exempt, operational)
@@ -109,28 +116,35 @@ invalidates a concurrent optimistic-lock holder.
 
 ## Migrations
 
-One migration so far. The down migration's `REVOKE ... FROM admin_readonly`
-is guarded (`EXCEPTION WHEN undefined_object`) to match the up migration's
-own `IF NOT EXISTS (SELECT 1 FROM pg_roles ...)` guard on the `GRANT` —
-`admin_readonly` is infra-provisioned ahead of the migration in prod and
-may not exist in dev/CI/a fresh environment; an unguarded `REVOKE` against
-a nonexistent role raises `role does not exist` and aborts the whole
-rollback (verified against a real Postgres instance in both branches).
+Two migrations so far. `000001_schema` is the consolidated base (tables,
+RLS, roles, triggers). `000002_rotation_cadence` (§16 TSQ-6 Resolved)
+adds `rotation_cadence_days`/`next_rotation_at` to
+`service_account_credentials` plus `idx_sac_next_rotation` — additive
+only, no data migration needed (pre-existing rows simply have both
+columns `NULL`, which the due-list scan's own `WHERE` clause already
+excludes). `000001`'s down migration's `REVOKE ... FROM admin_readonly`
+is guarded (`EXCEPTION WHEN undefined_object`) to match its own up
+migration's `IF NOT EXISTS (SELECT 1 FROM pg_roles ...)` guard on the
+`GRANT` — `admin_readonly` is infra-provisioned ahead of the migration in
+prod and may not exist in dev/CI/a fresh environment; an unguarded
+`REVOKE` against a nonexistent role raises `role does not exist` and
+aborts the whole rollback (verified against a real Postgres instance in
+both branches).
 
 ## Roles
 
 | Role | Attributes | Used by |
 |---|---|---|
-| `serviceaccount_app` | `NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE` | `cmd/server`, `cmd/consumer` |
+| `serviceaccount_app` | `NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE` | `cmd/server`, `cmd/consumer`; also `cmd/rotator`'s and `cmd/scheduler`'s own per-tenant RLS-scoped writes (RLS-7) |
 | `serviceaccount_migrator` | `BYPASSRLS` + DDL | migrations only, direct connection |
-| `serviceaccount_reconciler` | `BYPASSRLS`, `SELECT`-only | `cmd/rotator`'s cross-tenant enumeration only |
+| `serviceaccount_reconciler` | `BYPASSRLS`, `SELECT`-only | `cmd/rotator`'s and `cmd/scheduler`'s cross-tenant enumeration only (§16 TSQ-6 Resolved) |
 
 ## Invariants
 
 | # | Invariant |
 |---|---|
 | RLS-6 | `app.tenant_id` bound only via transaction-local `SET LOCAL`, never a session-wide `SET` |
-| RLS-7 | Only `cmd/rotator`'s reconciler pool may bypass RLS, and only for `SELECT`-only cross-tenant enumeration |
+| RLS-7 | Only the `serviceaccount_reconciler` role (`cmd/rotator`'s and `cmd/scheduler`'s reconciler pools, §16 TSQ-6 Resolved) may bypass RLS, and only for `SELECT`-only cross-tenant enumeration — every resulting write goes through an RLS-scoped `serviceaccount_app` transaction |
 | CONC-1 | Optimistic locking on `record_version` for both tenant-scoped tables |
 | CONC-2 | At most one `active` credential per principal at all times, even under concurrent rotation |
 | CONC-3 | An emitted event always corresponds to a committed state change — no committed-partial state a consumer can observe |

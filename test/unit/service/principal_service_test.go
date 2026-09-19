@@ -137,6 +137,30 @@ func TestPrincipalService_ReadPrincipal_ListByPrincipalError(t *testing.T) {
 	require.EqualError(t, err, "db unavailable")
 }
 
+func TestPrincipalService_FindPrincipalBySub(t *testing.T) {
+	svc, principals, _, _ := newTestPrincipalService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	res, err := svc.FindPrincipalBySub(ctx, tenantID, p.PrincipalSub)
+	require.NoError(t, err)
+	assert.Equal(t, p.ID, res.PrincipalID)
+	assert.Equal(t, tenantID, res.TenantID)
+	assert.Equal(t, domain.PrincipalStatusActive, res.Status)
+}
+
+func TestPrincipalService_FindPrincipalBySub_NotFound(t *testing.T) {
+	svc, _, _, _ := newTestPrincipalService(t)
+	ctx := context.Background()
+
+	_, err := svc.FindPrincipalBySub(ctx, uuid.New(), uuid.New())
+	require.Error(t, err)
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrPrincipalNotFound, de.Code)
+}
+
 func TestPrincipalService_Register_RepositoryError(t *testing.T) {
 	svc, principals, _, _ := newTestPrincipalService(t)
 	principals.forceRegisterErr = errors.New("db unavailable")

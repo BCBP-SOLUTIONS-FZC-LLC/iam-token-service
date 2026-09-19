@@ -52,10 +52,16 @@ type issueOrRotateResponseBody struct {
 
 // IssueOrRotate implements TS-1: POST
 // …/service-accounts/:principal_id/credentials (§5.4) — returns the
-// generated plaintext exactly once (TS-INV-2).
+// generated plaintext exactly once (TS-INV-2). `secret` (field name kept
+// for wire stability) is a PEM-encoded RSA private key (EXT-6, §2.5), not a
+// shared-secret string: the platform-automation principal authenticates to
+// Keycloak via client-jwt against a JWKS this service serves at
+// .../service-accounts/platform-automation/jwks.json, derived from this and
+// every other live (active/rotating) credential's public half — the
+// private key itself never leaves this response.
 //
 // @Summary      TS-1 — Issue or rotate credential
-// @Description  Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns the credential plaintext exactly once — it is never retrievable again (TS-INV-2).
+// @Description  Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache.
 // @Tags         Credentials
 // @Accept       json
 // @Produce      json

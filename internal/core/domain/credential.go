@@ -27,6 +27,12 @@ const (
 	DefaultOverlapSeconds = 300
 )
 
+// DefaultCadenceDays is the default rotation cadence (TS-D10, §16 TSQ-2
+// Resolved) — the interval the cadence scheduler (cmd/scheduler, §16 TSQ-6
+// Resolved) uses to compute next_rotation_at when no override is
+// configured via ROTATION_DEFAULT_CADENCE_DAYS.
+const DefaultCadenceDays = 90
+
 // ClampOverlapSeconds clamps s to [MinOverlapSeconds, MaxOverlapSeconds]
 // (§6.2, TS-CONFIG-4) — a hard server-side bound regardless of what the
 // caller requests.
@@ -61,6 +67,14 @@ type Credential struct {
 	ExpiresAt     *time.Time
 	RevokedAt     *time.Time
 	DeletedAt     *time.Time
+
+	// RotationCadenceDays/NextRotationAt (§16 TSQ-6 Resolved) are set on
+	// the 'active' row at issue/rotate time and cleared (nil) the moment
+	// this row is demoted to 'rotating' or revoked — only the current
+	// active version is ever "due". cmd/scheduler's due-list scan
+	// (idx_sac_next_rotation) and TS-3 both read these.
+	RotationCadenceDays *int
+	NextRotationAt      *time.Time
 }
 
 // OpenBaoPathFor computes the deterministic KV v2 path for (tenantID,

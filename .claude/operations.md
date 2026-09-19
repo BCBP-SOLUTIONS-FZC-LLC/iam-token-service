@@ -23,7 +23,12 @@ points here; the LLD is still the tie-breaker on any conflict.
 Mesh-mTLS only. `networkPolicy.ingressNamespaceSelector` (Helm) is a
 **required** value — the render fails closed if left unset rather than
 falling back to an unrestricted `{}` selector, which would match every
-namespace in the cluster.
+namespace in the cluster. `networkPolicy.keycloakNamespaceSelector`
+(TS-D15) is a second, separately-required value with the identical
+fail-closed posture — Keycloak's own outbound JWKS fetch (EXT-6) carries
+no caller identity, so it must be admitted at the network layer instead
+of by header, and it may not run in the same namespace as the
+RP/O&M/operator mesh `ingressNamespaceSelector` covers.
 
 ### Input validation
 
@@ -37,21 +42,29 @@ value. Path params typed-parsed; malformed → `400` before any DB checkout.
 | Route | Callers |
 |---|---|
 | TS-4 register | Realm Provisioner |
-| TS-1 issue/rotate | Realm Provisioner, operators, `cmd/rotator`'s opportunistic sweep |
-| TS-2 revoke | operators, the offboarding cascade, the overlap-expiry sweep |
+| TS-1 issue/rotate | Realm Provisioner, operators, `cmd/scheduler` (§16 TSQ-6 Resolved, TS-D14) |
+| TS-2 revoke | operators, the offboarding cascade |
 | TS-3 read | Org & Membership, operators |
+| TS-5 find-by-sub | Org & Membership (AUTH-9 non-member defense-in-depth, TS-D16) |
+| JWKS (unauthenticated) | Keycloak's own outbound client-jwt fetch (EXT-6) — the one route not on this list's system-principal model |
 
-All routes require the reserved `iam-system` principal — no route accepts
-a tenant-facing principal, and the automation principal itself holds no
-roles (TS-INV-4).
+`cmd/rotator` never calls TS-1 and calls no HTTP route at all — it drives
+Postgres/OpenBao directly (RLS-7). All *other* routes require the reserved
+`iam-system` principal — no route accepts a tenant-facing principal, and
+the automation principal itself holds no roles (TS-INV-4).
 
 ### Secret handling
 
-OpenBao KV v2 is the **only** home for plaintext (`iam/serviceaccount/<tenant_id>/<keycloak_client_id>/v<version>`,
-frozen §25); Kubernetes-auth-only login (no static token field exists in
-`openbao.Config`); TS-1 returns the plaintext exactly once, never
-re-readable (TS-3 is metadata-only); this service never writes Keycloak
-(TS-INV-1, CI-enforced via `no-gocloak`).
+OpenBao KV v2 is the **only** home for private-key plaintext
+(`iam/serviceaccount/<tenant_id>/<keycloak_client_id>/v<version>`, frozen
+§25); Kubernetes-auth-only login (no static token field exists in
+`openbao.Config`); TS-1 returns the plaintext private key exactly once,
+never re-readable (TS-3 is metadata-only); this service never writes
+Keycloak (TS-INV-1, CI-enforced via `no-gocloak`). Since **EXT-6** (rev
+1.3), the public half is served directly by this service's own JWKS route
+rather than handed to the Realm Provisioner — RP never receives key
+material at all, only triggers Keycloak's key-cache refresh
+(`ClearServiceAccountKeysCache`, RP-17) after every rotate/revoke.
 
 ## 11. Observability
 
@@ -77,6 +90,8 @@ them. `make gates` → `metrics-taxonomy` enforces naming compliance in CI.
 | `offboarding_cascade_total` | counter | `result` (ok/error) — legacy, see Tier 2 below |
 | `rotation_sweep_total` | counter | `result` |
 | `material_reconcile_total` | counter | `result` (orphan_deleted/missing_material/ok/error) |
+| `cadence_rotation_total` | counter | `result` (rotated/skipped/failed) — `cmd/scheduler`, §16 TSQ-6 Resolved |
+| `jwks_key_errors_total` | counter | — (no label; exactly one outcome) — EXT-6 JWKS route, TS-D15 |
 | `processed_events_duplicates_total` | counter | `consumer` — legacy, see Tier 1 below |
 | `unknown_event_acknowledged_total` | counter | `consumer`, `event_type` |
 
@@ -113,12 +128,17 @@ Go identifier like `Secret`, not just a lowercase JSON-style key).
 ### Alerts
 
 OpenBao failure-rate, stuck `rotating` versions, `material_reconcile_total{result="missing_material"}` > 0
-(page — irrecoverable per-version data loss), offboarding-cascade DLQ
-depth, `outbox_pending_total` growth (both a warning-stage backlog alert
-and the later DLQ-depth alert), `pgcommon_pool_empty_acquire_total` growth
-(pool exhaustion, either pool), offboarding-queue message age (dormant
-until a CloudWatch exporter is deployed — SQS depth/age isn't available
-in-process). Defined in `deploy/monitoring/app-alerts.yml`, mirrored in
+(page — irrecoverable per-version data loss), `cadence_rotation_total{result="failed"}` > 0
+(page — may mean `IssueOrRotate` committed but the RP-17 key-refresh
+failed, TS-D15; will not self-heal since `next_rotation_at` already
+advanced), `jwks_key_errors_total` > 0 (page — a live credential the JWKS
+route couldn't serve, i.e. a real per-credential Keycloak auth outage,
+TS-D15), offboarding-cascade DLQ depth, `outbox_pending_total` growth
+(both a warning-stage backlog alert and the later DLQ-depth alert),
+`pgcommon_pool_empty_acquire_total` growth (pool exhaustion, either pool),
+offboarding-queue message age (dormant until a CloudWatch exporter is
+deployed — SQS depth/age isn't available in-process). Defined in
+`deploy/monitoring/app-alerts.yml`, mirrored in
 `deploy/helm/templates/prometheusrule.yaml` (kept in sync by hand).
 
 ## 12. Configuration
@@ -131,25 +151,43 @@ list:
 | `APP_ENV`, `APP_PORT`, `METRICS_PORT` | Environment / API port / dedicated metrics port |
 | `PG_HOST`/`PORT`/`USER`/`PASSWORD`/`DBNAME`/`SSLMODE`, `PG_MAX_CONNS`, `PG_BOUNCER_MODE` | App pool (`platform-pgcommon`) |
 | `MIGRATION_DATABASE_URL` | Direct-port DSN, bypasses PgBouncer (session-scoped `pg_advisory_lock`) |
-| `RECONCILER_DATABASE_URL` | `serviceaccount_reconciler` (BYPASSRLS, SELECT-only) pool for `cmd/rotator` |
+| `RECONCILER_DATABASE_URL` | `serviceaccount_reconciler` (BYPASSRLS, SELECT-only) pool for `cmd/rotator` and `cmd/scheduler` |
 | `OPENBAO_ADDR`, `OPENBAO_ROLE`, `OPENBAO_KV_MOUNT` | Kubernetes-auth login + KV v2 mount |
 | `AWS_REGION`, `AWS_ENDPOINT_URL`, `GLUE_REGISTRY_NAME`, `SNS_TOPIC_SERVICEACCOUNT_ARN` (or `SNS_TOPIC_ARN` alias) | Produced events |
 | `SQS_OFFBOARDING_QUEUE_URL`, `SQS_OFFBOARDING_CONCURRENCY` | The one inbound subscription |
 | `ROTATION_DEFAULT_OVERLAP_SECONDS`, `ROTATION_DEFAULT_CADENCE_DAYS` | Rotation tuning (`overlap_seconds` still server-clamped to `[0,900]` regardless) |
+| `REALM_PROVISIONER_BASE_URL` | RP-17 target for `cmd/rotator`'s and `cmd/scheduler`'s `ClearServiceAccountKeysCache` call (EXT-6, TS-D14/15); required outside dev |
+| `JWKS_RATE_LIMIT_RPS`, `JWKS_RATE_LIMIT_BURST` | Process-wide token-bucket rate limit on the unauthenticated-by-header JWKS route (TS-D15); default 20/40 |
 | `PROCESSED_EVENTS_TTL_DAYS` | Dedup-ledger retention (must exceed SQS message lifetime) |
 | `DOCS_ENABLED`, `DOCS_AUTH_TOKEN` | Swagger/AsyncAPI viewer gating |
 
 ## 13. Deployment and scaling
 
-**Topology:** `Deployment` × 2 (server, consumer — HA not load), `CronJob` × 1
-(rotator, singleton). `server`/`consumer` connect as `serviceaccount_app`
-(RLS-scoped); `rotator` connects as `serviceaccount_reconciler` (BYPASSRLS,
-read-only) for enumeration, then opens ordinary `serviceaccount_app`
-transactions for the writes it makes.
+**Topology:** `Deployment` × 2 (server, consumer — HA not load), `CronJob` × 2
+(rotator, scheduler — each a singleton). `server`/`consumer` connect as
+`serviceaccount_app` (RLS-scoped); `rotator` and `scheduler` both connect
+as `serviceaccount_reconciler` (BYPASSRLS, read-only) for their own
+cross-tenant enumeration (`idx_sac_overlap`/`idx_sac_next_rotation`
+respectively), then open ordinary `serviceaccount_app` transactions for
+the writes each makes — `scheduler`'s write is
+`CredentialService.IssueOrRotate` itself, not a direct SQL statement
+(§16 TSQ-6 Resolved, TS-D14). Both CronJobs also call out to the Realm
+Provisioner (RP-17) after every rotate/revoke (TS-D15) — the NetworkPolicy
+chart's `-rotator`/`-scheduler` blocks each carry that one extra egress
+rule `-consumer` doesn't need, and `-server`'s ingress rule separately
+admits Keycloak's own outbound JWKS fetch
+(`networkPolicy.keycloakNamespaceSelector`, required, no safe default —
+same fail-closed posture as `ingressNamespaceSelector`).
 
-**CronJob tuning:** `activeDeadlineSeconds: 240s`, deliberately shorter
-than the 5-minute schedule so a run never eats into the next tick under
-`concurrencyPolicy: Forbid`.
+**CronJob tuning:** `activeDeadlineSeconds: 240s` on both, deliberately
+shorter than the 5-minute schedule so a run never eats into the next tick
+under `concurrencyPolicy: Forbid`. Each binary's own in-process run
+timeout (`ROTATOR_RUN_TIMEOUT`/`SCHEDULER_RUN_TIMEOUT`) defaults to 180s —
+deliberately *shorter* than `activeDeadlineSeconds`, not just shorter than
+the schedule interval (TS-D15: a 5-minute in-process default was
+previously *longer* than the k8s deadline, so a run using its full budget
+could never reach its own graceful-exit/metrics/pool-drain path before
+Kubernetes SIGKILLs the Pod first).
 
 **Migration safety:** direct-port DSN bypasses PgBouncer for migrations.
 The down migration's `REVOKE ... FROM admin_readonly` is guarded to match
@@ -179,11 +217,11 @@ reasoning on each.
 
 | Service | Relationship |
 |---|---|
-| Realm Provisioner | Calls TS-4 (register), TS-1 (issue/rotate) — applies the returned secret to Keycloak (the "other half" of every credential transition) |
-| Org & Membership / operators | Call TS-3 (read metadata) |
+| Realm Provisioner | Calls TS-4 (register), TS-1 (issue/rotate) — discards the returned private-key plaintext immediately (never needs it, EXT-6) and instead calls Keycloak's `ClearServiceAccountKeysCache` (RP-17) so Keycloak re-fetches this service's own JWKS (the "other half" of every credential transition) |
+| Org & Membership / operators | Call TS-3 (read metadata) and TS-5 (find-by-sub, AUTH-9 non-member defense-in-depth, TS-D16) |
 | Org & Membership / Core | Publishes `TenantMembershipsPurged` — this service's one inbound subscription |
 | Audit Log | Subscribes to `iam-serviceaccount-events` (5 events, audit-only — no authz consumer, the automation principal carries no roles) |
-| Keycloak | Indirect only — runtime validator of the applied secret; this service never calls it (TS-INV-1) |
+| Keycloak | Fetches this service's own JWKS directly (EXT-6) — the one route Keycloak calls; otherwise indirect only, and this service never calls Keycloak itself (TS-INV-1) |
 
 ## 20. Operational considerations
 
