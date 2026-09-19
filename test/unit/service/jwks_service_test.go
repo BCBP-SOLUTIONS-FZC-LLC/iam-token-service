@@ -113,6 +113,54 @@ func TestJWKSService_PublicKeys_SkipsUnreadableCredential(t *testing.T) {
 	assert.Equal(t, 1, skipped, "the unreadable credential must be counted, not just logged (TS-D15)")
 }
 
+// TestJWKSService_PublicKeys_SkipsNonPEMMaterial covers jwkFor's
+// pem.Decode-returns-nil branch: OpenBao material present but not
+// PEM-encoded at all, a divergence pem.Decode itself rejects before
+// x509 parsing is even attempted.
+func TestJWKSService_PublicKeys_SkipsNonPEMMaterial(t *testing.T) {
+	svc, principals, credentials, secrets := newTestJWKSService(t)
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	bad := &domain.Credential{
+		ID: uuid.New(), TenantID: tenantID, PrincipalID: p.ID,
+		Version: 1, Status: domain.CredentialStatusActive,
+		OpenBaoPath: domain.OpenBaoPathFor(tenantID, "platform-automation", 1),
+		GrantedBy:   domain.SystemPrincipalID,
+	}
+	require.NoError(t, credentials.Insert(context.Background(), bad))
+	require.NoError(t, secrets.Write(context.Background(), bad.OpenBaoPath, "not a pem at all"))
+
+	keys, skipped, err := svc.PublicKeys(context.Background(), tenantID)
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+	assert.Equal(t, 1, skipped)
+}
+
+// TestJWKSService_PublicKeys_SkipsMalformedPKCS1Body covers jwkFor's
+// x509.ParsePKCS1PrivateKey error branch: a syntactically valid PEM block
+// whose DER body is not a parseable RSA private key.
+func TestJWKSService_PublicKeys_SkipsMalformedPKCS1Body(t *testing.T) {
+	svc, principals, credentials, secrets := newTestJWKSService(t)
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	bad := &domain.Credential{
+		ID: uuid.New(), TenantID: tenantID, PrincipalID: p.ID,
+		Version: 1, Status: domain.CredentialStatusActive,
+		OpenBaoPath: domain.OpenBaoPathFor(tenantID, "platform-automation", 1),
+		GrantedBy:   domain.SystemPrincipalID,
+	}
+	require.NoError(t, credentials.Insert(context.Background(), bad))
+	malformedPEM := "-----BEGIN RSA PRIVATE KEY-----\n" + "AAAA\n" + "-----END RSA PRIVATE KEY-----\n"
+	require.NoError(t, secrets.Write(context.Background(), bad.OpenBaoPath, malformedPEM))
+
+	keys, skipped, err := svc.PublicKeys(context.Background(), tenantID)
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+	assert.Equal(t, 1, skipped)
+}
+
 func TestJWKSService_PublicKeys_PrincipalRepositoryError_Propagates(t *testing.T) {
 	svc, principals, _, _ := newTestJWKSService(t)
 	principals.forceListByTenantErr = errors.New("db unavailable")

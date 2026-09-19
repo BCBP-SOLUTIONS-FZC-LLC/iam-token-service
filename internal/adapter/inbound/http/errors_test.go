@@ -95,6 +95,26 @@ func TestHandleError_LeakedConnectivitySQLState_Returns503(t *testing.T) {
 	}
 }
 
+// TestHandleError_LeakedConnectivitySQLState_LogsWhenLoggerSet covers the
+// errorLogger != nil branch on the db_unavailable path — the 503 test above
+// runs with no logger installed, so that branch was never exercised.
+func TestHandleError_LeakedConnectivitySQLState_LogsWhenLoggerSet(t *testing.T) {
+	fl := &fakeLogger{}
+	prevLogger := errorLogger
+	errorLogger = fl
+	defer func() { errorLogger = prevLogger }()
+
+	r := gin.New()
+	r.Use(gincommon.ObservabilityMiddlewares(testGinConfig)...)
+	r.GET("/probe", func(c *gin.Context) {
+		HandleError(c, &pgconn.PgError{Code: "08006", Message: "boom"})
+	})
+	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Len(t, fl.errorCalls, 1)
+	assert.NotEmpty(t, fl.errorCalls[0]["trace_id"])
+}
+
 func TestHandleError_LeakedConstraintSQLState_Returns500(t *testing.T) {
 	r := gin.New()
 	r.GET("/probe", func(c *gin.Context) {

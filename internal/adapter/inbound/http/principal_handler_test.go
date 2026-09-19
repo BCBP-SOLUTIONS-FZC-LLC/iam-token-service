@@ -111,12 +111,15 @@ func TestPrincipalHandler_Read(t *testing.T) {
 	issuedAt := time.Now().UTC()
 	expiresAt := issuedAt.Add(5 * time.Minute)
 
-	t.Run("200 with credentials, one with a non-nil expires_at", func(t *testing.T) {
+	nextRotationAt := issuedAt.Add(90 * 24 * time.Hour)
+	cadenceDays := 90
+
+	t.Run("200 with credentials, one with a non-nil expires_at and next_rotation_at", func(t *testing.T) {
 		svc := &fakePrincipalService{readResult: &service.ReadPrincipalResult{
 			PrincipalID: principalID, TenantID: tenantID, KeycloakClientID: domain.KeycloakClientPlatformAutomation,
 			PrincipalType: domain.PrincipalTypePlatformAutomation, Status: domain.PrincipalStatusActive, RecordVersion: 2,
 			Credentials: []service.CredentialSummary{
-				{Version: 2, Status: domain.CredentialStatusActive, OpenBaoPath: "iam/serviceaccount/x/y/v2", IssuedAt: issuedAt},
+				{Version: 2, Status: domain.CredentialStatusActive, OpenBaoPath: "iam/serviceaccount/x/y/v2", IssuedAt: issuedAt, RotationCadenceDays: &cadenceDays, NextRotationAt: &nextRotationAt},
 				{Version: 1, Status: domain.CredentialStatusRotating, OpenBaoPath: "iam/serviceaccount/x/y/v1", IssuedAt: issuedAt, ExpiresAt: &expiresAt},
 			},
 		}}
@@ -126,8 +129,11 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code)
 		require.Len(t, body.Credentials, 2)
 		assert.Nil(t, body.Credentials[0].ExpiresAt)
+		require.NotNil(t, body.Credentials[0].NextRotationAt)
+		assert.Equal(t, nextRotationAt.Format(time.RFC3339), *body.Credentials[0].NextRotationAt)
 		require.NotNil(t, body.Credentials[1].ExpiresAt)
 		assert.Equal(t, expiresAt.Format(time.RFC3339), *body.Credentials[1].ExpiresAt)
+		assert.Nil(t, body.Credentials[1].NextRotationAt)
 	})
 
 	t.Run("401 missing identity headers", func(t *testing.T) {
@@ -208,10 +214,14 @@ func TestPrincipalHandler_DefensiveMissingRequestContext(t *testing.T) {
 	r := gin.New()
 	r.POST("/service-accounts", h.Register)
 	r.GET("/service-accounts/:principal_id", h.Read)
+	r.GET("/service-accounts", h.FindBySub)
 
 	rec := doRequest(t, r, http.MethodPost, "/service-accounts", map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 
 	rec = doRequest(t, r, http.MethodGet, "/service-accounts/"+uuid.New().String(), nil, nil)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	rec = doRequest(t, r, http.MethodGet, "/service-accounts?principal_sub="+uuid.New().String(), nil, nil)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
