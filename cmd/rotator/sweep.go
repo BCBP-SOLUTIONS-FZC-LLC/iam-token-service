@@ -27,10 +27,16 @@ var errAlreadyHandled = errors.New("rotator: credential already revoked")
 // runOverlapSweep implements §8.3: enumerate every `rotating` credential
 // across all tenants whose expires_at has passed (via the BYPASSRLS
 // reconciler role), then revoke each one through a normal RLS-scoped
-// RunInTx bound to that row's own tenant (RLS-7). Availability-first: one
-// row's failure is logged and does not abort the rest of the sweep — a
-// missed row is caught by the next run.
-func runOverlapSweep(ctx context.Context, reconciler port.ReconcilerRepository, credentials port.CredentialRepository, secrets port.SecretStore, tx port.TxRunner, log port.Logger) sweepResult {
+// RunInTx bound to that row's own tenant (RLS-7), then ask the Realm
+// Provisioner to clear Keycloak's cached JWKS for that tenant (RP-17,
+// `ClearServiceAccountKeysCache`) — under the EXT-6 client-jwt/JWKS
+// mechanism (rev 1.3) a cached key keeps authenticating at Keycloak
+// indefinitely until that call lands; there is no Keycloak-side TTL that
+// does it automatically (TS-INV-7, §6.2). Availability-first: one row's
+// failure is logged and does not abort the rest of the sweep — a missed
+// row is caught by the next run (subject to the caveat in
+// revokeExpiredRotating's doc comment for an RP-17 failure specifically).
+func runOverlapSweep(ctx context.Context, reconciler port.ReconcilerRepository, credentials port.CredentialRepository, secrets port.SecretStore, tx port.TxRunner, rp port.RealmProvisionerClient, log port.Logger) sweepResult {
 	var result sweepResult
 	expired, err := reconciler.ListExpiredRotating(ctx)
 	if err != nil {
@@ -38,7 +44,7 @@ func runOverlapSweep(ctx context.Context, reconciler port.ReconcilerRepository, 
 		return result
 	}
 	for _, row := range expired {
-		err := revokeExpiredRotating(ctx, credentials, secrets, tx, row)
+		err := revokeExpiredRotating(ctx, credentials, secrets, tx, rp, row)
 		switch {
 		case err == nil:
 			result.Revoked++
@@ -60,8 +66,25 @@ func runOverlapSweep(ctx context.Context, reconciler port.ReconcilerRepository, 
 // the row's own tenant. Mirrors CredentialService's revoke discipline
 // (material-first, §9.3) directly against domain/port rather than
 // core/service — reconciler_jobs may not depend on service
-// (.go-arch-lint.yml).
-func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepository, secrets port.SecretStore, tx port.TxRunner, row port.ExpiredRotatingCredential) error {
+// (.go-arch-lint.yml). RealmProvisionerClient is the one adapters_outbound
+// exception this component does depend on (allowed by
+// .go-arch-lint.yml's reconciler_jobs.mayDependOn) — it's an outbound HTTP
+// call, not a service-layer write path.
+//
+// Once the revoke commits, this calls RP-17 (`RefreshKeys` /
+// `ClearServiceAccountKeysCache`) so Keycloak actually forgets the removed
+// key — the enforcement step JWKS-exclusion alone doesn't provide, since
+// Keycloak caches whatever it last fetched (§6.2, TS-INV-7). A known gap,
+// the same two-halves reality cmd/scheduler's rotateOneDue already
+// documents (§8.2): if the DB revoke commits but this RP-17 call then
+// fails, there is no "next_rotation_at"-style marker for this row to
+// retry against — the row is already `revoked` and ListExpiredRotating
+// will never enumerate it again. That failure is deliberately surfaced as
+// Failed (page-worthy, §11.5) with tenant/principal/version logged (never
+// key material) so an operator can trigger the missed cache-clear by
+// hand, rather than silently leaving a revoked key that still
+// authenticates at Keycloak.
+func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepository, secrets port.SecretStore, tx port.TxRunner, rp port.RealmProvisionerClient, row port.ExpiredRotatingCredential) error {
 	ctx = withTenantGUC(ctx, row.TenantID)
 
 	cred, err := credentials.FindByVersion(ctx, row.TenantID, row.PrincipalID, row.Version)
@@ -79,7 +102,7 @@ func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepos
 	now := time.Now().UTC()
 	cred.Status = domain.CredentialStatusRevoked
 	cred.RevokedAt = &now
-	return tx.RunInTx(ctx, func(ctx context.Context) error {
+	err = tx.RunInTx(ctx, func(ctx context.Context) error {
 		if err := credentials.Update(ctx, cred); err != nil {
 			// A concurrent actor (a TS-2 call racing this sweep, or another
 			// rotator run) may have revoked this exact row between the
@@ -106,4 +129,13 @@ func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepos
 			},
 		})
 	})
+	if err != nil {
+		return err
+	}
+
+	// The DB half is durably committed at this point — a failure below is
+	// the documented two-halves gap (this function's doc comment): the row
+	// stays `revoked` regardless, and this row will never be enumerated
+	// again, so this MUST surface as Failed, not be swallowed.
+	return rp.RefreshKeys(ctx, row.TenantID)
 }

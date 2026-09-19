@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Observability must enter the process only through platform-gincommon,
-# matching iam-user-profile / iam-org-membership:
+# matching iam-user-profile / iam-org-membership (every binary:
+# cmd/server, cmd/consumer, cmd/rotator, cmd/scheduler):
 #   logs    — Zap via logger.NewLogger (port.Logger), never slog / stdlib log / zap.New
 #   metrics — gincommon.MetricsRegisterer, never prometheus.DefaultRegisterer / promauto
 #   traces  — gincommon.InitTracingFromEnv, never a hand-rolled TracerProvider

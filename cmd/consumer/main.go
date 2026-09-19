@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	consumeradapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/consumer"
@@ -45,6 +46,9 @@ var buildVersion = "dev"
 
 func main() {
 	appEnv := envOr("APP_ENV", "dev")
+	if appEnv != "dev" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
 	// ── 1. Logger — Zap via platform-gincommon (same sink as iam-org-membership)
 	log, err := logger.NewLogger(appEnv)
@@ -58,7 +62,11 @@ func main() {
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
 	}
-	// Metrics-init side effect only — this process has no Gin router.
+	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
+	// it here (before any collector registration) so business metrics land
+	// on gincommon.MetricsRegisterer with matching {service, version} const
+	// labels. The health engine below applies the same middleware slice so
+	// probe traffic gets Zap access logs / HTTP metrics / HTTP traces.
 	_ = gincommon.ObservabilityMiddlewares(cfg)
 	metrics.Register(appEnv)
 	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
@@ -164,28 +172,35 @@ func main() {
 	}()
 
 	// ── 6. Health + metrics servers ────────────────────────────────────────
-	healthMux := http.NewServeMux()
-	healthMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
-	healthMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		checkCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	// /healthz and /readyz go through the same Gin + gincommon stack as
+	// cmd/server (and iam-user-profile / iam-org-membership): Zap access
+	// logs, HTTP metrics, and HTTP traces. /metrics stays on a dedicated
+	// stdlib mux — scrapes must not share a listener with probes, matching
+	// cmd/server's METRICS_PORT split.
+	health := gin.New()
+	health.Use(gincommon.TimeoutMiddleware(30 * time.Second))
+	health.Use(gincommon.ObservabilityMiddlewares(cfg)...)
+	health.GET("/healthz", gincommon.HealthHandler())
+	health.GET("/readyz", func(c *gin.Context) {
+		checkCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
 		dbHealthy := pool.Health(checkCtx).Healthy
 		baoHealthy := openbaoClient.Health(checkCtx) == nil
 		if dbHealthy && baoHealthy {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ready"}`))
+			c.JSON(http.StatusOK, gin.H{"status": "ready"})
 			return
 		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, `{"status":"not ready","checks":{"database":%q,"openbao":%q}}`,
-			healthLabel(dbHealthy), healthLabel(baoHealthy))
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "not ready",
+			"checks": gin.H{
+				"database": healthLabel(dbHealthy),
+				"openbao":  healthLabel(baoHealthy),
+			},
+		})
 	})
 	healthServer := &http.Server{
 		Addr:              ":" + envOr("APP_PORT", "8080"),
-		Handler:           healthMux,
+		Handler:           health,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

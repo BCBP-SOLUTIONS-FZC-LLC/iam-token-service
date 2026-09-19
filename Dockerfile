@@ -3,7 +3,7 @@
 # iam-token-service
 #
 # Multi-stage build producing a minimal, non-root, distroless runtime image
-# carrying all three binaries this service ships (§3, §13, §build-order):
+# carrying all four binaries this service ships (§3, §13, §build-order):
 #   /iam-token-service-server     HTTP API (TS-1..TS-4) + the outbox.Runner
 #                                  SNS-publish loop. The image's default
 #                                  ENTRYPOINT.
@@ -15,10 +15,15 @@
 #                                  reconciler, outbox/processed_events prune)
 #                                  — run-to-completion, invoked by a
 #                                  Kubernetes CronJob.
+#   /iam-token-service-scheduler  the §16 TSQ-6 Resolved automatic
+#                                  cadence-driven rotation scan (TS-D14) —
+#                                  run-to-completion, invoked by its own
+#                                  Kubernetes CronJob.
 #
 # One image: the server/consumer Deployments run it unmodified; the rotator
-# CronJob template (deploy/helm/templates/cronjobs.yaml) overrides `command`
-# to invoke /iam-token-service-rotator against the SAME image reference.
+# and scheduler CronJob templates (deploy/helm/templates/cronjobs.yaml)
+# override `command` to invoke /iam-token-service-rotator or
+# /iam-token-service-scheduler against the SAME image reference.
 #
 # NOTE: base image FROM lines below are tag-pinned, not digest-pinned — this
 # repo has no verified digest to pin against yet (§13.6: nothing is deployed
@@ -76,7 +81,12 @@ RUN CGO_ENABLED=0 GOOS=linux \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
     -o /out/iam-token-service-rotator \
-    ./cmd/rotator
+    ./cmd/rotator && \
+    go build \
+    -trimpath \
+    -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
+    -o /out/iam-token-service-scheduler \
+    ./cmd/scheduler
 
 ########################################
 # Stage: runtime
@@ -99,6 +109,7 @@ WORKDIR /
 COPY --from=builder /out/iam-token-service-server /iam-token-service-server
 COPY --from=builder /out/iam-token-service-consumer /iam-token-service-consumer
 COPY --from=builder /out/iam-token-service-rotator /iam-token-service-rotator
+COPY --from=builder /out/iam-token-service-scheduler /iam-token-service-scheduler
 
 USER nonroot:nonroot
 

@@ -58,14 +58,24 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 	return &cp, nil
 }
 
-func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, error) {
+func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
 	np := *p
 	if np.ID == uuid.Nil {
 		np.ID = uuid.New()
 	}
 	f.put(&np)
 	cp := np
-	return &cp, true, nil
+	return &cp, true, false, nil
+}
+
+func (f *fakePrincipalRepository) FindByPrincipalSub(_ context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	for _, p := range f.byID {
+		if p.TenantID == tenantID && p.PrincipalSub == principalSub {
+			cp := *p
+			return &cp, nil
+		}
+	}
+	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
 }
 
 func (f *fakePrincipalRepository) ListByTenant(context.Context, uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {

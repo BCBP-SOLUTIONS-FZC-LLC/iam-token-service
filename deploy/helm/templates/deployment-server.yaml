@@ -72,6 +72,10 @@ spec:
               value: {{ .Values.rotation.defaultOverlapSeconds | quote }}
             - name: ROTATION_DEFAULT_CADENCE_DAYS
               value: {{ .Values.rotation.defaultCadenceDays | quote }}
+            - name: JWKS_RATE_LIMIT_RPS
+              value: {{ .Values.jwks.rateLimitRPS | quote }}
+            - name: JWKS_RATE_LIMIT_BURST
+              value: {{ .Values.jwks.rateLimitBurst | quote }}
             - name: GLUE_REGISTRY_NAME
               value: {{ .Values.events.glueRegistryName | quote }}
             - name: SNS_TOPIC_ARN

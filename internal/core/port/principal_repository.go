@@ -17,11 +17,29 @@ type PrincipalRepository interface {
 	// (§5.5).
 	FindByID(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error)
 
+	// FindByPrincipalSub reads the principal by its Keycloak sub rather
+	// than Token Service's own internal id — the TS-5 lookup (AUTH-9,
+	// org-membership's service-account-not-grantable defense-in-depth
+	// check). principal_sub is the same UUID shape callers see as a
+	// human user's user_id, so this is the only way another service can
+	// answer "is this subject a service account" without ever generating
+	// principal_sub itself (TS-INV-1). Returns domain.ErrPrincipalNotFound
+	// when absent or not visible under RLS (§5.5) — the expected, common
+	// result for the overwhelming majority of calls, since almost every
+	// subject checked is a real human user, not the tenant's automation
+	// principal.
+	FindByPrincipalSub(ctx context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error)
+
 	// Register inserts p if no principal yet exists for
 	// (tenant_id, principal_type) (uq_sap_active_principal); idempotent —
-	// a repeat call returns the existing row and created=false rather than
-	// erroring (TS-4, §5.4).
-	Register(ctx context.Context, p *domain.ServiceAccountPrincipal) (result *domain.ServiceAccountPrincipal, created bool, err error)
+	// a repeat call with an unchanged principal_sub/keycloak_client_id
+	// returns the existing row with created=false and updated=false (TS-4,
+	// §5.4). A repeat call whose principal_sub or keycloak_client_id
+	// differs from the stored row (RP-3 conversion carry-over — the
+	// principal is re-registered against a newly-minted Keycloak client in
+	// a dedicated realm) updates the row in place and returns
+	// updated=true, rather than silently keeping the stale identity.
+	Register(ctx context.Context, p *domain.ServiceAccountPrincipal) (result *domain.ServiceAccountPrincipal, created bool, updated bool, err error)
 
 	// ListByTenant returns every principal row for tenantID (§8.4 —
 	// normally 0 or 1 at MVP, uq_sap_active_principal; forward-compatible

@@ -5,7 +5,7 @@ read the README's mental model and API overview; this file exists to make
 every cross-cutting mechanism — layering, RLS, the outbox, OpenBao custody,
 observability — traceable to the exact code and LLD section that define it.
 The canonical, signed-off design is `docs/iam-lld-token-service.md` (rev
-1.0, Approved); this file is a navigable summary of it, kept in sync by
+1.2, Approved); this file is a navigable summary of it, kept in sync by
 hand.
 
 ---
@@ -13,12 +13,17 @@ hand.
 ## Layer model
 
 Clean Architecture, enforced structurally by `.go-arch-lint.yml` (`make
-lint` fails on any violation, not just a style warning). Three binaries
-(`cmd/server`, `cmd/consumer`, `cmd/rotator`) share one image and one set of
-inner layers; `cmd/rotator` is deliberately walled off from the `service`
-layer — it drives `postgres`/`openbao` directly under a `BYPASSRLS`
-connection for cross-tenant enumeration (RLS-7), a privilege no HTTP- or
-event-triggered code path may ever hold.
+lint` fails on any violation, not just a style warning). Four binaries
+(`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) share one
+image and one set of inner layers; `cmd/rotator` is deliberately walled
+off from the `service` layer — it drives `postgres`/`openbao` directly
+under a `BYPASSRLS` connection for cross-tenant enumeration (RLS-7), a
+privilege no HTTP- or event-triggered code path may ever hold.
+`cmd/scheduler` (§16 TSQ-6 Resolved) also uses that same `BYPASSRLS`
+connection for its own cross-tenant due-list enumeration, but — unlike
+`cmd/rotator` — is NOT walled off from `service`: every actual rotation it
+performs goes through `CredentialService.IssueOrRotate`, an ordinary
+RLS-scoped write, the same code `cmd/server`'s HTTP handler calls.
 
 > Source: [layer-model.mmd](docs/architecture/mermaid/layer-model.mmd)
 
@@ -28,6 +33,7 @@ graph TD
         SERVER["cmd/server<br/>HTTP API + outbox runner"]
         CONSUMER["cmd/consumer<br/>offboarding SQS subscriber"]
         ROTATOR["cmd/rotator<br/>sweep + reconciler + prune CronJob"]
+        SCHEDULER["cmd/scheduler<br/>cadence scan + RP-17 key-refresh"]
     end
 
     subgraph inbound["adapters_inbound"]
@@ -37,11 +43,13 @@ graph TD
 
     subgraph outbound["adapters_outbound"]
         EVENTBUS["internal/adapter/outbound/eventbus<br/>Publisher, ValidatingCodec, GlueCodec"]
+        REALMPROV["internal/adapter/outbound/realmprovisioner<br/>RP-17 client"]
     end
 
     subgraph isolated["single-purpose outbound components"]
         POSTGRES["postgres<br/>repositories, RLS GUC binding, TxRunner"]
         OPENBAO["openbao<br/>KV v2 client, Kubernetes auth"]
+        HTTPX["httpx<br/>traceparent injection, client spans"]
         OBS["observability<br/>Prometheus metrics"]
     end
 
@@ -68,11 +76,18 @@ graph TD
     ROTATOR --> OPENBAO
     ROTATOR --> EVENTBUS
     ROTATOR --> OBS
+    SCHEDULER --> POSTGRES
+    SCHEDULER --> OPENBAO
+    SCHEDULER --> SERVICE
+    SCHEDULER --> REALMPROV
+    SCHEDULER --> OBS
 
     HTTP --> SERVICE
     CONS --> PORT
     CONS --> OBS
     EVENTBUS --> SERVICE
+    REALMPROV --> PORT
+    REALMPROV --> HTTPX
     POSTGRES --> PORT
     OPENBAO --> PORT
     OBS --> SERVICE
@@ -86,6 +101,7 @@ graph TD
     HTTP --> APISPEC
 
     style ROTATOR fill:#fce8e6,stroke:#c0392b
+    style SCHEDULER fill:#fff4e0,stroke:#e67e22
     style SERVICE fill:#e8f4fc,stroke:#2980b9
     style DOMAIN fill:#eafaf1,stroke:#27ae60
 ```
@@ -98,10 +114,11 @@ graph TD
 | `observability` | `internal/adapter/outbound/metrics` | `domain`, `port`, `service` |
 | `postgres` | `internal/adapter/outbound/postgres` | `domain`, `port` |
 | `openbao` | `internal/adapter/outbound/openbao` | `domain`, `port` |
-| `adapters_outbound` | `internal/adapter/outbound/eventbus` | `domain`, `port`, `service`, `observability` |
+| `httpx` | `internal/adapter/outbound/httpx` | vendor only — shared outbound-HTTP transport (traceparent injection, client spans) |
+| `adapters_outbound` | `internal/adapter/outbound/{eventbus,realmprovisioner}` | `domain`, `port`, `service`, `observability`, `httpx` |
 | `adapters_inbound` | `internal/adapter/inbound/{http,consumer}` | `domain`, `port`, `service`, `requestctx`, `apispec`, `observability` |
 | `reconciler_jobs` | `cmd/rotator` | `domain`, `port`, `postgres`, `openbao`, `observability`, `adapters_outbound` — **never `service`** |
-| `cmd` | `cmd/{server,consumer}` | everything |
+| `cmd` | `cmd/{server,consumer,rotator,scheduler}` | everything — `cmd/scheduler` is the one composition root besides `server` that actually exercises the `service` dependency for a write path |
 
 ---
 
@@ -134,10 +151,13 @@ graph LR
     openbao["openbao"] --> domain
     openbao --> port
 
-    adapters_outbound["adapters_outbound<br/>(eventbus)"] --> domain
+    httpx["httpx<br/>(anyVendorDeps only)"]
+
+    adapters_outbound["adapters_outbound<br/>(eventbus, realmprovisioner)"] --> domain
     adapters_outbound --> port
     adapters_outbound --> service
     adapters_outbound --> observability
+    adapters_outbound --> httpx
 
     adapters_inbound["adapters_inbound<br/>(http, consumer)"] --> domain
     adapters_inbound --> port
@@ -153,7 +173,7 @@ graph LR
     reconciler_jobs --> observability
     reconciler_jobs --> adapters_outbound
 
-    cmd["cmd<br/>(server, consumer)"] --> domain
+    cmd["cmd<br/>(server, consumer, rotator, scheduler)"] --> domain
     cmd --> port
     cmd --> service
     cmd --> requestctx
@@ -170,6 +190,14 @@ graph LR
     style service fill:#e8f4fc,stroke:#2980b9
 ```
 
+Two rules worth calling out: `reconciler_jobs` may **not** depend on
+`service` — `cmd/rotator` drives `postgres`/`openbao` directly under
+`BYPASSRLS`, never through the RLS-scoped service layer. `cmd/scheduler`
+(§16 TSQ-6 Resolved) is the opposite case: it uses that same `BYPASSRLS`
+pool for its own cross-tenant due-list scan, but lives under `cmd` (not
+`reconciler_jobs`) precisely because it **does** depend on `service` for
+every actual rotation write.
+
 Why `postgres` and `openbao` are each their own component instead of folded
 into `adapters_outbound`: it keeps two structural invariants mechanically
 checkable rather than just documented — **TS-INV-1** (no `gocloak`
@@ -177,6 +205,75 @@ dependency anywhere in this service) and **TS-INV-2** (no credential
 plaintext ever reaches Postgres) both fail loudly in CI (`make lint`,
 `no-gocloak`, `no-secret-log` gates) the moment a future change would
 violate them, instead of relying on code review to catch it.
+
+---
+
+## Write ordering discipline
+
+Every mutating operation follows **one** ordering discipline (LLD §9.3,
+TS-D11) — there is no distributed transaction spanning OpenBao, Postgres,
+and (since EXT-6) the Realm Provisioner, so the order each of those three
+systems is touched in relative to the Postgres commit is itself the
+correctness mechanism. Unlike the Realm Provisioner's own two disciplines
+(external-effect-first for most writes, local-intent-first-then-reconcile
+when Keycloak is transiently down), this service has exactly one: it is
+**fail-closed**, not reconcile-later, when its external dependency
+(OpenBao) is unavailable — there is no `pending`/`reconciling` state a
+credential row can be in.
+
+> Source: [write-ordering-discipline.mmd](docs/architecture/mermaid/write-ordering-discipline.mmd)
+
+```mermaid
+sequenceDiagram
+    participant CALLER as Caller (RP / operator / cmd/scheduler)
+    participant SVC as CredentialService
+    participant BAO as OpenBao (material)
+    participant TX as Postgres RunInTx
+    participant OUT as outbox_events
+    participant RP as Realm Provisioner (RP-17)
+
+    Note over SVC,BAO: Phase 1 — material effect, BEFORE any Postgres transaction opens.<br/>A row must never reference material that doesn't exist; the inverse<br/>(material with no row) is the recoverable case, §8.6.
+    CALLER->>SVC: IssueOrRotate / Revoke
+    SVC->>BAO: Write v(n+1) — or — Delete v(n)
+    alt OpenBao unavailable
+        BAO-->>SVC: error
+        SVC-->>CALLER: 502 secret_store_unavailable — NOTHING committed,<br/>fail-closed (no "pending, reconcile later" discipline)
+    else material effect succeeds
+        BAO-->>SVC: ok
+
+        Note over SVC,OUT: Phase 2 — local commit, only after the material effect succeeded
+        SVC->>TX: RunInTx(ctx, func(txCtx))
+        TX->>TX: UPDATE/INSERT service_account_credentials (RLS-scoped)
+        TX->>OUT: Enqueue — same transaction (EVT-1)
+        TX-->>SVC: commit — row + event durable together
+
+        SVC-->>CALLER: 200/201 (plaintext once, on issue/rotate)
+
+        Note over CALLER,RP: Phase 3 — RP-17, AFTER the commit, and only for the callers<br/>that drive it themselves (an operator by hand; cmd/rotator's sweep and<br/>cmd/scheduler's scan automatically, TS-D14/15). Ordered last because it<br/>is the one step this service cannot roll back if it fails — the row is<br/>already durably committed either way.
+        CALLER->>RP: ClearServiceAccountKeysCache
+        alt RP-17 fails
+            RP-->>CALLER: error
+            Note over CALLER: Two-halves gap (TS-INV-7): the row is already committed,<br/>so this is surfaced as a page-worthy Failed outcome, never<br/>silently retried into a possible double-rotation.
+        else RP-17 succeeds
+            RP-->>CALLER: 204 — Keycloak re-fetches this service's JWKS
+        end
+    end
+```
+
+**Two external systems, two positions relative to the commit, for two
+different reasons.** OpenBao is ordered **before** the commit because a
+committed row must never reference material that doesn't exist — the
+inverse (material with no row, an orphan) is the recoverable direction,
+reclaimed by the §8.6 reconciler. The Realm Provisioner is ordered
+**after** the commit, and only reached at all by callers that drive RP-17
+themselves (an operator by hand for the on-demand path; `cmd/rotator`'s
+sweep and `cmd/scheduler`'s scan automatically, TS-D14/15) — it is
+deliberately last because it is the one step this service cannot roll
+back if it fails: the row is already durable either way, so an RP-17
+failure is the documented two-halves gap (TS-INV-7), surfaced as a
+page-worthy outcome rather than retried into a possible double-rotation.
+This same material-first shape repeats, delete instead of write, in the
+Credential revoke flow (TS-2) and the Offboarding cascade flow below.
 
 ---
 
@@ -422,6 +519,117 @@ routine, expected background convergence.
 
 ---
 
+## Cadence scheduler flow (cmd/scheduler)
+
+A separate run-to-completion CronJob from `cmd/rotator` above (§16 TSQ-6
+Resolved, TS-D14) — `cmd/rotator` never calls TS-1, though it now shares
+this flow's RP-17 dependency for its own revoke path (TS-D15, see
+"Reconciler sweep flow" above). It shares `cmd/rotator`'s connection shape
+(`serviceaccount_reconciler`, `BYPASSRLS`, `SELECT`-only, for its own
+cross-tenant due-list scan) but not its architectural isolation: every
+actual rotation goes through `CredentialService.IssueOrRotate`, the
+ordinary RLS-scoped write `cmd/server`'s TS-1 handler also calls, which
+generates a fresh RSA-2048 keypair and returns the plaintext private key
+once (EXT-6/rev 1.3) — the caller then calls RP-17
+(`RealmProvisionerClient.RefreshKeys`, wrapping
+`ClearServiceAccountKeysCache`) so Keycloak re-fetches this service's JWKS
+and recognizes the new key, discarding the private-key plaintext
+immediately after. This is the same two-call sequence an operator performs
+by hand (§8.2), automated.
+
+> Source: [cadence-scheduler-flow.mmd](docs/architecture/mermaid/cadence-scheduler-flow.mmd)
+
+```mermaid
+flowchart TD
+    START(["CronJob fires<br/>(one binary invocation)"])
+    START --> SCAN
+
+    subgraph SCAN["1. Due-list scan"]
+        L1["ReconcilerRepository.ListDueForRotation()<br/>BYPASSRLS — cross-tenant, status=active<br/>AND next_rotation_at < now()"]
+    end
+
+    SCAN --> LOOP
+
+    subgraph LOOP["2. Per due principal (rotateOneDue)"]
+        C1["bind app.tenant_id GUC to this row's tenant"]
+        C2["CredentialService.IssueOrRotate()<br/>fresh rotation_id, RLS-scoped serviceaccount_app write —<br/>same code path cmd/server's TS-1 handler calls"]
+        C3{"result"}
+        C4["principal_revoked / rotation_in_flight:<br/>a concurrent offboarding or operator/O&amp;M<br/>rotation already won the race → Skipped"]
+        C5["other error<br/>(OpenBao/DB unavailable) → Failed"]
+        C6["success: RealmProvisionerClient.RefreshKeys (RP-17)<br/>— no key material sent, RP just triggers<br/>ClearServiceAccountKeysCache"]
+        C7{"RP-17 call"}
+        C8["ok → Rotated"]
+        C9["fails: TS-1 already committed, but Keycloak is<br/>now out of sync — next_rotation_at already<br/>advanced, so this principal will NOT reappear<br/>next scan → Failed (page-worthy, TS-INV-7-style<br/>two-halves gap; tenant/principal/version logged,<br/>never key material) — needs a manual RP-17 call"]
+        C1 --> C2 --> C3
+        C3 -->|principal_revoked or rotation_in_flight| C4
+        C3 -->|other error| C5
+        C3 -->|success| C6 --> C7
+        C7 -->|204| C8
+        C7 -->|error| C9
+    end
+
+    LOOP --> DONE(["metrics.CadenceRotationTotal{result}<br/>Exit — Kubernetes recreates the Pod<br/>on the next schedule"])
+
+    style L1 fill:#e8f4fc,stroke:#2980b9
+    style C2 fill:#e8f4fc,stroke:#2980b9
+    style C9 fill:#fce8e6,stroke:#c0392b
+```
+
+`iam_token_service_cadence_rotation_total{result="failed"}` is the metric
+worth paging on (alert: `IAMTokenServiceCadenceRotationFailures`): it can
+mean an outright failure (OpenBao/DB unavailable, retried next scan since
+the row is still due), **or** the two-halves gap above — `IssueOrRotate`
+committed but the RP-17 call didn't, which will *not* self-heal on the
+next scan because this row's `next_rotation_at` has already moved to the
+next cadence window. The tenant/principal/version are logged (never key
+material, TS-INV-2) specifically so an operator can complete the missed
+`ClearServiceAccountKeysCache` call by hand — the same break-glass posture
+§8.7 already documents for revoke.
+
+---
+
+## Cache strategy
+
+This service sits on **no hot path at all** (Keycloak is the hot
+token-validation path, not this service, §21) — there is no
+request-latency-driven cache, and correctness never depends on one. The
+only two things that resemble a cache exist for entirely different
+reasons:
+
+1. **The OpenBao Kubernetes-auth token cache**
+   (`internal/adapter/outbound/openbao/client.go`, see "OpenBao credential
+   custody lifecycle" above) — a 30-second-clock-skew-margin cache of the
+   short-lived token from `auth/kubernetes/login`, refreshed on expiry.
+   This exists to avoid re-authenticating to OpenBao on every single KV
+   call, the same reason the Realm Provisioner caches its own Keycloak
+   admin token — but unlike RP's cache, there is no single-flight
+   coordination across concurrent refreshes (`kvClient()`'s per-call
+   `Clone()` removes the *token-mutation* race, §"OpenBao credential
+   custody lifecycle" above, but a cache-miss stampede simply means
+   several concurrent `auth/kubernetes/login` calls, not a correctness
+   issue — OpenBao's Kubernetes auth method is cheap and idempotent to
+   call repeatedly).
+2. **`Cache-Control: public, max-age=60` on the JWKS route**
+   (production-readiness review, TS-D15) — an HTTP caching *hint* for any
+   intermediary between Keycloak and this service, not a server-side
+   cache this process maintains. It changes nothing about correctness:
+   Keycloak's own outbound fetch is lazy and uncached at its end
+   regardless (it holds whatever it last fetched until RP's
+   `ClearServiceAccountKeysCache` explicitly tells it to re-fetch), so a
+   60-second HTTP cache never delays Keycloak noticing a real rotation —
+   it exists purely to bound OpenBao read-amplification if the
+   unauthenticated route is hit repeatedly (§"JWKS custody" and TS-D15).
+
+Everything else this service reads — TS-3's/TS-5's principal/credential
+lookups, the JWKS route's own key derivation — goes to Postgres or OpenBao
+on every call. This is a deliberate simplification matching the service's
+scale (§21): the one steady-state read path (TS-3, plus TS-5's much
+lighter identity-only lookup) is a single RLS-scoped indexed query, cheap
+enough that a cache would add failure modes (staleness after a rotation,
+invalidation on revoke) without a measurable latency win.
+
+---
+
 ## Row-Level Security (RLS) and GUC injection
 
 Tenant isolation is enforced in Postgres itself, not just in application
@@ -458,9 +666,9 @@ Three Postgres roles, one purpose each:
 
 | Role | Attributes | Used by |
 |---|---|---|
-| `serviceaccount_app` | `NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE` | `cmd/server`, `cmd/consumer` — every RLS-scoped read/write |
+| `serviceaccount_app` | `NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE` | `cmd/server`, `cmd/consumer` — every RLS-scoped read/write; also `cmd/rotator`'s per-tenant revoke writes and `cmd/scheduler`'s per-tenant `IssueOrRotate` writes (both via a normal RLS-scoped transaction bound to the row's own tenant, RLS-7) |
 | `serviceaccount_migrator` | `BYPASSRLS` + DDL privileges | migrations only, direct connection, bypasses PgBouncer (`pg_advisory_lock` is session-scoped) |
-| `serviceaccount_reconciler` | `BYPASSRLS`, `SELECT`-only, no write grant | `cmd/rotator`'s cross-tenant enumeration only |
+| `serviceaccount_reconciler` | `BYPASSRLS`, `SELECT`-only, no write grant | `cmd/rotator`'s and `cmd/scheduler`'s cross-tenant enumeration only (§16 TSQ-6 Resolved) |
 
 `SET LOCAL` (never plain `SET`) is the load-bearing detail: it scopes the
 GUC to the current transaction, so a pooled connection returned to
@@ -746,7 +954,7 @@ mutation against a stale read-modify-write.
 | Failure | Behavior |
 |---|---|
 | OpenBao unreachable during issue/rotate/revoke | `502 secret_store_unavailable`; nothing committed to Postgres (material-write precedes the tx; material-delete precedes the tx on revoke) |
-| Postgres connectivity/resource error (SQLSTATE class `08`/`53`/`57`/`58`, closed pool, network I/O error) | Remapped by `wrapConnErr` to `domain.ErrDBUnavailable` → `503`, never a raw `500` |
+| Postgres connectivity/resource error (SQLSTATE class `08`/`53`/`57`/`58`, or a closed pool) | Remapped by `wrapConnErr` to `domain.ErrDBUnavailable` → `503`, never a raw `500`. **Corrected 2026-09-20, TS-D16**: classification is now positive-identification-only (SQLSTATE class match or `puddle.ErrClosedPool`) — a prior broad `isNetworkError` heuristic (string-matching "connection refused"/EOF/etc.) was removed because it could silently discard a caller's real business error under a misleading `503`. `HandleError` (HTTP layer) independently classifies a leaked `*pgconn.PgError` of these same classes into the same `503`, as defense-in-depth against a case `wrapConnErr` itself misses. |
 | Crash between OpenBao write and Postgres commit (issue/rotate) | Orphaned OpenBao material, no committed row — reconcilable by the §8.6 orphan-material reconciler (`orphan_deleted`), never a phantom credential |
 | Crash between OpenBao delete and Postgres commit (revoke/offboarding) | Delete is a no-op on an already-missing path, so retrying the whole operation is always safe |
 | Committed credential with no backing OpenBao material | `missing_material` — irrecoverable per-version data loss; the reconciler pages rather than silently reissuing |
@@ -770,25 +978,38 @@ mutation against a stale read-modify-write.
 | TS-INV-6 | Reachable only in-mesh on `/api/v1/internal/*` under the reserved `iam-system` principal; no tenant-facing surface at MVP |
 | TS-INV-7 | Revocation is two-halves, like rotation — TS-2 removes this service's custody/metadata, not the Keycloak-side validity, except where a Keycloak change is already implied |
 | RLS-6 | Tenant scoping is via `SET LOCAL app.tenant_id`, transaction-local only — never a session-wide `SET` |
-| RLS-7 | Only `cmd/rotator`'s reconciler pool may bypass RLS, and only for `SELECT`-only cross-tenant enumeration |
+| RLS-7 | Only the `serviceaccount_reconciler` role (`cmd/rotator`'s and `cmd/scheduler`'s reconciler pools, §16 TSQ-6 Resolved) may bypass RLS, and only for `SELECT`-only cross-tenant enumeration — every resulting write goes through an RLS-scoped `serviceaccount_app` transaction |
 
 ---
 
 ## Deployment
 
-**Three binaries, one image.** `cmd/server` (HTTP API + outbox runner),
+**Four binaries, one image.** `cmd/server` (HTTP API + outbox runner),
 `cmd/consumer` (offboarding SQS subscriber), `cmd/rotator` (sweep +
-reconciler + prune CronJob) are built from one `Dockerfile`, selected by
-`ENTRYPOINT` override — `deploy/helm/templates/deployment-server.yaml`,
-`deployment-consumer.yaml`, and `cronjob-rotator.yaml` each point the same
-`image.repository:tag` at a different entrypoint.
+reconciler + prune CronJob), and `cmd/scheduler` (the §16 TSQ-6 Resolved
+automatic cadence-driven rotation CronJob, TS-D14) are built from one
+`Dockerfile`, selected by `ENTRYPOINT` override —
+`deploy/helm/templates/deployment-server.yaml`, `deployment-consumer.yaml`,
+`cronjob-rotator.yaml`, and `cronjob-scheduler.yaml` each point the same
+`image.repository:tag` at a different entrypoint. `cmd/scheduler` is the
+one composition root besides `server` that imports `core/service` directly
+(it calls `CredentialService.IssueOrRotate` in-process, the same code
+`server`'s HTTP handler calls) — `cmd/rotator` is deliberately walled off
+from `service` (`.go-arch-lint.yml`'s `reconciler_jobs` component); the
+line is "does this binary ever mint new credential material," not
+"does this binary run on a schedule."
 
 **Topology.** 2 replicas each for `server`/`consumer` (HA, not load — this
-service is trivially small); the rotation CronJob is a singleton
-run-to-completion job. `server`/`consumer` connect as `serviceaccount_app`
-(RLS-scoped); `rotator` connects as `serviceaccount_reconciler`
-(`BYPASSRLS`, read-only) for enumeration and opens ordinary
-`serviceaccount_app` transactions for the writes it makes.
+service is trivially small); the rotation and cadence-scheduler CronJobs
+are each a singleton run-to-completion job. `server`/`consumer` connect as
+`serviceaccount_app` (RLS-scoped); `rotator` connects as
+`serviceaccount_reconciler` (`BYPASSRLS`, read-only) for enumeration and
+opens ordinary `serviceaccount_app` transactions for the writes it makes.
+`scheduler` uses the identical two-pool shape — `serviceaccount_reconciler`
+to enumerate `idx_sac_next_rotation`'s due list, `serviceaccount_app` (via
+`CredentialService.IssueOrRotate`) for every actual write — then relays the
+returned plaintext to the Realm Provisioner's RP-17 over its one outbound
+HTTP dependency (`internal/adapter/outbound/realmprovisioner`).
 
 **Migration safety.** `MIGRATION_DATABASE_URL` bypasses PgBouncer —
 `pg_advisory_lock` is session-scoped and breaks under transaction pooling.
@@ -800,12 +1021,14 @@ the migration in prod and may not exist in dev/CI) — verified against a
 real Postgres instance with the role both present and absent.
 
 **Helm chart** (`deploy/helm/`): `Deployment` × 2 (server, consumer),
-`CronJob` × 1 (rotator — `activeDeadlineSeconds: 240s`, deliberately
-shorter than the 5-minute schedule so a run never eats into the next tick
-under `concurrencyPolicy: Forbid`), `NetworkPolicy` restricting ingress to
-in-mesh callers (`ingressNamespaceSelector` is a required value — the
-render fails closed if left unset, since an empty selector matches every
-namespace in the cluster), `ServiceAccount` bound to the OpenBao
+`CronJob` × 2 (rotator and scheduler — each `activeDeadlineSeconds: 240s`,
+deliberately shorter than the 5-minute schedule so a run never eats into
+the next tick under `concurrencyPolicy: Forbid`), `NetworkPolicy`
+restricting ingress to in-mesh callers (`ingressNamespaceSelector` is a
+required value — the render fails closed if left unset, since an empty
+selector matches every namespace in the cluster; `scheduler`'s policy adds
+one egress rule to the Realm Provisioner's port, the one outbound target
+`rotator` never needs), `ServiceAccount` bound to the OpenBao
 Kubernetes-auth role, `PrometheusRule`/`ServiceMonitor` for the alerts in
 `deploy/monitoring/app-alerts.yml`, `PodDisruptionBudget` (`minAvailable:
 1`). HPA (`autoscaling.enabled`) and Ingress/HTTPRoute/SecurityPolicy
@@ -946,6 +1169,22 @@ name entirely — the 5 current names are frozen (§25) and never reused.
 
 ---
 
+## Session-specific decisions
+
+A small number of judgment calls were made during implementation where the
+frozen LLD was silent on an internals-only detail, or where a shared
+library had a gap the design didn't anticipate. Each is documented at its
+point of impact in the code as well as here; unlike the LLD's own
+Decision Register (§22, `TS-D#`), none of these rises to a design-level
+decision — they are code-level pragmatism, not architecture.
+
+1. **TS-5's query-parameter shape, not a new path segment** (`internal/adapter/inbound/http/router.go`, TS-D16). AUTH-9's find-by-Keycloak-sub lookup needed a new read route on the same `/service-accounts` collection TS-4 already registers `POST` on. A static `.../service-accounts/by-sub` segment would sit at the same tree position as TS-3's `:principal_id` wildcard — gin's router rejects a static segment and a named parameter sharing one position. `GET /service-accounts?principal_sub=<uuid>` avoids the conflict entirely; the query parameter is an internal routing detail, not part of a frozen path shape (§25 doesn't cover it), so this cost nothing to choose freely.
+2. **`wrapConnErr`'s SQLSTATE class 57/58 matching is string-based, not a `pgcommon` helper** (`internal/adapter/outbound/postgres/db.go`, TS-D16). `platform-pgcommon` v1.3.0 ships dedicated classifiers for class `08` (connection exception) and `53` (insufficient resources) but not `57` (operator intervention) or `58` (system error) yet — matched on the `pgconn` error's `Error()` text (`"… (SQLSTATE 57…)"`) instead, the same workaround iam-user-profile/iam-org-membership use, so this service doesn't need its own `pgconn` import to close the gap. Revisit once `pgcommon` adds the dedicated helpers.
+3. **`eventbus.Codec`/`NoopCodec` are now type aliases to `platform-events`' own `events.Codec`/`events.NoopCodec`**, not this service's local types. `ValidatingCodec` gained a pass-through `Decode` to satisfy the library interface. Purely a library-alignment cleanup (matching iam-user-profile/iam-org-membership's own adoption) — no behavior change, and every constructor still nil-defaults to `events.NoopCodec{}`.
+4. **`cmd/consumer`'s `/healthz`/`/readyz` now run through Gin + `gincommon.ObservabilityMiddlewares`**, not a bare `http.ServeMux`, matching `cmd/server`/`cmd/rotator`/`cmd/scheduler`'s stack — probe traffic gets the same Zap access logs, HTTP metrics, and traces every other route does. `/metrics` stays on its own dedicated stdlib mux, deliberately not sharing a listener with probes.
+
+---
+
 ## Documentation assets
 
 | Doc | Purpose |
@@ -954,7 +1193,7 @@ name entirely — the 5 current names are frozen (§25) and never reused.
 | `ARCHITECTURE.md` (this file) | Deep-dive mechanisms, one diagram per cross-cutting concern |
 | `docs/architecture/mermaid/*.mmd` | Canonical diagram sources — edit here first |
 | `docs/architecture/README.md` | Index mapping each diagram to its section/LLD reference |
-| `docs/iam-lld-token-service.md` | The signed-off Low-Level Design (rev 1.0) — the ultimate source of truth |
+| `docs/iam-lld-token-service.md` | The signed-off Low-Level Design (rev 1.3) — the ultimate source of truth |
 | `api/asyncapi.yaml` | Event contract (design-time); served at `/asyncapi` |
 | `docs/swagger/` | Generated OpenAPI spec (`make swag`); served at `/swagger` |
 | `VERSIONING.md` | SemVer scope, release process, frozen-contract enumeration |

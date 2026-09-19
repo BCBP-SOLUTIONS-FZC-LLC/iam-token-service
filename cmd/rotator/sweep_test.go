@@ -34,7 +34,7 @@ func TestRunOverlapSweep_RevokesExpiredRotating(t *testing.T) {
 
 	rr := &fakeReconcilerRepository{expired: []port.ExpiredRotatingCredential{expiredRow(tenantID, principalID, 1, path)}}
 
-	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, nil)
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, newFakeRealmProvisionerClient(), nil)
 
 	assert.Equal(t, 1, result.Revoked)
 	assert.Equal(t, 0, result.Skipped)
@@ -65,7 +65,7 @@ func TestRunOverlapSweep_AlreadyRevokedIsSkippedNotFailed(t *testing.T) {
 
 	rr := &fakeReconcilerRepository{expired: []port.ExpiredRotatingCredential{expiredRow(tenantID, principalID, 1, path)}}
 
-	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, nil)
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, newFakeRealmProvisionerClient(), nil)
 
 	assert.Equal(t, 0, result.Revoked)
 	assert.Equal(t, 1, result.Skipped)
@@ -98,7 +98,7 @@ func TestRunOverlapSweep_OneFailureDoesNotBlockTheRest(t *testing.T) {
 		expiredRow(tenantID2, principalID2, 1, path2),
 	}}
 
-	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, nil)
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, newFakeRealmProvisionerClient(), nil)
 
 	assert.Equal(t, 1, result.Failed)
 	assert.Equal(t, 1, result.Revoked, "a failure on one row must not block the next")
@@ -130,11 +130,76 @@ func TestRunOverlapSweep_ConcurrentRevokeDuringUpdateIsSkippedNotFailed(t *testi
 
 	rr := &fakeReconcilerRepository{expired: []port.ExpiredRotatingCredential{expiredRow(tenantID, principalID, 1, path)}}
 
-	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, nil)
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, newFakeRealmProvisionerClient(), nil)
 
 	assert.Equal(t, 0, result.Revoked)
 	assert.Equal(t, 1, result.Skipped)
 	assert.Equal(t, 0, result.Failed, "a benign concurrent-revoke race must not count as a sweep failure")
+}
+
+// TestRunOverlapSweep_RefreshesKeysAfterRevoke covers the fix for the
+// production-readiness audit's blocker #1: a revoke that only updates
+// Postgres/OpenBao never actually cuts a key off at Keycloak under EXT-6
+// (rev 1.3) — Keycloak keeps validating a cached key indefinitely with no
+// TTL. The sweep must call RP-17 (RefreshKeys) for the row's tenant after
+// every successful revoke.
+func TestRunOverlapSweep_RefreshesKeysAfterRevoke(t *testing.T) {
+	credentials := newFakeCredentialRepository()
+	secrets := newFakeSecretStore()
+	tx := &fakeTxRunner{events: &fakeEventPublisher{}}
+
+	tenantID := uuid.New()
+	principalID := uuid.New()
+	path := domain.OpenBaoPathFor(tenantID, domain.KeycloakClientPlatformAutomation, 1)
+	secrets.data[path] = "material"
+	credentials.seed(&domain.Credential{
+		TenantID: tenantID, PrincipalID: principalID, Version: 1,
+		Status: domain.CredentialStatusRotating, OpenBaoPath: path, RecordVersion: 1,
+	})
+
+	rr := &fakeReconcilerRepository{expired: []port.ExpiredRotatingCredential{expiredRow(tenantID, principalID, 1, path)}}
+	rp := newFakeRealmProvisionerClient()
+
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, rp, nil)
+
+	assert.Equal(t, 1, result.Revoked)
+	assert.Equal(t, 0, result.Failed)
+	assert.Equal(t, []uuid.UUID{tenantID}, rp.refreshed, "RP-17 must be called for the revoked row's tenant")
+}
+
+// TestRunOverlapSweep_RP17FailureIsFailedNotRevoked covers the other half
+// of the same fix: the DB revoke already committed by the time RP-17 is
+// called (material-first ordering, §9.3), so a failed key-refresh cannot
+// be rolled back — it must surface as Failed (page-worthy), not be
+// swallowed as a quiet success, since the row will never be enumerated by
+// ListExpiredRotating again (revokeExpiredRotating's doc comment).
+func TestRunOverlapSweep_RP17FailureIsFailedNotRevoked(t *testing.T) {
+	credentials := newFakeCredentialRepository()
+	secrets := newFakeSecretStore()
+	tx := &fakeTxRunner{events: &fakeEventPublisher{}}
+
+	tenantID := uuid.New()
+	principalID := uuid.New()
+	path := domain.OpenBaoPathFor(tenantID, domain.KeycloakClientPlatformAutomation, 1)
+	secrets.data[path] = "material"
+	credentials.seed(&domain.Credential{
+		TenantID: tenantID, PrincipalID: principalID, Version: 1,
+		Status: domain.CredentialStatusRotating, OpenBaoPath: path, RecordVersion: 1,
+	})
+
+	rr := &fakeReconcilerRepository{expired: []port.ExpiredRotatingCredential{expiredRow(tenantID, principalID, 1, path)}}
+	rp := newFakeRealmProvisionerClient()
+	rp.errs[tenantID] = errors.New("realm provisioner unreachable")
+
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, rp, nil)
+
+	assert.Equal(t, 0, result.Revoked)
+	assert.Equal(t, 1, result.Failed)
+
+	cred, err := credentials.FindByVersion(context.Background(), tenantID, principalID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, cred)
+	assert.Equal(t, domain.CredentialStatusRevoked, cred.Status, "the DB revoke is not rolled back on an RP-17 failure")
 }
 
 func TestRunOverlapSweep_ListFailureIsSafeNoOp(t *testing.T) {
@@ -143,7 +208,7 @@ func TestRunOverlapSweep_ListFailureIsSafeNoOp(t *testing.T) {
 	tx := &fakeTxRunner{}
 	rr := &fakeReconcilerRepository{err: errors.New("db unavailable")}
 
-	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, nil)
+	result := runOverlapSweep(context.Background(), rr, credentials, secrets, tx, newFakeRealmProvisionerClient(), nil)
 
 	assert.Equal(t, sweepResult{}, result)
 }

@@ -3,8 +3,8 @@
 **Custodian of the platform-automation service account's rotating credential material** for the Tender Management SaaS Platform's IAM subsystem — issues, rotates, and revokes the per-tenant `platform-automation` Keycloak client's secret, custodies the plaintext exclusively in OpenBao (never Postgres), and drives the tenant-offboarding credential cleanup cascade.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service`
-**Module:** Go 1.26.6 — three binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`) built from one image, deployed as a Helm chart (Deployment × 2, CronJob × 1)
-**Design:** `docs/iam-lld-token-service.md` (rev 1.0, Approved) — this README and `ARCHITECTURE.md` are navigable summaries of it, not a replacement; the LLD is the tie-breaker on any discrepancy.
+**Module:** Go 1.26.6 — four binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) built from one image, deployed as a Helm chart (Deployment × 2, CronJob × 2)
+**Design:** `docs/iam-lld-token-service.md` (rev 1.3, Approved) — this README and `ARCHITECTURE.md` are navigable summaries of it, not a replacement; the LLD is the tie-breaker on any discrepancy.
 
 ---
 
@@ -26,6 +26,27 @@ versions, custodies, tracks status); the **Realm Provisioner** is the sole
 [Credential issue/rotate flow](ARCHITECTURE.md#credential-issuerotate-flow-ts-1)
 for the exact hand-off.
 
+**One write-ordering discipline, used everywhere in this service (no
+per-flow variation the way the Realm Provisioner has two):**
+1. **Material-first, then Postgres commit, then RP-17 after the commit.**
+   Every write (TS-1 issue/rotate, TS-2 revoke, the overlap sweep, the
+   offboarding cascade) writes or deletes the OpenBao material *before*
+   any Postgres transaction opens. If that step fails, nothing is
+   committed and the caller gets `502 secret_store_unavailable` — this
+   service has no "record the intent, reconcile later" discipline the way
+   the Realm Provisioner's RP-8 does; every write here is fail-closed by
+   design, because a service-account principal has no operator watching a
+   `pending` queue the way a tenant admin does. Only once the OpenBao step
+   succeeds does `RunInTx` commit the row and enqueue the outbox event
+   atomically. `ClearServiceAccountKeysCache` (RP-17) then runs strictly
+   *after* that commit, never before and never inside the same
+   transaction — it is the one step this service cannot roll back if it
+   fails, so ordering it last means a failure there never leaves an
+   inconsistent local row, only a documented, page-worthy two-halves gap
+   (TS-INV-7, TS-D14/TS-D15). See
+   [Write ordering discipline](ARCHITECTURE.md#write-ordering-discipline)
+   for the full sequence diagram.
+
 ---
 
 ## Why this service exists
@@ -33,33 +54,86 @@ for the exact hand-off.
 The automation principal's credential needs a home that is neither
 Keycloak (which only the Realm Provisioner may write) nor a general secrets
 service with no domain awareness of rotation-overlap, idempotent
-issue/rotate semantics, or the offboarding cascade. This service exists to
-be that home: a small, single-purpose credential authority with exactly one
-external secret-storage dependency (OpenBao) and zero Keycloak Admin API
-surface.
+issue/rotate semantics, or the offboarding cascade. Concretely:
+
+- **One holder of the credential-lifecycle logic.** Issue/rotate/revoke
+  idempotency, overlap-window math, and the offboarding cascade are
+  implemented once, in one codebase, instead of re-derived (and
+  potentially re-broken) by every caller that would otherwise talk to
+  OpenBao directly.
+- **A structural, not just conventional, split from Keycloak
+  administration.** If this service could also write to Keycloak, the
+  two-halves model (system-of-record vs. applier) would collapse into a
+  single point that both custodies material *and* can apply it — a wider
+  blast radius for exactly the same compromise. TS-INV-1 keeps that
+  impossible: this service has **zero** `gocloak` dependency, enforced
+  structurally by `.github/scripts/check-no-gocloak.sh` (`make gates`) —
+  a `Nerzal/gocloak` import anywhere in this repo fails the build, not
+  just a review comment.
+- **Plaintext custody with one exit door.** TS-INV-2 (no secret plaintext
+  in Postgres, ever) and the CI `no-secret-log` gate (fails the build if a
+  credential field name reaches a log/trace sink) together mean the
+  *only* place a generated private key exists outside a single HTTP
+  response body is OpenBao.
+- **A stable, versioned contract for every caller.** The Realm Provisioner,
+  Org & Membership, and operator tooling integrate against this service's
+  HTTP/event contract instead of OpenBao's own KV API and its
+  version-specific quirks, or Keycloak's client-jwt configuration
+  directly.
 
 ---
 
 ## API overview
 
-4 routes (TS-1..TS-4) plus health/docs — `internal/adapter/inbound/http/router.go`
-is the single source of truth; the generated Swagger spec (`make swag`,
-`docs/swagger/`) is derived from `swaggo` annotations on the handlers, never
-hand-authored. All routes sit behind `gincommon.DefaultMiddlewares`
-(`PanicRecovery → RequestID → Tracing → CorrelationHeaders → Metrics →
-Logging → RequireAuth → ContextMiddleware`) followed by this service's own
-`GUCBridgeMiddleware`. There is exactly **one route class** — every route
-is under `/api/v1/internal/*`; this service has no public/tenant-facing
-surface at MVP.
+6 routes (TS-1..TS-5 plus the EXT-6 JWKS route) plus health/docs, all
+registered from `internal/adapter/inbound/http/router.go`'s `NewRouter` —
+the single source of truth; the generated Swagger spec (`make swag`,
+`docs/swagger/`) is derived from `swaggo` annotations on the handlers,
+never hand-authored.
 
-### Internal routes (4)
+**Middleware chain** (`NewRouter` → `registerInternalRoutes`): a 1 MB
+`http.MaxBytesReader` body cap (this service's bodies are UUIDs and one
+secret string — no legitimate caller needs more) → `gincommon.TimeoutMiddleware(30s)`
+→ `gincommon.ObservabilityMiddlewares` → **then**, only on the
+`/api/v1/internal` route group, `gincommon.ProtectedMiddlewares`
+(`RequireAuth` + `ContextMiddleware`) → `GUCBridgeMiddleware` (binds
+`app.tenant_id` transaction-locally, RLS) → `RequireJSONContentType` →
+`RequireTenantPathMatch` (the `:id` path segment must equal the resolved
+tenant GUC before any handler runs — a mismatch is `403`, never silently
+corrected). `/healthz`, `/readyz`, the docs routes, and the JWKS route are
+all registered *before* that protected group, so they never pick up
+`RequireAuth`/`GUCBridgeMiddleware` at all — see the JWKS row below.
 
-| # | Method & path | Purpose |
-|---|---|---|
-| TS-4 | `POST /api/v1/internal/tenants/:id/service-accounts` | Register the principal after the Realm Provisioner mints the Keycloak client. Idempotent on `(tenant_id, principal_type)`. Emits `ServiceAccountRegistered`. |
-| TS-1 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials` | Issue or rotate the credential — the only endpoint that ever returns a plaintext secret, exactly once. Idempotent per `rotation_id`. Emits `…CredentialIssued`/`…CredentialRotated`. |
-| TS-2 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials/:version/revoke` | Revoke one credential version immediately; deletes its OpenBao material. Idempotent. Emits `…CredentialRevoked`. |
-| TS-3 | `GET /api/v1/internal/tenants/:id/service-accounts/:principal_id` | Read principal + credential **metadata** — never a secret. |
+**Idempotency model — deliberately different from a header-based scheme.**
+This service has no `Idempotency-Key` header mechanism: TS-1 takes a
+**body field**, `rotation_id`, because the idempotency key here is
+intrinsically part of the request's meaning (which rotation this is), not
+an opaque retry token layered on top. Reusing the same `rotation_id`
+against an in-flight or already-committed rotation replays the stored
+result (`200`, not `201`); a *different* `rotation_id` arriving while one
+is still in flight is `409 rotation_in_flight`. TS-2/TS-3/TS-4/TS-5 are
+naturally idempotent from their own request shape (a revoke of an
+already-revoked version, or a repeat registration, is a no-op success)
+and need no separate token at all.
+
+### Internal routes (6)
+
+| # | Method & path | Idempotency | Purpose | Emits |
+|---|---|---|---|---|
+| TS-4 | `POST /api/v1/internal/tenants/:id/service-accounts` | On `(tenant_id, keycloak_client_id)` — repeat returns `200` with the existing row, never a duplicate | Register the principal after the Realm Provisioner mints the Keycloak client | `ServiceAccountRegistered` |
+| TS-1 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials` | Body field `rotation_id` — same id replays (`200`); a different concurrent id is `409 rotation_in_flight` | Issue or rotate the credential — the only endpoint that ever returns the plaintext private key, exactly once | `…CredentialIssued` / `…CredentialRotated` |
+| TS-2 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials/:version/revoke` | Revoking an already-revoked version is a no-op success | Revoke one credential version immediately; deletes its OpenBao material | `…CredentialRevoked` |
+| TS-3 | `GET /api/v1/internal/tenants/:id/service-accounts/:principal_id` | Read-only | Read principal + credential **metadata** — never a key | — |
+| TS-5 | `GET /api/v1/internal/tenants/:id/service-accounts?principal_sub=<uuid>` | Read-only | Find a principal by its Keycloak `sub` instead of this service's own internal id (AUTH-9) — identity/status only, never credential metadata; used by org-membership's non-member defense-in-depth check | — |
+| — | `GET .../service-accounts/platform-automation/jwks.json` | Read-only, unauthenticated | EXT-6: public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches | — |
+
+There are no "operator-only" routes on this service the way the Realm
+Provisioner has RP-13/RP-14 behind `RequireOperatorRole` — every TS-1..TS-5
+route accepts the same one caller identity, the reserved system principal
+(`x-user-id: 00000000-0000-0000-0000-0000000000a1`); there is no
+`platform_operator`-vs-`iam-system` distinction anywhere in this service's
+authorization surface, because a human operator calling TS-1/TS-2 goes
+through the same mesh path as any other caller, not a separately-gated one.
 
 ### Health and docs routes
 
@@ -77,42 +151,117 @@ exactly one automation principal per tenant, read directly by TS-3.
 
 ## Input validation
 
-Applied in the service layer before any write, so a validation failure
-never reaches OpenBao or Postgres: `rotation_id` must be a UUID;
-`overlap_seconds` is clamped server-side to `[0, 900]` regardless of what
-the caller sends (`0` is a hard cutover); `principal_sub` must be a UUID;
-`keycloak_client_id` is validated against the frozen `platform-automation`
-value. Failures return `400 invalid_request` with the specific field named
-in `details.field`.
+Like the Realm Provisioner, this service is **fail-fast, single-error**:
+`ShouldBindJSON` stops at the first malformed field and a bind failure is
+wrapped into one `400 invalid_request` — never a field-level array. A
+handler-level check (a path-param UUID, a body-field UUID string) fails
+before the request ever reaches the service layer; a business-rule check
+(the clamp on `overlap_seconds`, the frozen `keycloak_client_id` value)
+lives in the service layer instead, so it can never be bypassed by a
+caller that skips the HTTP layer (a future gRPC/internal-only caller,
+say). Either way, the response shape is the same flat envelope:
+
+```json
+{
+  "error": "invalid_request",
+  "status": 400,
+  "trace_id": "a3f1b2c8d4e5f60718293a4b5c6d7e8f",
+  "request_id": "01H8XYZ...",
+  "details": { "field": "rotation_id" }
+}
+```
 
 ### Notable validation rules
 
-- The `:id` path segment must equal the `x-tenant-id` GUC before any DB
-  checkout — a mismatch is `403`, never silently corrected.
-- The only accepted `x-user-id` on any route is the reserved system
-  principal `iam-system` (`00000000-0000-0000-0000-0000000000a1`) — a
-  tenant-facing principal is rejected before any handler runs.
-- Mutation responses always include `record_version` so callers can
-  round-trip the optimistic-concurrency token; no response body ever
-  includes a stored secret except TS-1's freshly-generated plaintext.
+| Field | Rule (as implemented) | Error / code |
+|---|---|---|
+| `id` (tenant, path) | Must parse as `uuid.UUID`; must equal the `x-tenant-id`-derived GUC before any DB checkout (`RequireTenantPathMatch`) | `400 invalid_request` (malformed) / `403` (mismatch — never silently corrected) |
+| `principal_id` (path, TS-1/TS-2/TS-3) | Must parse as `uuid.UUID` | `400 invalid_request` |
+| `rotation_id` (TS-1 body) | Empty is passed through as `uuid.Nil` so the service layer's own "required" check fires with the same shape; present-but-unparseable is rejected at the HTTP boundary | `400 invalid_request` |
+| `overlap_seconds` (TS-1 body) | `nil` (omitted) means "use the configured default" (`ROTATION_DEFAULT_OVERLAP_SECONDS`, 300s); an explicit `0` is a deliberate hard cutover; either way `domain.ClampOverlapSeconds` bounds the effective value to `[0, 900]` regardless of what the caller sends | Never rejected — silently clamped |
+| `version` (path, TS-2) | Must parse as an integer | `400 invalid_request` |
+| `principal_sub` (TS-4 body) | Must parse as `uuid.UUID` at the HTTP layer (the service's `RegisterRequest.PrincipalSub` is already typed `uuid.UUID`, so a non-UUID string can never reach it) | `400 invalid_request` |
+| `keycloak_client_id` (TS-4 body) | Must equal the frozen `platform-automation` value — a value-level business rule, checked in the service layer, not the handler | `400 invalid_request` |
+| `principal_sub` (TS-5 query param) | Must parse as `uuid.UUID` | `400 invalid_request` |
+| `x-user-id` (header, every route) | Must be the reserved system principal `00000000-0000-0000-0000-0000000000a1` — a tenant-facing principal is rejected before any handler runs | `401 missing_identity_headers` |
+| `Content-Type` (header) | Must be `application/json` on a non-empty write body (`RequireJSONContentType`) | `415 unsupported_media_type` |
+
+Mutation responses always include `record_version` so callers can
+round-trip the optimistic-concurrency token (§9 below); no response body
+ever includes a stored secret except TS-1's freshly-generated plaintext,
+returned exactly once. Validation-relevant fields are never logged with
+their raw values — only `tenant_id`, `principal_id`, `version`, `op`,
+`result` (§ Observability below), enforced structurally by the CI
+`no-secret-log` gate.
 
 ---
 
 ## Architecture
 
-Clean Architecture, structurally enforced by `.go-arch-lint.yml` — `make
-lint` fails the build on a layering violation, not just a style warning.
-Full diagrams and mechanism-by-mechanism detail live in
-[`ARCHITECTURE.md`](ARCHITECTURE.md); this is the summary.
+Clean Architecture — dependencies point inward; outer layers never import
+inner layers: `domain` ← `port` ← `service` ← `adapter` ← `cmd`,
+structurally enforced by `.go-arch-lint.yml` (`make lint` fails the build
+on a layering violation, not just a style warning). Four composition
+roots ship from one Docker image. Full diagrams and mechanism-by-mechanism
+detail live in [`ARCHITECTURE.md`](ARCHITECTURE.md); this is the summary.
 
-### Dependency rules (enforced by go-arch-lint in CI)
+```
+iam-token-service/
+├── cmd/
+│   ├── server/                        # HTTP composition root: pool+GUC wiring, migrations, outbox runner
+│   ├── consumer/                      # SQS composition root: the one inbound subscription (offboarding)
+│   ├── rotator/                       # CronJob binary: overlap sweep + orphan reconciler + prune — BYPASSRLS, no `service` dependency (RLS-7)
+│   └── scheduler/                     # CronJob binary: cadence-driven auto-rotation (§16 TSQ-6, TS-D14) — BYPASSRLS scan, but DOES depend on `service`
+├── internal/
+│   ├── core/
+│   │   ├── domain/                    # Entities, value objects, ErrorCode taxonomy (§17), event payload structs
+│   │   ├── port/                      # CredentialRepository, PrincipalRepository, SecretStore, EventPublisher, RealmProvisionerClient, TxRunner, ReconcilerRepository
+│   │   └── service/                   # CredentialService (TS-1/TS-2), PrincipalService (TS-3/TS-4/TS-5), JWKSService, secret_generator (RSA-2048 keypairs)
+│   └── adapter/
+│       ├── inbound/
+│       │   ├── http/                  # Gin handlers (TS-1..TS-5), JWKS handler, middleware, router.go, /swagger, /asyncapi
+│       │   └── consumer/              # The one SQS consumer: offboarding_consumer.go + dedup.go (ackUnknown semantics)
+│       └── outbound/
+│           ├── postgres/              # Repository impls, RLS/GUC wiring, migrations — its own component (not folded into adapters_outbound)
+│           ├── openbao/               # KV v2 client, Kubernetes-auth only — its own component, mirroring TS-INV-1's isolation shape
+│           ├── eventbus/              # Outbox publisher (topic iam-serviceaccount-events) + Glue/Noop/Validating codecs
+│           ├── realmprovisioner/      # RP-17 (ClearServiceAccountKeysCache) HTTP client — the one outbound dependency on another IAM service
+│           ├── httpx/                 # Shared instrumented http.RoundTripper (traceparent injection) that realmprovisioner builds on
+│           └── metrics/               # iam_token_service_* (Tier 3) + platform_*/iam_* (Tier 1/2 proposed) Prometheus counters/histograms
+├── pkg/requestctx/                    # Typed RequestContext{UserID, TenantID}
+├── api/                                # //go:embed asyncapi.yaml — served from the compiled binary, no source tree in the image
+├── docs/swagger/                      # swag-generated OpenAPI spec — checked in, regenerated by `make swag`
+├── deploy/                            # Helm chart, OpenBao policy, Prometheus alerts
+├── docs/iam-lld-token-service.md      # Frozen LLD, rev 1.3 Approved
+├── .githooks/pre-commit               # tidy + fmt-check + vet + lint; installed via `make setup`/`make install-hooks`
+└── test/                              # test/unit (black-box + white-box), test/contract, test/postgres (RLS, -tags=integration), test/integration, test/e2e, test/dbseed
+```
 
-`domain` → `port` → `service` → `{postgres, openbao, observability,
-adapters_outbound}` → `{adapters_inbound, reconciler_jobs}` → `cmd`. The one
-rule most worth internalizing: **`cmd/rotator` (the `reconciler_jobs`
-component) may not depend on `service`** — it drives `postgres`/`openbao`
-directly under a `BYPASSRLS` connection for cross-tenant enumeration, a
-privilege no HTTP- or event-triggered code path may ever hold.
+### Dependency rules (enforced by `go-arch-lint` in CI)
+
+| Package | May import |
+|---|---|
+| `core/domain` | Nothing internal (`anyVendorDeps: true` for `google/uuid` etc.) |
+| `core/port` | `core/domain` only |
+| `core/service` | `core/domain`, `core/port`, `pkg/requestctx` |
+| `postgres` (own component) | `core/domain`, `core/port` |
+| `openbao` (own component) | `core/domain`, `core/port` |
+| `httpx` (own component) | — (shared outbound-HTTP transport `adapters_outbound` builds on) |
+| `observability` (own component) | `core/domain`, `core/port`, `core/service` — a documented cross-cutting leaf |
+| `adapters_outbound` (eventbus, realmprovisioner) | `core/domain`, `core/port`, `core/service`, `observability`, `httpx` |
+| `adapters_inbound` (http, consumer) | `core/domain`, `core/port`, `core/service`, `requestctx`, `apispec`, `observability` |
+| `reconciler_jobs` (`cmd/rotator` only) | `core/domain`, `core/port`, `postgres`, `openbao`, `observability`, `adapters_outbound` — **not** `core/service` |
+| `cmd` (server/consumer/scheduler) | Everything above, including `service` — `cmd/scheduler` lives here, not in `reconciler_jobs`, precisely because it needs `service` |
+
+The one rule most worth internalizing: **`cmd/rotator` may not depend on
+`service`** — it drives `postgres`/`openbao` directly under a `BYPASSRLS`
+connection for cross-tenant enumeration (RLS-7), a privilege no HTTP- or
+event-triggered code path may ever hold. `cmd/scheduler` (§16 TSQ-6
+Resolved) holds that same `BYPASSRLS` enumeration privilege for its own
+due-list scan, but — unlike `cmd/rotator` — is *not* walled off from
+`service`: it calls `CredentialService.IssueOrRotate` directly, so it is
+listed under `cmd`'s own dependency allowance in `.go-arch-lint.yml`, not
+`reconciler_jobs`'s.
 
 ### Storage and messaging
 
@@ -154,9 +303,23 @@ principal as `200`, never a duplicate row.
 
 ### 3. Calling TS-1 (issue / rotate)
 
-The Realm Provisioner calls this to obtain the plaintext secret it then
-applies to the Keycloak client (RP-17); operators and this service's own
-rotation CronJob also call it. The caller supplies a `rotation_id` — reuse
+Operators and O&M tooling call this to generate a fresh RSA-2048 keypair
+and obtain the plaintext private key once, then call the Realm
+Provisioner's RP-17 endpoint (`ClearServiceAccountKeysCache`) so Keycloak
+re-fetches this service's JWKS and recognizes the new key — no key
+material is ever sent to RP (EXT-6/rev 1.3); Keycloak fetches the public
+key itself. This is a manually-orchestrated two-call sequence, not an
+automated call from this service to RP. Automatic cadence-driven rotation
+also exists (LLD §16 TSQ-6 — Resolved rev 1.2, TS-D14): a fourth binary,
+`cmd/scheduler`, scans for principals past their `next_rotation_at` and
+performs the same TS-1-then-RP-17 sequence itself. This service's own
+`cmd/rotator` CronJob sweeps expired overlaps and reconciles orphaned
+material (§8.3/§8.6); it never initiates a rotation, but it does call
+RP-17 after every automatic revoke, for the same reason (TS-D15) —
+Keycloak caches whatever key it last fetched with no self-expiring TTL, so
+skipping that call would leave a revoked key still authenticating
+indefinitely. The caller
+supplies a `rotation_id` — reuse
 the **same** id to safely retry a lost response without generating new
 material or a double-emit; use a **different** id only for a genuinely new
 rotation (a different one mid-flight is `409 rotation_in_flight`).
@@ -191,21 +354,87 @@ change never touches a service-account principal.
 
 ### 8. Handling errors
 
-Every response uses the flat `platform-gincommon` `ErrorResponse` shape
-(`error`, `status`, `trace_id`, `request_id`, `details?`) — see
-[Error taxonomy](#security) below and LLD §17 for the full table.
+Every non-2xx response is the flat `platform-gincommon` `ErrorResponse`
+shape (`internal/adapter/inbound/http/errors.go`) — `{error, status,
+trace_id, request_id, details?}`. There is no separate field-level
+validation-error shape; a bind failure is `400 invalid_request` with the
+same flat envelope.
 
-### 9. Rate limits
+```go
+var errResp struct {
+    Error     string         `json:"error"`
+    Status    int            `json:"status"`
+    TraceID   string         `json:"trace_id"`
+    RequestID string         `json:"request_id"`
+    Details   map[string]any `json:"details"`
+}
+_ = json.NewDecoder(resp.Body).Decode(&errResp)
+// errResp.TraceID links to the distributed trace
+```
 
-None enforced at this service — all callers are trusted in-mesh backends
-behind a NetworkPolicy allow-list, not external/public traffic.
+| Code | Status | Trigger |
+|---|---|---|
+| `invalid_request` | 400 | Malformed JSON / a UUID-parse or business-rule field failure; `details.field` names the offending field |
+| `missing_identity_headers` | 401 | `x-user-id`/`x-tenant-id` missing, or `x-user-id` is not the reserved system principal |
+| `principal_not_found` | 404 | TS-1/TS-2/TS-3 against an unregistered `principal_id` |
+| `rotation_in_flight` | 409 | TS-1 — a *different* `rotation_id` arrives while another rotation for the same principal is still uncommitted (`details.active_rotation_id`) |
+| `optimistic_lock_conflict` | 409 | A concurrent writer (another call, or the overlap sweep) already changed the row's `record_version` (`details.expected_version`) |
+| `credential_replay_revoked` | 409 | TS-1's `rotation_id` replay found the row it would replay, but that credential has since been revoked — additive to §17, not a misleading `502` (TS-D13) |
+| `principal_revoked` | 422 | TS-1/TS-2 against a principal whose registration itself has been revoked (offboarded tenant) |
+| `secret_store_unavailable` | 502 | OpenBao write/delete failed — material-first ordering means **nothing** was committed |
+| `db_unavailable` | 503 | Postgres connectivity/resource exhaustion, classified by positive SQLSTATE identification only (class `08`/`53`/`57`/`58`, or a closed pool) — additive to §17, distinct from a caller's business error (TS-D16) |
 
-### 10. Background reconcilers you may observe
+The `db_unavailable` and `credential_replay_revoked` codes are explicitly
+commented in `internal/core/domain/errors.go` as **additive, not frozen**
+— the other seven codes above are the frozen §17 taxonomy and cannot
+change in place.
+
+### 9. Optimistic locking
+
+`service_account_principals` and `service_account_credentials` both carry
+`record_version`, bumped by the `touch_row()` DB trigger (§4.5) on any
+real change — a no-op update never advances it. A `409
+optimistic_lock_conflict` returns the current `expected_version` in
+`details` so the caller can re-read and retry; there is no
+client-supplied expected-version field on TS-1/TS-2/TS-4's write bodies —
+conflicts surface from concurrent writers hitting the same row (another
+TS-2 call racing the overlap sweep, say), not from a caller-echoed
+version. TS-2 and the overlap sweep both re-check after a conflict and
+report the already-achieved idempotent outcome rather than a false
+failure when the "conflict" was actually two actors converging on the
+same result (TS-D13).
+
+### 10. Rate limits
+
+**Every internal route (TS-1..TS-5) applies no inbound rate limiting of
+its own** — all callers are trusted in-mesh backends behind a
+NetworkPolicy allow-list, not external/public traffic. The one exception
+is the EXT-6 JWKS route, which is deliberately unauthenticated by header
+(Keycloak's own outbound fetch carries no caller identity) and so has no
+caller-identity gate to lean on: it carries its own process-wide
+token-bucket rate limiter (`JWKS_RATE_LIMIT_RPS`/`JWKS_RATE_LIMIT_BURST`,
+default 20/40, TS-D15) to bound OpenBao read-amplification if it's hit
+repeatedly.
+
+The only *outbound* rate limiting in this codebase is the Realm
+Provisioner's own `KEYCLOAK_RATE_LIMIT_RPS` on its Keycloak Admin API
+calls — this service never calls Keycloak (TS-INV-1) and has no
+equivalent outbound limiter of its own; its one outbound HTTP dependency
+(RP-17, `internal/adapter/outbound/realmprovisioner`) instead retries a
+bounded number of times on a plausibly-transient failure (TS-D15) rather
+than rate-limiting.
+
+### 11. Background reconcilers you may observe
 
 `cmd/rotator` runs an overlap-expiry sweep and an orphan-material
 reconciler on a cron schedule; both are read-only from any other service's
 perspective — they only ever touch this service's own rows and its own
-OpenBao paths.
+OpenBao paths, plus (since TS-D15) a call to the Realm Provisioner's RP-17
+after every automatic revoke. `cmd/scheduler` (§16 TSQ-6 Resolved,
+TS-D14) runs on its own cron schedule and *is* visible to other
+services: it calls TS-1 automatically for any principal past its
+`next_rotation_at`, emitting the same `…CredentialIssued`/`…CredentialRotated`
+events an operator-triggered rotation would, then calls RP-17 itself.
 
 ---
 
@@ -236,17 +465,46 @@ CronJob-equivalent binary via `make docker-run-rotator`.
 
 ### Common commands
 
-| Command | Purpose |
+| Command | Description |
 |---|---|
-| `make build` | Compile all three binaries |
-| `make test` | Unit + contract + Postgres + integration suites, in parallel |
-| `make test-unit` | Unit tests only, no containers |
-| `make lint` | `go-arch-lint` + `golangci-lint` |
-| `make gates` | The three invariant gates (`no-gocloak`, `no-secret-log`, `set-local-only`) + `gincommon-obs` |
-| `make fmt` / `make vet` | Format / vet |
-| `make swag` | Regenerate the Swagger/OpenAPI spec from handler annotations |
-| `make godoc` | Serve package documentation locally |
-| `make help` | List every target with its one-line description |
+| `make setup` | Copy `.env-example` → `.env` if missing; install `.githooks/pre-commit` |
+| `make install-hooks` | Install `.githooks/pre-commit` (also run by `make setup`) |
+| `make tidy` / `make fmt` / `make fmt-check` / `make vet` | Go basics; `fmt-check` mirrors CI, does not modify files |
+| `make lint` | `golangci-lint` (via `go tool`) |
+| `make gates` | The 5 invariant gates: `no-gocloak`, `no-secret-log`, `set-local-only`, `gincommon-obs`, `metrics-taxonomy` |
+| `make mod-verify` | `go mod verify` |
+| `make vuln-check` | `govulncheck` on `./internal/...`/`./pkg/...` |
+| `make sast` | `gosec` Go-code SAST — distinct from `vuln-check` (dependency CVEs) and the release pipeline's Trivy scan (container/OS CVEs) |
+| `make test` | Unit + contract + Postgres + integration suites, in parallel (Docker required) |
+| `make test-ci` | Same, with `-race` + merged coverage (what CI runs) |
+| `make test-unit` | Unit tests only, no Docker |
+| `make test-contract` | Event-contract tests, no external services |
+| `make test-postgres` | Postgres + RLS integration (testcontainers-go) |
+| `make test-integration` | Cross-layer (Postgres + OpenBao via testcontainers) |
+| `make test-e2e` | End-to-end tests |
+| `make test-smoke` | CI-only image gate: size ≤200MB + startup-gate check (`IMAGE_TAG`+`BINARY` required) |
+| `make race` | All four suites with `-race`, no coverage merge |
+| `make run` / `make run-consumer` / `make run-scheduler` | Run `cmd/server` / `cmd/consumer` (`APP_PORT=8081`) / one `cmd/scheduler` scan pass (`METRICS_PORT=9092`) natively |
+| `make build` | Compile all four binaries to `bin/` |
+| `make cover` / `make cover-func` | Coverage HTML report / per-function summary |
+| `make ci` | `tidy` + `fmt-check` + `vet` + `lint` + `gates` + `test-ci` + `build` |
+| `make docker-up` / `make docker-down` | Start/stop Postgres + PgBouncer + Floci + Floci UI + OpenBao (infra only, no app containers) |
+| `make docker-run-app` | Build + run the containerized server+consumer (requires `.go_private_token`) |
+| `make docker-run-rotator` / `make docker-run-scheduler` | Run the rotator / scheduler once via Docker, then exit (requires `.go_private_token`) |
+| `make extract-schemas` | Derive `internal/adapter/outbound/eventbus/schemas/*.json` from `api/asyncapi.yaml` |
+| `make swag` | Generate Swagger docs into `docs/swagger/` from handler annotations — re-run and commit whenever they change |
+| `make swag-check` | Fails if regenerating Swagger docs would change `docs/swagger/` (CI drift gate) |
+| `make schema-pull` | Pull the `platform-schemagov` Docker image (`0.4`) |
+| `make schema-validate` | Validate AsyncAPI + this service's 5 event schemas — no AWS credentials needed |
+| `make schema-diff CURRENT=… PROPOSED=…` | Show compatibility diff between two schema files |
+| `make schema-register` | Register this service's 5 event schemas to the Glue registry (requires AWS) |
+| `make schema-verify` | Pre-deploy check that all 5 of this service's schemas exist in the target registry |
+| `make schema-prune` | Dry-run: list orphaned Glue schemas (`EXECUTE=true` to archive+delete) |
+| `make pin-base-images` | Fetch and pin the current SHA digests for the Dockerfile's base images |
+| `make godoc` | Serve package documentation locally (pkgsite, `:8080`) |
+| `make docs-serve` | Runs the server, then prints the three docs URLs (`/`, `/swagger`, `/asyncapi`) |
+| `make clean` | Remove `bin/`, `.coverage/`, and coverage artifacts |
+| `make help` | Print the same command list this table documents, from the Makefile itself |
 
 ### Running a single test
 
@@ -422,7 +680,7 @@ profiles with a max-count strategy, and enforces the CI coverage floor in
 | `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` | — | `platform-pgcommon` DB config (app pool) |
 | `PG_MAX_CONNS`/`PG_MIN_CONNS`/`PG_BOUNCER_MODE`/`PG_STATEMENT_TIMEOUT` | `20`/`0`/`true`/unset | Pool sizing and PgBouncer transaction-pooling mode |
 | `MIGRATION_DATABASE_URL` | direct port | Bypasses PgBouncer for migrations (`pg_advisory_lock` is session-scoped) |
-| `RECONCILER_DATABASE_URL` | direct port | `serviceaccount_reconciler` (`BYPASSRLS`, `SELECT`-only) pool for `cmd/rotator` |
+| `RECONCILER_DATABASE_URL` | direct port | `serviceaccount_reconciler` (`BYPASSRLS`, `SELECT`-only) pool for `cmd/rotator` and `cmd/scheduler` |
 | `OPENBAO_ADDR`, `OPENBAO_ROLE`, `OPENBAO_KV_MOUNT` | `http://localhost:8210`, `iam-token-service`, `iam` | OpenBao Kubernetes-auth login + KV v2 mount |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL` | `ap-south-1`, `test`/`test`, Floci endpoint | AWS SDK config (Floci locally, real AWS in deployed environments) |
 | `GLUE_REGISTRY_NAME` | `iam-serviceaccount-events` | Glue Schema Registry name |
@@ -445,7 +703,7 @@ comments — this table is a curated summary, not a substitute.
 |---|---|
 | Tenant isolation | `FORCE ROW LEVEL SECURITY` on both tenant-scoped tables; the policy predicate fails closed (no GUC → zero rows / write rejected) |
 | GUC scoping | `SET LOCAL app.tenant_id`, transaction-local only — never a session-wide `SET`, which would leak across a pooled connection |
-| Cross-tenant enumeration role | `serviceaccount_reconciler` — `BYPASSRLS` but grantless beyond `SELECT`; used only by `cmd/rotator` |
+| Cross-tenant enumeration role | `serviceaccount_reconciler` — `BYPASSRLS` but grantless beyond `SELECT`; used only by `cmd/rotator` and `cmd/scheduler` (every resulting write still goes through RLS-scoped `serviceaccount_app`) |
 | Privilege separation | Three distinct roles (`serviceaccount_app`/`_migrator`/`_reconciler`), each scoped to exactly what its call sites need |
 | No Keycloak credential | This service has no `gocloak` dependency and no Keycloak Admin credential anywhere (TS-INV-1, CI-enforced) |
 | Secret-in-Postgres / secret-in-logs | Structurally impossible by design (TS-INV-2) — the CI `no-secret-log` gate fails the build if a credential field name reaches a log/trace sink |
@@ -512,20 +770,22 @@ Structured `slog` JSON logs carry `tenant_id`/`principal_id`/`version`/`op`/
 
 ## Deployment
 
-### Container image — three binaries
+### Container image — four binaries
 
 | Binary | Entrypoint | Purpose |
 |---|---|---|
-| `cmd/server` | `/iam-token-service` (default) | HTTP API (TS-1..TS-4) + outbox runner |
+| `cmd/server` | `/iam-token-service` (default) | HTTP API (TS-1..TS-5 + EXT-6 JWKS route) + outbox runner |
 | `cmd/consumer` | `/iam-token-service-consumer` | Offboarding SQS subscriber |
 | `cmd/rotator` | `/iam-token-service-rotator` | Overlap-expiry sweep + orphan-material reconciler + prune, run-to-completion |
+| `cmd/scheduler` | `/iam-token-service-scheduler` | Automatic cadence-driven rotation scan + RP-17 key-refresh call (§16 TSQ-6 Resolved, TS-D14), run-to-completion |
 
 ### Helm chart
 
 `deploy/helm/` — `Deployment` × 2 (server, consumer, each `replicaCount: 2`
-for HA, not load), `CronJob` × 1 (rotator — `activeDeadlineSeconds: 240s`,
-deliberately shorter than its 5-minute schedule so a run never eats into
-the next scheduled tick under `concurrencyPolicy: Forbid`), `NetworkPolicy`
+for HA, not load), `CronJob` × 2 (rotator and scheduler — each
+`activeDeadlineSeconds: 240s`, deliberately shorter than its 5-minute
+schedule so a run never eats into the next scheduled tick under
+`concurrencyPolicy: Forbid`), `NetworkPolicy`
 restricting ingress to in-mesh callers (`networkPolicy.ingressNamespaceSelector`
 is required — the render fails if left unset), `ServiceAccount` bound to
 the OpenBao Kubernetes-auth role, `PrometheusRule` + `ServiceMonitor`,
@@ -612,6 +872,73 @@ docker build -t iam-token-service --secret id=go_private_token,src=.go_private_t
 `GET /healthz` (liveness, pre-auth) and `GET /readyz` (readiness — checks
 DB + OpenBao reachability) are registered before the auth middleware.
 
+### Networking reference
+
+| What you want to reach | Hostname inside Docker (compose network) | Hostname from the host |
+|---|---|---|
+| This service's API | `server:8080` | `localhost:8080` |
+| This service's `/metrics` | `server:9090` | `localhost:9090` |
+| PostgreSQL | `postgres:5432` | `localhost:5535` |
+| PgBouncer | `pgbouncer:5432` | `localhost:5536` |
+| Floci (SNS/SQS/Glue) | `floci:4566` | `localhost:4568` |
+| Floci UI | `floci-ui:4500` | `localhost:4502` |
+| OpenBao | `openbao:8200` | `localhost:8210` |
+
+### Calling the service from another container
+
+```bash
+# From inside another container on the same compose network — TS-1,
+# issue/rotate, the crux endpoint. Only ever returns the plaintext
+# private key to THIS caller, and only once (TS-INV-2).
+curl -X POST http://server:8080/api/v1/internal/tenants/<tenant-uuid>/service-accounts/<principal-uuid>/credentials \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: 00000000-0000-0000-0000-0000000000a1" \
+  -H "x-tenant-id: <tenant-uuid>" \
+  -d '{"rotation_id":"'"$(uuidgen)"'","overlap_seconds":300}'
+```
+
+### Integrating into another project's `docker-compose.yml`
+
+```yaml
+services:
+  iam-token-service:
+    image: ghcr.io/bcbp-solutions-fzc-llc/iam-token-service:latest
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      APP_ENV: dev
+      PG_HOST: iam-postgres
+      PG_PORT: "5432"
+      PG_USER: serviceaccount_app
+      PG_PASSWORD: devpassword
+      PG_DBNAME: serviceaccount
+      PG_SSLMODE: disable
+      MIGRATION_DATABASE_URL: postgres://serviceaccount_migrator:devpassword@iam-postgres:5432/serviceaccount?sslmode=disable
+      RECONCILER_DATABASE_URL: postgres://serviceaccount_reconciler:devpassword@iam-postgres:5432/serviceaccount?sslmode=disable
+      OPENBAO_ADDR: http://iam-openbao:8200
+      OPENBAO_ROLE: iam-token-service
+      OPENBAO_KV_MOUNT: iam
+      AWS_REGION: ap-south-1
+      AWS_ENDPOINT_URL: http://iam-floci:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      GLUE_REGISTRY_NAME: iam-serviceaccount-events
+      SQS_OFFBOARDING_QUEUE_URL: http://iam-floci:4566/000000000000/tenant-lifecycle-tokensvc-q
+    depends_on:
+      iam-postgres:
+        condition: service_healthy
+```
+
+This starts `cmd/server` only — `cmd/consumer`, `cmd/rotator`, and
+`cmd/scheduler` are the same image with a different `command`/`entrypoint`
+(see "Container image — four binaries" above); `cmd/rotator` and
+`cmd/scheduler` additionally need `REALM_PROVISIONER_BASE_URL` (RP-17) to
+do anything useful. The chart-level source for the image path is
+`deploy/helm/values.yaml`'s `image.repository`
+(`ghcr.io/bcbp-solutions-fzc-llc/iam-token-service`); no `v*` release tags
+exist yet — pin `main`-branch images by digest, not `latest`.
+
 ### Minimum required environment variables
 
 ```bash
@@ -626,9 +953,10 @@ AWS_REGION=ap-south-1 AWS_ENDPOINT_URL=http://localhost:4568 GLUE_REGISTRY_NAME=
 
 | Direction | Service | Relationship |
 |---|---|---|
-| Called by | Realm Provisioner | TS-4 (register), TS-1 (issue/rotate) — RP applies the returned secret to Keycloak |
-| Called by | Org & Membership, operators | TS-3 (read metadata) |
-| Called by | Operators, this service's own rotation CronJob | TS-1 (rotate), TS-2 (revoke) |
+| Called by | Realm Provisioner | TS-4 (register), TS-1 (issue/rotate) — RP discards the returned private-key plaintext immediately and calls Keycloak's `ClearServiceAccountKeysCache` (RP-17) instead, so Keycloak re-fetches this service's own JWKS (EXT-6) |
+| Called by | Org & Membership, operators | TS-3 (read metadata), TS-5 (find-by-sub, AUTH-9 non-member defense-in-depth) |
+| Called by | Keycloak | The EXT-6 JWKS route — the one unauthenticated-by-header, fully public route |
+| Called by | Operators, O&M tooling, `cmd/scheduler` | TS-1 (rotate), TS-2 (revoke) — `cmd/scheduler` automatically rotates any principal past its `next_rotation_at` (LLD §16 TSQ-6 Resolved, TS-D14), then calls RP-17 itself so Keycloak re-fetches the JWKS. `cmd/rotator` never calls TS-1, but it does call RP-17 after every automatic revoke (TS-D15) |
 | Consumes from | Org & Membership / Core | `TenantMembershipsPurged` (tenant-lifecycle topic) |
 | Publishes to | Audit Log | 5 events on `iam-serviceaccount-events` |
 | Never calls | Keycloak Admin API | TS-INV-1 — zero `gocloak` dependency |
@@ -664,7 +992,7 @@ repo yet; the tables below are the closest thing to a contributor guide.
 | [`.claude/request-flows.md`](.claude/request-flows.md) | Per-flow walkthroughs, concurrency, failure handling |
 | [`.claude/operations.md`](.claude/operations.md) | Security, observability, config, deployment, testing |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Detailed architecture narrative with diagrams |
-| [`docs/iam-lld-token-service.md`](docs/iam-lld-token-service.md) | Full LLD (rev 1.0, Approved) — §16 open questions, §17 error taxonomy, §25 frozen name inventory |
+| [`docs/iam-lld-token-service.md`](docs/iam-lld-token-service.md) | Full LLD (rev 1.3, Approved) — §16 open questions, §17 error taxonomy, §25 frozen name inventory |
 | [`docs/observability-registry-proposals.md`](docs/observability-registry-proposals.md) | Tier-1/Tier-2 metric registry submissions pending ratification |
 
 ---

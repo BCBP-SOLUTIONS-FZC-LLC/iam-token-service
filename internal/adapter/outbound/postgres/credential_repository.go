@@ -14,7 +14,8 @@ import (
 // #nosec G101 -- a SQL column list (granted_by/rotation_id are column
 // names), not a credential value.
 const credentialColumns = `id, tenant_id, principal_id, version, status, openbao_path, granted_by,
-	rotation_id, record_version, issued_at, updated_at, rotated_at, expires_at, revoked_at, deleted_at`
+	rotation_id, record_version, issued_at, updated_at, rotated_at, expires_at, revoked_at, deleted_at,
+	rotation_cadence_days, next_rotation_at`
 
 // CredentialRepository implements port.CredentialRepository against
 // `service_account_credentials` (§4.2).
@@ -33,7 +34,8 @@ var _ port.CredentialRepository = (*CredentialRepository)(nil)
 func scanCredential(row pgx.Row) (*domain.Credential, error) {
 	var c domain.Credential
 	err := row.Scan(&c.ID, &c.TenantID, &c.PrincipalID, &c.Version, &c.Status, &c.OpenBaoPath, &c.GrantedBy,
-		&c.RotationID, &c.RecordVersion, &c.IssuedAt, &c.UpdatedAt, &c.RotatedAt, &c.ExpiresAt, &c.RevokedAt, &c.DeletedAt)
+		&c.RotationID, &c.RecordVersion, &c.IssuedAt, &c.UpdatedAt, &c.RotatedAt, &c.ExpiresAt, &c.RevokedAt, &c.DeletedAt,
+		&c.RotationCadenceDays, &c.NextRotationAt)
 	if err != nil {
 		return nil, err
 	}
@@ -171,10 +173,12 @@ func (r *CredentialRepository) Insert(ctx context.Context, c *domain.Credential)
 		}
 		err := tx.QueryRow(ctx, `
 			INSERT INTO service_account_credentials
-				(tenant_id, principal_id, version, status, openbao_path, granted_by, rotation_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(tenant_id, principal_id, version, status, openbao_path, granted_by, rotation_id,
+				 rotation_cadence_days, next_rotation_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			RETURNING id, record_version, issued_at, updated_at`,
 			c.TenantID, c.PrincipalID, c.Version, c.Status, c.OpenBaoPath, c.GrantedBy, c.RotationID,
+			c.RotationCadenceDays, c.NextRotationAt,
 		).Scan(&c.ID, &c.RecordVersion, &c.IssuedAt, &c.UpdatedAt)
 		if err == nil {
 			_, relErr := tx.Exec(ctx, `RELEASE SAVEPOINT credential_insert`)
@@ -218,6 +222,12 @@ func activeRotationID(ctx context.Context, tx pgx.Tx, tenantID, principalID uuid
 // sweep's expiry-revoke all go through this one method. Returns
 // domain.ErrOptimisticLockConflict on a stale record_version.
 //
+// rotation_cadence_days/next_rotation_at are written verbatim from c on
+// every call (§16 TSQ-6 Resolved) — the service layer nils both fields
+// before demoting an `active` row to `rotating`/`revoked` (only the
+// current active version is ever "due"), so this is a plain pass-through,
+// not conditional logic this repository needs to own.
+//
 // The touch_row trigger (§4.5) bumps record_version and updated_at
 // server-side on every real change; this scans both back into c via
 // RETURNING so a caller chaining a second Update on the same in-memory
@@ -227,10 +237,12 @@ func (r *CredentialRepository) Update(ctx context.Context, c *domain.Credential)
 	return withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
 			UPDATE service_account_credentials SET
-				status = $3, rotated_at = $4, expires_at = $5, revoked_at = $6
+				status = $3, rotated_at = $4, expires_at = $5, revoked_at = $6,
+				rotation_cadence_days = $7, next_rotation_at = $8
 			WHERE id = $1 AND record_version = $2
 			RETURNING record_version, updated_at`,
 			c.ID, c.RecordVersion, c.Status, c.RotatedAt, c.ExpiresAt, c.RevokedAt,
+			c.RotationCadenceDays, c.NextRotationAt,
 		).Scan(&c.RecordVersion, &c.UpdatedAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {

@@ -35,6 +35,13 @@ func (f *fakeReconcilerRepository) ListPrincipalMaterialStates(context.Context) 
 	return f.states, nil
 }
 
+// ListDueForRotation is unused by cmd/rotator (§16 TSQ-6 Resolved,
+// TS-D14 — that's cmd/scheduler's job); stubbed only to satisfy
+// port.ReconcilerRepository.
+func (f *fakeReconcilerRepository) ListDueForRotation(context.Context) ([]port.DueForRotation, error) {
+	return nil, nil
+}
+
 var _ port.ReconcilerRepository = (*fakeReconcilerRepository)(nil)
 
 type fakeCredentialRepository struct {
@@ -192,3 +199,25 @@ func (f *fakeProcessedEventsStore) Prune(context.Context, int, int) (int, error)
 }
 
 var _ port.ProcessedEventsStore = (*fakeProcessedEventsStore)(nil)
+
+// fakeRealmProvisionerClient stubs port.RealmProvisionerClient — an
+// optional per-tenant error lets a test fail exactly one RP-17 key-refresh
+// without affecting the rest of the sweep.
+type fakeRealmProvisionerClient struct {
+	errs      map[uuid.UUID]error
+	refreshed []uuid.UUID // tenantIDs RefreshKeys was called for, in order
+}
+
+func newFakeRealmProvisionerClient() *fakeRealmProvisionerClient {
+	return &fakeRealmProvisionerClient{errs: map[uuid.UUID]error{}}
+}
+
+func (f *fakeRealmProvisionerClient) RefreshKeys(_ context.Context, tenantID uuid.UUID) error {
+	f.refreshed = append(f.refreshed, tenantID)
+	if err, ok := f.errs[tenantID]; ok {
+		return err
+	}
+	return nil
+}
+
+var _ port.RealmProvisionerClient = (*fakeRealmProvisionerClient)(nil)

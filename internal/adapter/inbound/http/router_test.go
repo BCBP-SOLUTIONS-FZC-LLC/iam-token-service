@@ -129,6 +129,25 @@ func TestRouter_DocsSurface_Gating(t *testing.T) {
 	})
 }
 
+// TestRouter_JWKSRoute_RegisteredWhenHandlerPresent covers
+// registerJWKSRoutes' actual registration branch — newFullTestRouter's
+// Handlers.JWKS is otherwise always nil, so every other router test only
+// exercises the early-return.
+func TestRouter_JWKSRoute_RegisteredWhenHandlerPresent(t *testing.T) {
+	tenantID := uuid.New()
+	r := NewRouter(RouterConfig{
+		GinConfig: gincommon.Config{ServiceName: "iam-token-service-test"},
+		Handlers: Handlers{
+			Principal:  NewPrincipalHandler(&fakePrincipalService{}),
+			Credential: NewCredentialHandler(&fakeCredentialService{}),
+			JWKS:       NewJWKSHandler(&fakeJWKSService{keys: []map[string]any{{"kty": "RSA", "kid": "k1"}}}),
+		},
+		Postgres: fakePinger{}, OpenBao: fakePinger{}, Outbox: fakePinger{},
+	})
+	rec := doRequest(t, r.Handler(), http.MethodGet, "/api/v1/internal/tenants/"+tenantID.String()+"/service-accounts/platform-automation/jwks.json", nil, nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
 func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 	tenantID := uuid.New()
 	principalID := uuid.New()

@@ -3,9 +3,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"io"
-	"net"
-	"syscall"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -150,39 +147,6 @@ func (*fakePortLogger) Info(string, map[string]interface{})  {}
 func (*fakePortLogger) Warn(string, map[string]interface{})  {}
 func (*fakePortLogger) Error(string, map[string]interface{}) {}
 
-// ── isNetworkError ──────────────────────────────────────────────────────
-
-// isNetworkError is only ever called from wrapConnErr after an explicit
-// `err == nil` guard — it panics on a literal nil (dereferences err.Error()
-// unconditionally at the bottom), so nil is deliberately not exercised
-// here as it is not part of the function's real call contract.
-func TestIsNetworkError(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"io.EOF", io.EOF, true},
-		{"io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, true},
-		{"net.OpError", &net.OpError{Op: "dial", Err: errors.New("boom")}, true},
-		{"ECONNRESET", syscall.ECONNRESET, true},
-		{"ECONNREFUSED", syscall.ECONNREFUSED, true},
-		{"EPIPE", syscall.EPIPE, true},
-		{"ETIMEDOUT", syscall.ETIMEDOUT, true},
-		{"connection refused message", errors.New("dial tcp: connection refused"), true},
-		{"connection reset message", errors.New("read: connection reset by peer"), true},
-		{"broken pipe message", errors.New("write: broken pipe"), true},
-		{"EOF in message", errors.New("unexpected EOF"), true},
-		{"unrelated syscall errno", syscall.EACCES, false},
-		{"unrelated error", errors.New("unique constraint violation"), false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, isNetworkError(tc.err))
-		})
-	}
-}
-
 // ── wrapConnErr ────────────────────────────────────────────────────────
 
 func pgErr(code string) error {
@@ -228,11 +192,22 @@ func TestWrapConnErr(t *testing.T) {
 		require.ErrorAs(t, got, &de)
 		assert.Equal(t, domain.ErrDBUnavailable, de.Code)
 	})
-	t.Run("network error is remapped to ErrDBUnavailable", func(t *testing.T) {
-		got := wrapConnErr(io.EOF)
-		var de *domain.Error
-		require.ErrorAs(t, got, &de)
-		assert.Equal(t, domain.ErrDBUnavailable, de.Code)
+	t.Run("transport-level error passes through unchanged", func(t *testing.T) {
+		src := errors.New("dial tcp: connection refused")
+		got := wrapConnErr(src)
+		assert.Same(t, src, got)
+	})
+	t.Run("pgx.ErrNoRows passes through unchanged", func(t *testing.T) {
+		got := wrapConnErr(pgx.ErrNoRows)
+		assert.ErrorIs(t, got, pgx.ErrNoRows)
+	})
+	t.Run("context.Canceled passes through unchanged", func(t *testing.T) {
+		got := wrapConnErr(context.Canceled)
+		assert.ErrorIs(t, got, context.Canceled)
+	})
+	t.Run("context.DeadlineExceeded passes through unchanged", func(t *testing.T) {
+		got := wrapConnErr(context.DeadlineExceeded)
+		assert.ErrorIs(t, got, context.DeadlineExceeded)
 	})
 	t.Run("business SQL error passes through unchanged", func(t *testing.T) {
 		src := pgErr("23505") // unique_violation

@@ -4,11 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
@@ -183,12 +180,17 @@ func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) e
 // iam-user-profile / iam-org-membership). Class 57 (operator
 // intervention) and 58 (system error) have no dedicated helper yet and
 // are matched on the pgconn Error() text. puddle.ErrClosedPool is the
-// other positively-identifiable connectivity failure. Transport-level
-// IO/network errors that never reached Postgres (EOF, ECONNRESET, …)
-// are also remapped so HTTP HandleError returns 503 rather than 500.
+// other positively-identifiable connectivity failure.
 //
 // Everything else — including a caller's own business error returned
-// from inside RunInTx/withPool — passes through unchanged.
+// from inside RunInTx/withPool, and a transport-level failure that never
+// reached Postgres — passes through unchanged. Defaulting unrecognized
+// errors to ErrDBUnavailable (as this used to, via a hand-rolled
+// isNetworkError remap) silently discarded the caller's real error under
+// a misleading "database unavailable" 503 — the bug fixed in
+// iam-user-profile / iam-org-membership. HTTP HandleError independently
+// classifies a leaked PgError of these same connectivity/resource
+// classes into 503 via the same pgcommon helpers.
 func wrapConnErr(err error) error {
 	if err == nil {
 		return nil
@@ -200,37 +202,7 @@ func wrapConnErr(err error) error {
 	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
 		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
 	}
-	if isNetworkError(err) {
-		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
-	}
 	return err
-}
-
-// isNetworkError reports whether err is a Go-level network/IO failure that
-// pgx surfaces when the TCP connection to Postgres is lost mid-flight.
-// These never reach the SQLSTATE classification path because pgx never
-// received a protocol response — they are unambiguously availability
-// failures (503).
-func isNetworkError(err error) bool {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		return true
-	}
-	var sysErr syscall.Errno
-	if errors.As(err, &sysErr) {
-		switch sysErr { //nolint:exhaustive // only transient-connection codes are retryable
-		case syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT:
-			return true
-		}
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "EOF")
 }
 
 // isOperatorOrSystemErrorSQLState reports whether err is a Postgres error

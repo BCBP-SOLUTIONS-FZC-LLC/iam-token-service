@@ -125,6 +125,37 @@ services:
     environment:
       <<: *common-env
       PROCESSED_EVENTS_TTL_DAYS: "8"
+      # cmd/rotator now calls RP-17 after every automatic revoke too
+      # (TS-D15) — same "no reachable target in this compose stack" caveat
+      # as -scheduler's identical setting below.
+      REALM_PROVISIONER_BASE_URL: "http://iam-realm-provisioner:8080"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+
+  # The automatic cadence-driven rotation scan (§16 TSQ-6 Resolved,
+  # TS-D14, cmd/scheduler's package doc comment) — run-to-completion,
+  # exits when done, exactly like the CronJob it stands in for locally.
+  # REALM_PROVISIONER_BASE_URL has no reachable target in this compose
+  # stack (the Realm Provisioner is a separate repo/service) — a run that
+  # actually finds a due row will succeed at IssueOrRotate and then fail
+  # the RP-17 relay, exactly like OpenBao's Kubernetes-auth note above:
+  # local dev work that needs a live end-to-end rotation must point this
+  # at a running iam-realm-provisioner instance. Kept out of the default
+  # `docker compose up` via the "scheduler" profile; invoke explicitly:
+  #   docker compose --profile scheduler run --rm scheduler
+  scheduler:
+    build:
+      context: .
+      secrets:
+        - go_private_token
+    entrypoint: ["/iam-token-service-scheduler"]
+    profiles: ["scheduler"]
+    environment:
+      <<: *common-env
+      REALM_PROVISIONER_BASE_URL: "http://iam-realm-provisioner:8080"
     depends_on:
       pgbouncer:
         condition: service_healthy

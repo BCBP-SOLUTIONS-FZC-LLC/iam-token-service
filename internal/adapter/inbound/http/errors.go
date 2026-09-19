@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
 // errorLogger is the shared gincommon-backed Logger, set once by NewRouter.
@@ -63,14 +65,27 @@ func writeInvalidRequest(c *gin.Context, field, reason string) {
 
 // HandleError maps a *domain.Error to its frozen §17 status/code, or falls
 // back to 500 internal_error for anything unclassified (logged so an
-// unhandled error path is never silent). The postgres adapter's wrapConnErr
-// already maps every connectivity/resource SQLSTATE to
-// domain.ErrDBUnavailable before an error can reach a handler (§9.4), so
-// the *domain.Error branch below is the only expected production path.
+// unhandled error path is never silent). wrapConnErr maps SQLSTATE
+// 08/53/57/58 to domain.ErrDBUnavailable before an error can reach a
+// handler (§9.4), so the *domain.Error branch is the production path.
+// The pgcommon fallback still classifies a leaked PgError (tests, future
+// missed wrap) into 503 db_unavailable without importing pgconn —
+// matching iam-user-profile / iam-org-membership.
 func HandleError(c *gin.Context, err error) {
 	var de *domain.Error
 	if errors.As(err, &de) {
 		writeError(c, string(de.Code), de.Status(), de.Details)
+		return
+	}
+	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) {
+		if errorLogger != nil {
+			fields := map[string]interface{}{"error_type": fmt.Sprintf("%T", err), "error": err.Error()}
+			if tid := gincommon.TraceIDFromContext(c); tid != "" {
+				fields["trace_id"] = tid
+			}
+			errorLogger.Error("database unavailable", fields)
+		}
+		writeError(c, string(domain.ErrDBUnavailable), http.StatusServiceUnavailable, nil)
 		return
 	}
 	if errorLogger != nil {
@@ -81,4 +96,14 @@ func HandleError(c *gin.Context, err error) {
 		errorLogger.Error("unhandled 500 error", fields)
 	}
 	writeError(c, "internal_error", http.StatusInternalServerError, nil)
+}
+
+// isOperatorOrSystemErrorSQLState reports SQLSTATE class 57/58 without
+// importing pgconn — pgcommon v1.3.0 covers 08/53 but not these two.
+func isOperatorOrSystemErrorSQLState(err error) bool {
+	if !pgcommon.IsPgError(err) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
 }

@@ -36,6 +36,7 @@ TEST_POSTGRES_PARALLEL ?= 4
 
 # White-box (package-internal) tests included in unit runs.
 TEST_INTERNAL_PKGS := ./cmd/rotator/... \
+                      ./cmd/scheduler/... \
                       ./cmd/server/... \
                       ./cmd/consumer/... \
                       ./internal/adapter/inbound/http/... \
@@ -44,6 +45,8 @@ TEST_INTERNAL_PKGS := ./cmd/rotator/... \
                       ./internal/adapter/outbound/openbao/... \
                       ./internal/adapter/outbound/postgres/... \
                       ./internal/adapter/outbound/metrics/... \
+                      ./internal/adapter/outbound/realmprovisioner/... \
+                      ./internal/adapter/outbound/httpx/... \
                       ./internal/core/port/... \
                       ./internal/core/domain/... \
                       ./internal/core/service/... \
@@ -124,7 +127,8 @@ help:
 	@echo "  make race            - all tests with -race flag"
 	@echo "  make run             - run the server locally (go run)"
 	@echo "  make run-consumer    - run the consumer locally (go run; APP_PORT=8081)"
-	@echo "  make build           - compile all three binaries to bin/"
+	@echo "  make run-scheduler   - run one cadence-scheduler scan pass locally (go run; METRICS_PORT=9092)"
+	@echo "  make build           - compile all four binaries to bin/"
 	@echo "  make cover           - coverage HTML report"
 	@echo "  make cover-func      - coverage summary by function"
 	@echo "  make ci              - tidy + fmt-check + vet + lint + gates + test-ci + build"
@@ -132,6 +136,7 @@ help:
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make docker-run-app  - build+run the containerized server+consumer (requires .go_private_token)"
 	@echo "  make docker-run-rotator - run the rotator once, then exit (requires .go_private_token)"
+	@echo "  make docker-run-scheduler - run the cadence scheduler once, then exit (requires .go_private_token)"
 	@echo "  make mod-verify      - go mod verify"
 	@echo "  make vuln-check      - govulncheck on internal + pkg"
 	@echo "  make sast            - gosec static-analysis scan (SAST)"
@@ -347,6 +352,13 @@ run-consumer:
 	@-lsof -ti :8081 | xargs kill -9 2>/dev/null; true
 	bash -c 'set -a && source .env && set +a && APP_PORT=8081 METRICS_PORT=9091 BUILD_VERSION=$(BUILD_VERSION) $(GO) run ./cmd/consumer'
 
+# Native scheduler run — one due-list scan pass then exit (§16 TSQ-6
+# Resolved, TS-D14), same run-to-completion shape as cmd/rotator.
+# Overrides METRICS_PORT to 9092 so it doesn't collide with cmd/server.
+.PHONY: run-scheduler
+run-scheduler:
+	bash -c 'set -a && source .env && set +a && METRICS_PORT=9092 BUILD_VERSION=$(BUILD_VERSION) $(GO) run ./cmd/scheduler'
+
 # -----------------------------
 # BUILD
 # -----------------------------
@@ -358,6 +370,7 @@ build:
 	$(GO) build -ldflags "-X main.buildVersion=$(BUILD_VERSION)" -o bin/iam-token-service-server ./cmd/server
 	$(GO) build -ldflags "-X main.buildVersion=$(BUILD_VERSION)" -o bin/iam-token-service-consumer ./cmd/consumer
 	$(GO) build -ldflags "-X main.buildVersion=$(BUILD_VERSION)" -o bin/iam-token-service-rotator ./cmd/rotator
+	$(GO) build -ldflags "-X main.buildVersion=$(BUILD_VERSION)" -o bin/iam-token-service-scheduler ./cmd/scheduler
 	@echo "Verifying library packages compile..."
 	$(GO) build ./internal/... ./pkg/...
 
@@ -391,6 +404,11 @@ docker-run-app:
 docker-run-rotator:
 	@test -f .go_private_token || { echo "ERROR: .go_private_token missing — write a GitHub PAT with read access to BCBP-SOLUTIONS-FZC-LLC private repos into this file (gitignored)"; exit 1; }
 	docker compose --profile rotator run --rm rotator
+
+.PHONY: docker-run-scheduler
+docker-run-scheduler:
+	@test -f .go_private_token || { echo "ERROR: .go_private_token missing — write a GitHub PAT with read access to BCBP-SOLUTIONS-FZC-LLC private repos into this file (gitignored)"; exit 1; }
+	docker compose --profile scheduler run --rm scheduler
 
 .PHONY: docker-down
 docker-down:

@@ -21,9 +21,11 @@ import (
 type PrincipalService interface {
 	Register(ctx context.Context, tenantID uuid.UUID, req service.RegisterRequest, actor uuid.UUID) (*service.RegisterResult, error)
 	ReadPrincipal(ctx context.Context, tenantID, principalID uuid.UUID) (*service.ReadPrincipalResult, error)
+	FindPrincipalBySub(ctx context.Context, tenantID, principalSub uuid.UUID) (*service.FindBySubResult, error)
 }
 
-// PrincipalHandler implements TS-3 (read) and TS-4 (register) (§5.4).
+// PrincipalHandler implements TS-3 (read), TS-4 (register), and TS-5
+// (find-by-sub, AUTH-9) (§5.4).
 type PrincipalHandler struct {
 	svc PrincipalService
 }
@@ -112,11 +114,13 @@ func (h *PrincipalHandler) Register(c *gin.Context) {
 }
 
 type credentialSummaryBody struct {
-	Version     int     `json:"version"`
-	Status      string  `json:"status"`
-	OpenBaoPath string  `json:"openbao_path"`
-	IssuedAt    string  `json:"issued_at"`
-	ExpiresAt   *string `json:"expires_at,omitempty"`
+	Version             int     `json:"version"`
+	Status              string  `json:"status"`
+	OpenBaoPath         string  `json:"openbao_path"`
+	IssuedAt            string  `json:"issued_at"`
+	ExpiresAt           *string `json:"expires_at,omitempty"`
+	RotationCadenceDays *int    `json:"rotation_cadence_days,omitempty"`
+	NextRotationAt      *string `json:"next_rotation_at,omitempty"`
 }
 
 type readPrincipalResponseBody struct {
@@ -174,9 +178,15 @@ func (h *PrincipalHandler) Read(c *gin.Context) {
 			s := cr.ExpiresAt.UTC().Format(time.RFC3339)
 			expiresAt = &s
 		}
+		var nextRotationAt *string
+		if cr.NextRotationAt != nil {
+			s := cr.NextRotationAt.UTC().Format(time.RFC3339)
+			nextRotationAt = &s
+		}
 		creds = append(creds, credentialSummaryBody{
 			Version: cr.Version, Status: string(cr.Status), OpenBaoPath: cr.OpenBaoPath,
 			IssuedAt: cr.IssuedAt.UTC().Format(time.RFC3339), ExpiresAt: expiresAt,
+			RotationCadenceDays: cr.RotationCadenceDays, NextRotationAt: nextRotationAt,
 		})
 	}
 
@@ -184,5 +194,55 @@ func (h *PrincipalHandler) Read(c *gin.Context) {
 		PrincipalID: res.PrincipalID, TenantID: res.TenantID, KeycloakClientID: res.KeycloakClientID,
 		PrincipalType: string(res.PrincipalType), Status: string(res.Status), RecordVersion: res.RecordVersion,
 		Credentials: creds,
+	})
+}
+
+// FindBySub implements TS-5: GET
+// /api/v1/internal/tenants/:id/service-accounts?principal_sub=<uuid>
+// (AUTH-9) — a query-param lookup on the existing collection path rather
+// than a new path segment, since a static "by-sub" segment at the same
+// tree position as the existing GET .../service-accounts/:principal_id
+// route would conflict in gin's router (a static segment and a named
+// parameter can't share one position). Deliberately returns only
+// identity/status (principalResponseBody), never credential metadata —
+// callers checking "is this a service account" have no need for it.
+//
+// @Summary      TS-5 — Find service-account principal by Keycloak sub
+// @Description  Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer "does this subject resolve to a service_account-typed Keycloak principal" without ever generating principal_sub itself (TS-INV-1).
+// @Tags         ServiceAccounts
+// @Produce      json
+// @Param        id             path      string  true  "Tenant UUID"          format(uuid)
+// @Param        principal_sub  query     string  true  "Keycloak sub UUID"    format(uuid)
+// @Success      200            {object}  principalResponseBody
+// @Failure      400            {object}  ErrorResponse  "invalid_request"
+// @Failure      401            {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      404            {object}  ErrorResponse  "principal_not_found"
+// @Failure      500            {object}  ErrorResponse
+// @Security     SystemRole
+// @Security     TenantID
+// @Security     UserID
+// @Router       /tenants/{id}/service-accounts [get]
+func (h *PrincipalHandler) FindBySub(c *gin.Context) {
+	rc, ok := requestctx.FromContext(c.Request.Context())
+	if !ok {
+		writeMissingIdentityHeaders(c)
+		return
+	}
+
+	principalSub, err := uuid.Parse(c.Query("principal_sub"))
+	if err != nil {
+		writeInvalidRequest(c, "principal_sub", "must be a UUID")
+		return
+	}
+
+	res, err := h.svc.FindPrincipalBySub(c.Request.Context(), rc.TenantID, principalSub)
+	if err != nil {
+		HandleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, principalResponseBody{
+		PrincipalID: res.PrincipalID, TenantID: res.TenantID,
+		PrincipalType: string(res.PrincipalType), Status: string(res.Status), RecordVersion: res.RecordVersion,
 	})
 }

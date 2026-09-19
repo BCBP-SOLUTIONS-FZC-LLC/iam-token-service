@@ -34,6 +34,13 @@ go.work.sum
 # make test-ci coverage output, bin/ build artifacts
 .coverage/
 bin/
+# A `go build ./cmd/<x>` run at the repo root (rather than `make build`,
+# which always targets bin/) drops a same-named binary here — one
+# `git add -A` from being committed (production-readiness review, TS-D15).
+/server
+/consumer
+/rotator
+/scheduler
 
 # macOS
 .DS_Store

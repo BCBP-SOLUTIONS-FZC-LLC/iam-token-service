@@ -22,11 +22,6 @@ var migrationsFS embed.FS
 // pg_advisory_lock which is session-scoped (§4.4/TS-CONFIG-2). MUST run
 // AFTER outbox.ApplySchema (MIG-2 — the domain migration ALTERs
 // outbox_events, which must already exist).
-// RunMigrations applies all pending domain migrations against dsn. Uses the
-// direct Postgres DSN (bypassing PgBouncer) because the runner acquires a
-// pg_advisory_lock which is session-scoped (§4.4/TS-CONFIG-2). MUST run
-// AFTER outbox.ApplySchema (MIG-2 — the domain migration ALTERs
-// outbox_events, which must already exist).
 //
 // log is optional (variadic so existing call sites keep compiling) — when
 // provided, each migration step is logged through it via LoggerAdapter

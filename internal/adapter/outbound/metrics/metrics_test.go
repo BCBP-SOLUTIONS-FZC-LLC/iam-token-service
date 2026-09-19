@@ -56,11 +56,32 @@ func TestRegister_IsIdempotentAndRegistersAllCollectors(t *testing.T) {
 	assert.NotNil(t, OffboardingCascadeTotal)
 	assert.NotNil(t, RotationSweepTotal)
 	assert.NotNil(t, MaterialReconcileTotal)
+	assert.NotNil(t, CadenceRotationTotal)
+	assert.NotNil(t, JWKSKeyErrorsTotal)
 	assert.NotNil(t, ProcessedEventsDuplicates)
 	assert.NotNil(t, UnknownEventAcknowledged)
 	assert.NotNil(t, DependencyRequestDuration, "Tier 1 (registry-proposed)")
 	assert.NotNil(t, DuplicateMessagesTotal, "Tier 1 (registry-proposed)")
 	assert.NotNil(t, IAMOffboardingCascadeTotal, "Tier 2 (proposed for the IAM Domain Metric Registry)")
+
+	// A collector being non-nil only proves it was constructed, not that
+	// it was actually passed to MustRegister — CadenceRotationTotal was
+	// constructed but never registered from when it was first added until
+	// this production-readiness review (TS-D15), so its own alert
+	// (IAMTokenServiceCadenceRotationFailures) could never have fired.
+	// re-MustRegister-ing an already-registered collector panics
+	// ("duplicate metrics collector registration attempted"); if it
+	// *doesn't* panic here, that's this exact bug recurring.
+	for _, c := range []prometheus.Collector{
+		CredentialsIssuedTotal, RotationOverlapActive, OpenBaoCallDuration,
+		OffboardingCascadeTotal, RotationSweepTotal, MaterialReconcileTotal,
+		CadenceRotationTotal, JWKSKeyErrorsTotal, ProcessedEventsDuplicates,
+		UnknownEventAcknowledged, DependencyRequestDuration, DuplicateMessagesTotal,
+		IAMOffboardingCascadeTotal,
+	} {
+		assert.Panics(t, func() { gincommon.MetricsRegisterer().MustRegister(c) },
+			"%T was constructed but never actually passed to MustRegister in registerMetrics", c)
+	}
 }
 
 // TestTier1Labels_CarryDomainServiceEnvironment and

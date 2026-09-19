@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/openbao"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
@@ -181,9 +183,11 @@ func main() {
 	txRunner := pgadapter.NewTxRunner(pool, outboxPublisher)
 
 	// ── 7. Core services ──────────────────────────────────────────────────
-	credentialSvc := service.NewCredentialService(principalRepo, credentialRepo, instrumentedSecrets, txRunner, log, nil)
+	credentialSvc := service.NewCredentialService(principalRepo, credentialRepo, instrumentedSecrets, txRunner, log, nil).
+		WithCadenceDays(envInt("ROTATION_DEFAULT_CADENCE_DAYS", domain.DefaultCadenceDays))
 	principalSvc := service.NewPrincipalService(principalRepo, credentialRepo, txRunner)
 	instrumentedCredentialSvc := metrics.NewInstrumentedCredentialService(credentialSvc) // iam_token_service_credentials_issued_total
+	jwksSvc := service.NewJWKSService(principalRepo, credentialRepo, instrumentedSecrets, log)
 
 	// ── 8. Glue codec + SNS publisher + outbox runner (§7.3.1, §7.4) ──────
 	// Both GLUE_REGISTRY_NAME and SNS_TOPIC_SERVICEACCOUNT_ARN are read
@@ -240,6 +244,8 @@ func main() {
 		Handlers: httpadapter.Handlers{
 			Principal:  httpadapter.NewPrincipalHandler(principalSvc),
 			Credential: httpadapter.NewCredentialHandler(instrumentedCredentialSvc),
+			JWKS: httpadapter.NewJWKSHandler(jwksSvc).
+				WithRateLimit(envFloat("JWKS_RATE_LIMIT_RPS", 20), envInt("JWKS_RATE_LIMIT_BURST", 40)),
 		},
 		Postgres: pingerFunc(func(ctx context.Context) error {
 			if hs := pool.Health(ctx); !hs.Healthy {
@@ -331,6 +337,24 @@ func (f pingerFunc) Health(ctx context.Context) error { return f(ctx) }
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
 	}
 	return def
 }

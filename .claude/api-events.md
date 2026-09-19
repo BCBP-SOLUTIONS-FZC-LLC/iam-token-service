@@ -40,11 +40,15 @@ on `/api/v1/internal/*`.
 | TS-1 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials` | Issue or rotate — returns plaintext once | Per `rotation_id` |
 | TS-2 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials/:version/revoke` | Revoke one version | Yes (re-revoke is a no-op) |
 | TS-3 | `GET /api/v1/internal/tenants/:id/service-accounts/:principal_id` | Read metadata — never a secret | Read |
+| TS-5 | `GET /api/v1/internal/tenants/:id/service-accounts?principal_sub=<uuid>` | Find by Keycloak `sub` (AUTH-9, TS-D16) — identity/status only, never credential metadata; used by org-membership's non-member defense-in-depth check | Read |
 | TS-H | `GET /healthz`, `GET /readyz` | Liveness/readiness | Read |
 | TS-D | `GET /asyncapi`, `GET /asyncapi.yaml`, `GET /swagger/*any` | Rendered/raw contracts (gated) | Read |
+| — | `GET .../service-accounts/platform-automation/jwks.json` | EXT-6: public JWK Set for Keycloak's client-jwt authenticator; the one unauthenticated-by-header route, rate-limited | Read |
 
-No listing endpoint (`GET .../service-accounts`) at MVP — exactly one
-automation principal per tenant, read directly by TS-3.
+`GET .../service-accounts` is not a listing endpoint — TS-5's
+`principal_sub` query parameter is required, and the response is a single
+principal or `404`, never a collection. Exactly one automation principal
+per tenant, read directly by TS-3 or TS-5.
 
 ## 5.5 Status codes (full taxonomy in `internal/core/domain/errors.go`)
 

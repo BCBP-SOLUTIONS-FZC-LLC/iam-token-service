@@ -6,10 +6,24 @@ ingress rule accepts traffic from outside the mesh namespace(s) — enforced
 by requiring a real namespaceSelector below; an empty `{}` selector would
 match every namespace in the cluster, not just the mesh, which is exactly
 the "no restriction at all" outcome this policy exists to prevent.
+
+Keycloak is a second, separate required ingress source (§10.2, EXT-6/rev
+1.3 completeness fix, TS-D15): its own outbound `jwks.url` fetch against
+GET .../service-accounts/platform-automation/jwks.json carries none of
+the x-user-id/x-tenant-id headers every other route on this prefix
+requires, so it cannot be folded into the same "mesh" selector as
+RP/O&M/operators unless Keycloak happens to already run in that
+namespace — keycloakNamespaceSelector lets it be scoped separately,
+wherever Keycloak actually runs, with the identical fail-closed posture as
+ingressNamespaceSelector above (no safe default; an empty selector is a
+silent open-to-the-cluster, not a restriction).
 */}}
 {{- if .Values.networkPolicy.enabled }}
 {{- if not .Values.networkPolicy.ingressNamespaceSelector }}
 {{- fail "networkPolicy.ingressNamespaceSelector is required when networkPolicy.enabled is true — an empty selector matches every namespace in the cluster (no restriction). Set it to a real namespace label selector scoping ingress to your mesh namespace(s), e.g. {matchLabels: {mesh: iam}}. See values.yaml." }}
+{{- end }}
+{{- if not .Values.networkPolicy.keycloakNamespaceSelector }}
+{{- fail "networkPolicy.keycloakNamespaceSelector is required when networkPolicy.enabled is true — the platform-automation JWKS route (EXT-6) needs Keycloak's own outbound fetch admitted separately from ingressNamespaceSelector, since Keycloak's request carries no caller identity and may not live in the same namespace as the RP/O&M/operator mesh. Set it to a real namespace label selector, e.g. {matchLabels: {app: keycloak}}. See values.yaml." }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -31,6 +45,18 @@ spec:
       ports:
         - port: http
         - port: metrics
+    # Keycloak's client-jwt authenticator fetch (EXT-6) — JWKS only, in
+    # practice, but NetworkPolicy has no path-level granularity; the JWKS
+    # route's own security model is network-trust-plus-RLS-from-path
+    # rather than header auth (§5.6), so this coarser port-level rule
+    # doesn't weaken any other route's actual gate (RequireAuth/
+    # GUCBridgeMiddleware still reject a header-less request everywhere
+    # else on this port).
+    - from:
+        - namespaceSelector:
+            {{- .Values.networkPolicy.keycloakNamespaceSelector | toYaml | nindent 12 }}
+      ports:
+        - port: http
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
 ---
@@ -64,7 +90,11 @@ spec:
 # component-specific ingress rule exists for it — it serves /metrics only
 # during its own brief post-run grace window (cmd/rotator/main.go's
 # serveMetricsBriefly) and accepts no inbound HTTP API traffic. It shares
-# this same outbound egress profile (Postgres, OpenBao, AWS, OTel).
+# this same outbound egress profile (Postgres, OpenBao, AWS, OTel), plus
+# one extra egress target -consumer never needs: the Realm Provisioner's
+# internal API (RP-17, TS-D15) — the overlap-expiry sweep must call
+# ClearServiceAccountKeysCache after every revoke (EXT-6/rev 1.3), the
+# same RP-17 dependency -scheduler already has below.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -79,4 +109,33 @@ spec:
     - Egress
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: {{ .Values.networkPolicy.realmProvisionerPort }}
+          protocol: TCP
+---
+# The scheduler CronJob's pods (§16 TSQ-6 Resolved, TS-D14) share the same
+# no-ingress profile as -rotator, plus the same RP-17 egress rule -rotator
+# now also has above (TS-D15) — the Realm Provisioner's internal API, the
+# one outbound HTTP dependency this service has on another IAM service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-scheduler
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "scheduler" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "iam-token-service.egressRules" . | nindent 4 }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: {{ .Values.networkPolicy.realmProvisionerPort }}
+          protocol: TCP
 {{- end }}

@@ -26,13 +26,16 @@ import (
 // (§7.3.1).
 type Publisher struct {
 	source string
-	codec  Codec
+	codec  events.Codec
 	log    port.Logger
 }
 
 // New builds a Publisher that stamps source on every enqueued envelope and
-// validates payloads via codec.
-func New(source string, codec Codec) *Publisher {
+// validates payloads via codec. A nil codec becomes events.NoopCodec.
+func New(source string, codec events.Codec) *Publisher {
+	if codec == nil {
+		codec = events.NoopCodec{}
+	}
 	return &Publisher{source: source, codec: codec}
 }
 

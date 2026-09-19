@@ -3,16 +3,26 @@
 Custodian of the platform-automation service account's rotating credential
 material for the Tender Management SaaS Platform's IAM subsystem: issues,
 rotates, and revokes the per-tenant `platform-automation` Keycloak client's
-secret, custodies the plaintext exclusively in OpenBao (never Postgres),
-and drives the tenant-offboarding credential cleanup cascade.
+keys, custodies the private-key plaintext exclusively in OpenBao (never
+Postgres), and drives the tenant-offboarding credential cleanup cascade.
+Since **EXT-6** (rev 1.3), the mechanism is Keycloak's `client-jwt`/JWKS
+authenticator, not a shared secret: TS-1 generates an RSA-2048 keypair and
+this service serves the public half itself (`GET
+.../service-accounts/platform-automation/jwks.json`, unauthenticated by
+design — Keycloak's own outbound fetch carries no caller identity); the
+Realm Provisioner never receives key material, only triggers Keycloak's
+key-cache refresh (RP-17, `ClearServiceAccountKeysCache`) after every
+rotate/revoke.
 
-The signed-off design is `docs/iam-lld-token-service.md` (rev 1.0,
+The signed-off design is `docs/iam-lld-token-service.md` (rev 1.3,
 Approved) — it is the tie-breaker on any discrepancy between this file and
 reality. A frozen name (LLD §25) or a resolved open question (§16) cannot
 be changed in place; that requires a new LLD revision. Everything else
 (prose sections, the Decision Register §22, runbooks §24) is normal
 living-document maintenance and has been kept current through an
-implementation-phase hardening pass (LLD §22 TS-D13).
+implementation-phase hardening pass (LLD §22 TS-D13) and a
+production-readiness review after the EXT-6/cadence-scheduler work landed
+(LLD §22 TS-D15).
 
 ## What this repo is
 
@@ -35,7 +45,7 @@ self-service (documented Phase-2 extension of the same schema, not built).
 | `make setup` | Copy `.env-example` → `.env`, install git hooks |
 | `make docker-up` | Start infra only (Postgres/PgBouncer/OpenBao/Floci) |
 | `make run` / `make run-consumer` | Run `cmd/server`/`cmd/consumer` natively against that infra |
-| `make build` | Compile all three binaries |
+| `make build` | Compile all four binaries |
 | `make test` / `make test-unit` | Full parallel suite / unit only, no containers |
 | `make test-ci` | Coverage-instrumented, merged pipeline (what CI runs) |
 | `make lint` | `go-arch-lint` + `golangci-lint` |
@@ -49,11 +59,18 @@ self-service (documented Phase-2 extension of the same schema, not built).
 ## Architecture
 
 Clean Architecture (`domain` → `port` → `service` → adapters → `cmd`),
-structurally enforced by `.go-arch-lint.yml`. Three binaries
-(`cmd/server`, `cmd/consumer`, `cmd/rotator`) share one image;
-`cmd/rotator` may **not** depend on `service` — it drives
+structurally enforced by `.go-arch-lint.yml`. Four binaries
+(`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) share one
+image; `cmd/rotator` may **not** depend on `service` — it drives
 `postgres`/`openbao` directly under a `BYPASSRLS` connection for
 cross-tenant enumeration (RLS-7), a privilege no HTTP/event path may hold.
+`cmd/scheduler` (§16 TSQ-6 Resolved, TS-D14) shares that same `BYPASSRLS`
+enumeration for its own due-list scan, but — unlike `cmd/rotator` — *is*
+allowed to depend on `service`: it drives automatic cadence-based
+rotation through the ordinary `CredentialService.IssueOrRotate`, then
+calls RP-17 itself; `cmd/rotator`'s sweep now does the same RP-17 call
+after every automatic revoke (TS-D15) — neither path is complete at
+Keycloak without it under EXT-6 (no self-expiring key-cache TTL exists).
 Full diagrams and per-mechanism deep-dives: root `ARCHITECTURE.md`. Terse
 package-layout/dependency-rule reference for quick lookups:
 `.claude/architecture.md`.
@@ -101,25 +118,69 @@ package-layout/dependency-rule reference for quick lookups:
   prune, one binary invocation per fire. `sweep.go`'s
   `revokeExpiredRotating` reclassifies a write-time
   `optimistic_lock_conflict` as `Skipped`, not `Failed` — the same
-  benign-race handling as TS-2's revoke, just on the other side.
+  benign-race handling as TS-2's revoke, just on the other side. Since
+  TS-D15, it also calls RP-17 (`RealmProvisionerClient.RefreshKeys`)
+  after every commit; a resulting RP-17 failure is `Failed`, not
+  swallowed, since the row is already `revoked` and never re-enumerated.
+- **`cmd/scheduler/{main,scan,helpers}.go`** — run-to-completion CronJob:
+  scans `idx_sac_next_rotation` for `active` rows past due, calls
+  `CredentialService.IssueOrRotate` directly (unlike `cmd/rotator`), then
+  RP-17. An `IssueOrRotate`-committed-but-RP-17-failed outcome is a
+  documented, page-worthy two-halves gap (`cadence_rotation_total{result="failed"}`)
+  — `next_rotation_at` has already advanced, so it will NOT self-heal.
+- **`internal/core/service/jwks_service.go`,
+  `internal/adapter/inbound/http/jwks_handler.go`** — EXT-6's JWKS route.
+  `PublicKeys` returns a `skipped` count (not just a log line) for any
+  live credential whose OpenBao material was unreadable — the handler
+  turns that into `iam_token_service_jwks_key_errors_total` (page-worthy:
+  a live credential going unserved is a real Keycloak auth outage, not a
+  routine "unknown tenant" empty response). The handler also carries a
+  process-wide rate limiter (`WithRateLimit`) and `Cache-Control`/
+  `X-Content-Type-Options` headers — this is the one unauthenticated,
+  fully public route on the service.
+- **`internal/adapter/outbound/realmprovisioner/client.go`** — the RP-17
+  client both `cmd/rotator` and `cmd/scheduler` call. Retries once (2
+  attempts total) on a plausibly-transient failure with a short backoff —
+  deliberately small, because it multiplies directly against how many
+  due/revoked rows one CronJob run can process inside
+  `activeDeadlineSeconds` (see `ROTATOR_RUN_TIMEOUT`/`SCHEDULER_RUN_TIMEOUT`'s
+  own default, tuned in the same review to stay under that same k8s
+  deadline so the graceful in-process exit path always wins).
 - **`internal/core/domain/errors.go`** — the frozen §17 taxonomy plus two
   additive codes (`db_unavailable`, `credential_replay_revoked`), each
   explicitly commented as additive-not-frozen.
+- **`internal/adapter/outbound/postgres/db.go`'s `wrapConnErr`,
+  `internal/adapter/inbound/http/errors.go`'s `HandleError`** (TS-D16) —
+  `db_unavailable` (503) is classified by **positive SQLSTATE
+  identification only** (class `08`/`53`/`57`/`58`, or a closed pool) —
+  never a broad "looks like a network error" heuristic, which used to
+  risk discarding a caller's real business error under a misleading 503.
+  `HandleError` independently re-classifies a leaked `*pgconn.PgError` of
+  the same classes as defense-in-depth against a case `wrapConnErr` itself
+  misses.
 
 ## Data model
 
 Two tenant-scoped tables under `FORCE ROW LEVEL SECURITY`
 (`service_account_principals`, `service_account_credentials`), plus
 `outbox_events` (owned by `platform-events`) and `processed_events`
-(RLS-exempt). One migration so far (dev stage, nothing deployed).
+(RLS-exempt). Two migrations so far (dev stage, nothing deployed): the
+base schema, plus `000002_rotation_cadence` (§16 TSQ-6 Resolved —
+`rotation_cadence_days`/`next_rotation_at` + `idx_sac_next_rotation`).
 Full detail in **[.claude/database-schema.md](database-schema.md)**.
 
 ## API & events
 
-4 routes (TS-1..TS-4) under `/api/v1/internal/*`, no public surface. One
-inbound event subscription (`TenantMembershipsPurged`), 5 frozen outbound
-events on `iam-serviceaccount-events` (single producer). No caching layer
-in this service. Full detail in
+6 routes (TS-1..TS-5 plus the EXT-6 JWKS route) under
+`/api/v1/internal/*`. TS-5 (`GET …/service-accounts?principal_sub=<uuid>`,
+TS-D16) finds a principal by Keycloak sub instead of this service's own
+internal id — org-membership's AUTH-9 non-member defense-in-depth check
+needs it, since a subject's sub is the only identifier that check ever
+sees. The JWKS route is this service's one intentionally public,
+unauthenticated-by-header surface (§5.6) — every other route requires the
+reserved system principal. One inbound event subscription
+(`TenantMembershipsPurged`), 5 frozen outbound events on
+`iam-serviceaccount-events` (single producer). Full detail in
 **[.claude/api-events.md](api-events.md)**.
 
 ## Request flows & concurrency

@@ -54,6 +54,35 @@ func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context) ([]port.
 	return out, nil
 }
 
+// ListDueForRotation enumerates every `active` credential across all
+// tenants whose next_rotation_at has passed (§16 TSQ-6 Resolved) — the
+// exact partial index idx_sac_next_rotation exists for.
+func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context) ([]port.DueForRotation, error) {
+	var out []port.DueForRotation
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT tenant_id, principal_id, version
+			FROM service_account_credentials
+			WHERE status = 'active' AND next_rotation_at IS NOT NULL AND next_rotation_at < now() AND deleted_at IS NULL`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row port.DueForRotation
+			if err := rows.Scan(&row.TenantID, &row.PrincipalID, &row.Version); err != nil {
+				return err
+			}
+			out = append(out, row)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ListPrincipalMaterialStates enumerates the principal registry across all
 // tenants with each principal's committed credential versions (§8.6). A
 // principal with no credential rows yet (freshly registered, TS-1 never

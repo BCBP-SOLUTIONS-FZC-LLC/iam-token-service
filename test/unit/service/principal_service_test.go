@@ -45,11 +45,33 @@ func TestPrincipalService_Register_IdempotentRepeat(t *testing.T) {
 	first, err := svc.Register(ctx, tenantID, req, domain.SystemPrincipalID)
 	require.NoError(t, err)
 
-	second, err := svc.Register(ctx, tenantID, service.RegisterRequest{PrincipalSub: uuid.New(), KeycloakClientID: domain.KeycloakClientPlatformAutomation}, domain.SystemPrincipalID)
+	// An identical repeat (same principal_sub/keycloak_client_id) is a
+	// true no-op — no second event.
+	second, err := svc.Register(ctx, tenantID, req, domain.SystemPrincipalID)
 	require.NoError(t, err)
 	assert.False(t, second.Created)
 	assert.Equal(t, first.PrincipalID, second.PrincipalID)
-	assert.Len(t, events.events, 1, "a repeat register must not emit a second event")
+	assert.Len(t, events.events, 1, "an identical repeat register must not emit a second event")
+}
+
+func TestPrincipalService_Register_CarryOverUpdatesAndEmits(t *testing.T) {
+	svc, _, _, events := newTestPrincipalService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	req := service.RegisterRequest{PrincipalSub: uuid.New(), KeycloakClientID: domain.KeycloakClientPlatformAutomation + "-" + tenantID.String()}
+
+	first, err := svc.Register(ctx, tenantID, req, domain.SystemPrincipalID)
+	require.NoError(t, err)
+
+	// RP-3 conversion: a new dedicated-realm Keycloak client replaces the
+	// trial-realm one — same tenant/principal row, a different sub/clientID.
+	carryOver := service.RegisterRequest{PrincipalSub: uuid.New(), KeycloakClientID: domain.KeycloakClientPlatformAutomation}
+	second, err := svc.Register(ctx, tenantID, carryOver, domain.SystemPrincipalID)
+	require.NoError(t, err)
+	assert.False(t, second.Created, "a carry-over must not report as a fresh 201 create")
+	assert.Equal(t, first.PrincipalID, second.PrincipalID, "carry-over updates the same principal row")
+	require.Len(t, events.events, 2, "a carry-over update must re-emit for audit continuity")
+	assert.Equal(t, domain.EventServiceAccountRegistered, events.events[1].Type)
 }
 
 func TestPrincipalService_Register_InvalidKeycloakClientID(t *testing.T) {
@@ -113,6 +135,30 @@ func TestPrincipalService_ReadPrincipal_ListByPrincipalError(t *testing.T) {
 
 	_, err := svc.ReadPrincipal(ctx, tenantID, p.ID)
 	require.EqualError(t, err, "db unavailable")
+}
+
+func TestPrincipalService_FindPrincipalBySub(t *testing.T) {
+	svc, principals, _, _ := newTestPrincipalService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	res, err := svc.FindPrincipalBySub(ctx, tenantID, p.PrincipalSub)
+	require.NoError(t, err)
+	assert.Equal(t, p.ID, res.PrincipalID)
+	assert.Equal(t, tenantID, res.TenantID)
+	assert.Equal(t, domain.PrincipalStatusActive, res.Status)
+}
+
+func TestPrincipalService_FindPrincipalBySub_NotFound(t *testing.T) {
+	svc, _, _, _ := newTestPrincipalService(t)
+	ctx := context.Background()
+
+	_, err := svc.FindPrincipalBySub(ctx, uuid.New(), uuid.New())
+	require.Error(t, err)
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrPrincipalNotFound, de.Code)
 }
 
 func TestPrincipalService_Register_RepositoryError(t *testing.T) {

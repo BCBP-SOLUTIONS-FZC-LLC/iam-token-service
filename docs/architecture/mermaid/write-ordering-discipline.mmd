@@ -1,0 +1,39 @@
+%% The one write-ordering discipline this service uses, generalized across
+%% TS-1 (issue/rotate), TS-2 (revoke), the overlap sweep, and offboarding —
+%% material-first, then Postgres commit, then (since TS-D14/15) RP-17
+%% AFTER the commit. Two external systems, two different positions
+%% relative to the transaction, for two different reasons.
+sequenceDiagram
+    participant CALLER as Caller (RP / operator / cmd/scheduler)
+    participant SVC as CredentialService
+    participant BAO as OpenBao (material)
+    participant TX as Postgres RunInTx
+    participant OUT as outbox_events
+    participant RP as Realm Provisioner (RP-17)
+
+    Note over SVC,BAO: Phase 1 — material effect, BEFORE any Postgres transaction opens.<br/>A row must never reference material that doesn't exist; the inverse<br/>(material with no row) is the recoverable case, §8.6.
+    CALLER->>SVC: IssueOrRotate / Revoke
+    SVC->>BAO: Write v(n+1) — or — Delete v(n)
+    alt OpenBao unavailable
+        BAO-->>SVC: error
+        SVC-->>CALLER: 502 secret_store_unavailable — NOTHING committed,<br/>fail-closed (no "pending, reconcile later" discipline)
+    else material effect succeeds
+        BAO-->>SVC: ok
+
+        Note over SVC,OUT: Phase 2 — local commit, only after the material effect succeeded
+        SVC->>TX: RunInTx(ctx, func(txCtx))
+        TX->>TX: UPDATE/INSERT service_account_credentials (RLS-scoped)
+        TX->>OUT: Enqueue — same transaction (EVT-1)
+        TX-->>SVC: commit — row + event durable together
+
+        SVC-->>CALLER: 200/201 (plaintext once, on issue/rotate)
+
+        Note over CALLER,RP: Phase 3 — RP-17, AFTER the commit, and only for the callers<br/>that drive it themselves (an operator by hand; cmd/rotator's sweep and<br/>cmd/scheduler's scan automatically, TS-D14/15). Ordered last because it<br/>is the one step this service cannot roll back if it fails — the row is<br/>already durably committed either way.
+        CALLER->>RP: ClearServiceAccountKeysCache
+        alt RP-17 fails
+            RP-->>CALLER: error
+            Note over CALLER: Two-halves gap (TS-INV-7): the row is already committed,<br/>so this is surfaced as a page-worthy Failed outcome, never<br/>silently retried into a possible double-rotation.
+        else RP-17 succeeds
+            RP-->>CALLER: 204 — Keycloak re-fetches this service's JWKS
+        end
+    end

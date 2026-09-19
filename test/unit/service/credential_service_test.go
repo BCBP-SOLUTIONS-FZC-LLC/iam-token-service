@@ -95,6 +95,86 @@ func TestCredentialService_IssueOrRotate_Rotate(t *testing.T) {
 	assert.Equal(t, domain.EventServiceAccountCredentialRotated, events.events[1].Type)
 }
 
+// TestCredentialService_IssueOrRotate_StampsDefaultCadence covers §16
+// TSQ-6 Resolved: an issue/rotate call, from any caller, stamps the new
+// `active` row's rotation_cadence_days/next_rotation_at using
+// domain.DefaultCadenceDays when WithCadenceDays was never called —
+// cmd/scheduler's due-list scan (idx_sac_next_rotation) depends on every
+// active row carrying this, not just cadence-driven ones.
+func TestCredentialService_IssueOrRotate_StampsDefaultCadence(t *testing.T) {
+	svc, principals, credentials, _, _ := newTestCredentialService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	before := time.Now().UTC()
+	_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 300}, domain.SystemPrincipalID)
+	require.NoError(t, err)
+
+	active, err := credentials.FindActive(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotNil(t, active.RotationCadenceDays)
+	assert.Equal(t, domain.DefaultCadenceDays, *active.RotationCadenceDays)
+	require.NotNil(t, active.NextRotationAt)
+	assert.WithinDuration(t, before.AddDate(0, 0, domain.DefaultCadenceDays), *active.NextRotationAt, 5*time.Second)
+}
+
+// TestCredentialService_WithCadenceDays_OverridesDefault covers the
+// ROTATION_DEFAULT_CADENCE_DAYS override path (§12) — WithCadenceDays
+// changes what gets stamped without touching the constructor's signature
+// or any other call site/test.
+func TestCredentialService_WithCadenceDays_OverridesDefault(t *testing.T) {
+	principals := newFakePrincipalRepository()
+	credentials := newFakeCredentialRepository()
+	secrets := newFakeSecretStore()
+	generate := func() (string, error) { return uuid.NewString(), nil }
+	svc := service.NewCredentialService(principals, credentials, secrets, &fakeTxRunner{}, nil, generate).WithCadenceDays(30)
+
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+
+	before := time.Now().UTC()
+	_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 300}, domain.SystemPrincipalID)
+	require.NoError(t, err)
+
+	active, err := credentials.FindActive(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	require.NotNil(t, active.RotationCadenceDays)
+	assert.Equal(t, 30, *active.RotationCadenceDays)
+	assert.WithinDuration(t, before.AddDate(0, 0, 30), *active.NextRotationAt, 5*time.Second)
+}
+
+// TestCredentialService_IssueOrRotate_RotateClearsPriorCadence covers §4.2:
+// only the current `active` row is ever "due" — a rotate must null out the
+// demoted row's cadence fields, or cmd/scheduler's due-list scan would
+// keep matching a row that is no longer eligible.
+func TestCredentialService_IssueOrRotate_RotateClearsPriorCadence(t *testing.T) {
+	svc, principals, credentials, _, _ := newTestCredentialService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+	actor := domain.SystemPrincipalID
+
+	_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 300}, actor)
+	require.NoError(t, err)
+
+	_, err = svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 300}, actor)
+	require.NoError(t, err)
+
+	priorRow, err := credentials.FindByVersion(ctx, tenantID, p.ID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, priorRow)
+	assert.Nil(t, priorRow.RotationCadenceDays)
+	assert.Nil(t, priorRow.NextRotationAt)
+
+	active, err := credentials.FindActive(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	require.NotNil(t, active.RotationCadenceDays)
+	require.NotNil(t, active.NextRotationAt)
+}
+
 func TestCredentialService_IssueOrRotate_RotationIDReplayReturnsSameSecret(t *testing.T) {
 	svc, principals, _, _, events := newTestCredentialService(t)
 	ctx := context.Background()
@@ -272,7 +352,7 @@ func TestNewCredentialService_NilGenerateUsesDefault(t *testing.T) {
 
 	res, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, domain.SystemPrincipalID)
 	require.NoError(t, err)
-	assert.NotEmpty(t, res.Secret, "DefaultSecretGenerator must have produced real material")
+	assert.NotEmpty(t, res.Secret, "DefaultKeyGenerator must have produced real material")
 }
 
 func TestCredentialService_IssueOrRotate_FindByRotationIDError(t *testing.T) {

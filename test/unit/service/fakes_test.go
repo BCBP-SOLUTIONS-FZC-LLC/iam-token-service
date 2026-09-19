@@ -53,6 +53,11 @@ type fakePrincipalRepository struct {
 	// forceRegisterErr, when non-nil, is returned by Register instead of
 	// its normal idempotent-create logic.
 	forceRegisterErr error
+
+	// forceListByTenantErr, when non-nil, is returned by ListByTenant
+	// instead of its normal listing — exercises JWKSService.PublicKeys'
+	// repository-error branch.
+	forceListByTenantErr error
 }
 
 func newFakePrincipalRepository() *fakePrincipalRepository {
@@ -75,14 +80,24 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 	return &cp, nil
 }
 
-func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, error) {
+func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
 	if f.forceRegisterErr != nil {
-		return nil, false, f.forceRegisterErr
+		return nil, false, false, f.forceRegisterErr
 	}
 	for _, existing := range f.byID {
 		if existing.TenantID == p.TenantID && existing.PrincipalType == p.PrincipalType {
+			// A true no-op repeat (identity unchanged) leaves the row alone;
+			// a carry-over (RP-3 conversion, differing principal_sub/
+			// keycloak_client_id) updates it in place — mirrors the
+			// postgres adapter's ON CONFLICT ... WHERE ... DO UPDATE.
+			if existing.PrincipalSub == p.PrincipalSub && existing.KeycloakClientID == p.KeycloakClientID {
+				cp := *existing
+				return &cp, false, false, nil
+			}
+			existing.PrincipalSub = p.PrincipalSub
+			existing.KeycloakClientID = p.KeycloakClientID
 			cp := *existing
-			return &cp, false, nil
+			return &cp, false, true, nil
 		}
 	}
 	np := *p
@@ -95,10 +110,26 @@ func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceA
 	np.RecordVersion = 1
 	f.put(&np)
 	cp := np
-	return &cp, true, nil
+	return &cp, true, false, nil
+}
+
+func (f *fakePrincipalRepository) FindByPrincipalSub(_ context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	if f.forceFindByIDErr != nil {
+		return nil, f.forceFindByIDErr
+	}
+	for _, p := range f.byID {
+		if p.TenantID == tenantID && p.PrincipalSub == principalSub {
+			cp := *p
+			return &cp, nil
+		}
+	}
+	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
 }
 
 func (f *fakePrincipalRepository) ListByTenant(_ context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	if f.forceListByTenantErr != nil {
+		return nil, f.forceListByTenantErr
+	}
 	var out []*domain.ServiceAccountPrincipal
 	for k, p := range f.byID {
 		if k.tenantID == tenantID {

@@ -219,15 +219,26 @@ func TestPrincipalRepository_FindByID_ScanErrorPropagates(t *testing.T) {
 	assert.Nil(t, got)
 }
 
+func TestPrincipalRepository_FindByPrincipalSub_ScanErrorPropagates(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+	wantErr := errors.New("scan boom")
+	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: wantErr}}}
+
+	got, err := r.FindByPrincipalSub(ctxWithFakeTx(tx), uuid.New(), uuid.New())
+	require.ErrorIs(t, err, wantErr)
+	assert.Nil(t, got)
+}
+
 func TestPrincipalRepository_Register_InsertScanErrorPropagates(t *testing.T) {
 	r := NewPrincipalRepository(nil)
 	wantErr := errors.New("insert scan boom")
 	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: wantErr}}}
 
-	got, created, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
+	got, created, updated, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 	assert.False(t, created)
+	assert.False(t, updated)
 }
 
 func TestPrincipalRepository_Register_ConflictFallbackSelectScanErrorPropagates(t *testing.T) {
@@ -238,10 +249,11 @@ func TestPrincipalRepository_Register_ConflictFallbackSelectScanErrorPropagates(
 		errRow{err: wantErr},
 	}}
 
-	got, created, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
+	got, created, updated, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{})
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 	assert.False(t, created)
+	assert.False(t, updated)
 }
 
 func TestPrincipalRepository_ListByTenant_QueryErrorPropagates(t *testing.T) {
@@ -282,6 +294,26 @@ func TestReconcilerRepository_ListExpiredRotating_ScanErrorPropagates(t *testing
 	tx := &fakeRepoTx{queryRows: &oneRowThenScanErrRows{scanErr: wantErr}}
 
 	got, err := r.ListExpiredRotating(ctxWithFakeTx(tx))
+	require.ErrorIs(t, err, wantErr)
+	assert.Nil(t, got)
+}
+
+func TestReconcilerRepository_ListDueForRotation_QueryErrorPropagates(t *testing.T) {
+	r := NewReconcilerRepository(nil)
+	wantErr := errors.New("query boom")
+	tx := &fakeRepoTx{queryErr: wantErr}
+
+	got, err := r.ListDueForRotation(ctxWithFakeTx(tx))
+	require.ErrorIs(t, err, wantErr)
+	assert.Nil(t, got)
+}
+
+func TestReconcilerRepository_ListDueForRotation_ScanErrorPropagates(t *testing.T) {
+	r := NewReconcilerRepository(nil)
+	wantErr := errors.New("scan boom")
+	tx := &fakeRepoTx{queryRows: &oneRowThenScanErrRows{scanErr: wantErr}}
+
+	got, err := r.ListDueForRotation(ctxWithFakeTx(tx))
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 }
