@@ -554,15 +554,23 @@ schema-verify:
 # this repo). Pass EXECUTE=true to archive and delete:
 # make schema-prune EXECUTE=true. Requires GLUE_REGISTRY_SERVICEACCOUNT_NAME
 # and AWS credentials.
+# schema-prune compares Glue against the PascalCase staged copy: prune treats a
+# schema as orphaned when no FILE STEM in --schema-dir matches it, and the
+# committed files are snake_case — against them (or the default dir) it lists
+# every live schema as an orphan, which EXECUTE=true would delete.
 .PHONY: schema-prune
 schema-prune:
 	@test -n "$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)" || { echo "GLUE_REGISTRY_SERVICEACCOUNT_NAME is not set"; exit 1; }
+	@rm -rf .tmp/glue-schemas
+	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas >/dev/null
 	docker run --rm \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
 	  -e AWS_REGION="$(AWS_REGION)" \
+	  -e AWS_ENDPOINT_URL="$(AWS_ENDPOINT_URL)" \
 	  "$(SCHEMA_GOV_IMAGE)" prune \
 	  --registry   "$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)" \
+	  --schema-dir .tmp/glue-schemas \
 	  $(if $(filter true,$(EXECUTE)),--execute,)
 
 # -----------------------------

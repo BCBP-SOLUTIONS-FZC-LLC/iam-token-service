@@ -102,6 +102,17 @@ jobs:
         run: |
           pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
+      # prune treats a Glue schema as orphaned when no FILE STEM in --schema-dir
+      # matches its name. The committed schema files are snake_case while every
+      # registered name is PascalCase, so pointing prune at them (or at its
+      # internal/eventschema default) lists EVERY live schema as an orphan —
+      # and --execute would archive + delete them. Prune compares against the
+      # PascalCase, produced-only staged copy instead.
+      - name: Stage produced schemas under their Glue names
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       # Schedule always runs dry-run (generates a monthly candidate report).
       # workflow_dispatch respects the dry_run input; un-check to execute.
       - name: Prune orphaned schemas
@@ -116,6 +127,7 @@ jobs:
           fi
           schema-gov prune \
             --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --schema-dir .tmp/glue-schemas \
             --env      staging \
             --output   "${{ runner.temp }}/schema-prune-metrics.json" \
             ${EXECUTE_FLAG}
@@ -184,6 +196,17 @@ jobs:
         run: |
           pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
+      # prune treats a Glue schema as orphaned when no FILE STEM in --schema-dir
+      # matches its name. The committed schema files are snake_case while every
+      # registered name is PascalCase, so pointing prune at them (or at its
+      # internal/eventschema default) lists EVERY live schema as an orphan —
+      # and --execute would archive + delete them. Prune compares against the
+      # PascalCase, produced-only staged copy instead.
+      - name: Stage produced schemas under their Glue names
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       - name: Prune orphaned schemas
         env:
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
@@ -192,6 +215,7 @@ jobs:
           [ "${DRY_RUN_INPUT}" = "false" ] && EXECUTE_FLAG="--execute"
           schema-gov prune \
             --registry "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
+            --schema-dir .tmp/glue-schemas \
             --env      production \
             --output   "${{ runner.temp }}/schema-prune-metrics.json" \
             ${EXECUTE_FLAG}
