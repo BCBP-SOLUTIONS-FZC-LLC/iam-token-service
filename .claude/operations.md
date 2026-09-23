@@ -94,6 +94,7 @@ them. `make gates` → `metrics-taxonomy` enforces naming compliance in CI.
 | `jwks_key_errors_total` | counter | — (no label; exactly one outcome) — EXT-6 JWKS route, TS-D15 |
 | `processed_events_duplicates_total` | counter | `consumer` — legacy, see Tier 1 below |
 | `unknown_event_acknowledged_total` | counter | `consumer`, `event_type` |
+| `consumed_schema_violations_total` | counter | `consumer`, `event_type` — inbound payload failed its embedded consumed schema and was sent straight to the DLQ (`cmd/consumer/inbound_schema.go`); pages via `IAMTokenServiceConsumedSchemaViolation` |
 
 **Tier 1/Tier 2 (registry-proposed, dual-emitted alongside the legacy
 metric above — not yet ratified, see `docs/observability-registry-proposals.md`):**
@@ -133,7 +134,9 @@ OpenBao failure-rate, stuck `rotating` versions, `material_reconcile_total{resul
 failed, TS-D15; will not self-heal since `next_rotation_at` already
 advanced), `jwks_key_errors_total` > 0 (page — a live credential the JWKS
 route couldn't serve, i.e. a real per-credential Keycloak auth outage,
-TS-D15), offboarding-cascade DLQ depth, `outbox_pending_total` growth
+TS-D15), `consumed_schema_violations_total` > 0 (page — a
+`TenantMembershipsPurged` failed its embedded schema and went straight to
+the DLQ, so that tenant's cascade did not run), offboarding-cascade DLQ depth, `outbox_pending_total` growth
 (both a warning-stage backlog alert and the later DLQ-depth alert),
 `pgcommon_pool_empty_acquire_total` growth (pool exhaustion, either pool),
 offboarding-queue message age (dormant until a CloudWatch exporter is

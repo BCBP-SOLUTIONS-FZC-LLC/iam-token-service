@@ -42,6 +42,13 @@ Initial build of the Token Service — custodian of the platform-automation serv
 
 ### Fixed
 
+**Event pipeline hardening (LLD rev 1.4), 2026-09-23:**
+
+- **`cmd/consumer` could not decode Glue-encoded events.** Its SQS consumer had no `events.WithConsumerCodec`, and iam-org-membership publishes `TenantMembershipsPurged` Glue-encoded — every such message would have failed decode and ended in the DLQ with the offboarding cascade never run. Now wired with the new decode-only `eventbus.GlueDecoder` (no Glue client or registry).
+- **Consumed payloads are validated before the cascade.** `cmd/consumer/inbound_schema.go` checks each payload against the embedded `tenant_memberships_purged.json` (`ValidatingCodec.Validate` + `ErrNoSchema`); a violation is counted by the new `iam_token_service_consumed_schema_violations_total` (critical `IAMTokenServiceConsumedSchemaViolation`) and never reaches `Handle`.
+- **Permanent rejects go straight to the DLQ.** `cmd/consumer/dlq.go` sends a schema violation to `tenant-lifecycle-tokensvc-q-dlq` (`DLQReason=schema_violation`, DLQ URL from the queue's `RedrivePolicy`) and acks, instead of retrying `maxReceiveCount` times; falls back to normal redrive if the DLQ can't be resolved or the send fails. New `sqs:SendMessage` grant `OffboardingDLQPermanentRejects`.
+- **Glue schema versions are resolved by definition, not "latest"; the 5-minute refresher is gone.** `GlueCodec` calls `glue:GetSchemaByDefinition` once at startup per produced schema with the embedded schema in `schema-gov register`'s exact compact form (Python-parity-tested), requiring `AVAILABLE`. `StartRefresher`, `GlueCodec.WithLogger` and `buildGlueCodec`'s logger parameter are removed. New floci integration test `test/integration/glue_codec_test.go`.
+
 **EXT-6 (client-jwt/JWKS, rev 1.3) completeness fixes (TS-D15) — production-readiness review, 2026-09-19:**
 
 - **Revoked keys never actually stopped authenticating at Keycloak (security regression).** `cmd/rotator`'s overlap-expiry sweep (`revokeExpiredRotating`) updated Postgres/OpenBao but never called RP-17 (`ClearServiceAccountKeysCache`) — under EXT-6's client-jwt/JWKS mechanism there is no Keycloak-side TTL, so every credential the sweep "revoked" kept validating at Keycloak indefinitely, silently, with no alert. `cmd/rotator` now wires the same `port.RealmProvisionerClient` `cmd/scheduler` already had and calls `RefreshKeys` after every successful revoke commits; a resulting RP-17 failure is classified `Failed` (page-worthy), not swallowed, since the row is already `revoked` and will never be re-enumerated by the sweep again.

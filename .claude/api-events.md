@@ -73,13 +73,29 @@ delivered. Does **not** consume `MembershipRevoked` — a per-user
 membership change never touches a service-account principal (non-member
 by construction, O&M AUTH-9).
 
+**Consumer pipeline** (`cmd/consumer`): O&M publishes this event
+Glue-encoded, so the consumer carries `eventbus.GlueDecoder`
+(`events.WithConsumerCodec` — strips the 18-byte header, no registry
+lookup). Each message then runs, outermost first: DLQ router → cascade
+metrics → `validateConsumed` → `OffboardingConsumer.Handle`. The payload is
+validated against the embedded `tenant_memberships_purged.json` (this
+service's own contract — `tenant_id` required; O&M's producer schema
+matches, plus an optional `actor_id`). A violation never reaches the
+cascade: it increments `iam_token_service_consumed_schema_violations_total`
+(critical alert) and is sent straight to the DLQ (`DLQReason=
+schema_violation`, URL from the queue's `RedrivePolicy`) and acked. An
+unknown type (no schema) passes through to `ackUnknown`.
+
 ## 7.3/7.4 Outbound events — single producer, transactional outbox
 
 `iam-serviceaccount-events` (Glue registry, single producer — no
 `RoutingPublisher` needed since there's only one topic). Every credential
 state transition writes its event to `outbox_events` in the **same
 transaction** as the business write (EVT-1) — never published for a
-rolled-back write, never missing for a committed one. Enqueue-time
+rolled-back write, never missing for a committed one. Each schema's Glue
+version UUID is resolved once at startup by definition
+(`glue:GetSchemaByDefinition` with the embedded schema) — never
+"latest", no refresher, no per-event Glue call. Enqueue-time
 validation is schema-check-only against plain JSON
 (`ValidatingCodec.Encode`, encoded bytes discarded — only the validation
 side effect matters); Glue wire-encoding happens later, at publish time

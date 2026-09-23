@@ -208,7 +208,7 @@ func main() {
 	for name := range producedSchemas {
 		schemaNames = append(schemaNames, name)
 	}
-	glueCodec, err := buildGlueCodec(ctx, glueClient, os.Getenv("GLUE_REGISTRY_NAME"), schemaNames, log)
+	glueCodec, err := buildGlueCodec(ctx, glueClient, os.Getenv("GLUE_REGISTRY_NAME"), schemaNames)
 	if err != nil {
 		panic(fmt.Sprintf("init glue codec: %v", err))
 	}

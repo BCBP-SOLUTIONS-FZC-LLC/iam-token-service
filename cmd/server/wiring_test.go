@@ -34,7 +34,7 @@ func newUnreachableGlueClient(t *testing.T) *glue.Client {
 }
 
 func TestBuildGlueCodec_EmptyRegistryNameReturnsNoop(t *testing.T) {
-	codec, err := buildGlueCodec(t.Context(), nil, "", nil, nil)
+	codec, err := buildGlueCodec(t.Context(), nil, "", nil)
 	require.NoError(t, err)
 	assert.IsType(t, events.NoopCodec{}, codec)
 }
@@ -43,7 +43,7 @@ func TestBuildGlueCodec_PrefetchFailurePropagates(t *testing.T) {
 	client := newUnreachableGlueClient(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	_, err := buildGlueCodec(ctx, client, "iam-serviceaccount-events", []string{"ServiceAccountRegistered"}, nil)
+	_, err := buildGlueCodec(ctx, client, "iam-serviceaccount-events", []string{"ServiceAccountRegistered"})
 	require.Error(t, err)
 }
 

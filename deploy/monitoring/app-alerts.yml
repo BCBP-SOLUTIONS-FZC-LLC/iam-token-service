@@ -149,6 +149,27 @@ groups:
             delayed. SQS redelivery will retry; investigate consumer logs
             if this persists.
 
+      # ── Consumed-schema contract break (page) ─────────────────────────
+      #    cmd/consumer rejects a TenantMembershipsPurged whose payload fails
+      #    its embedded schema straight to the -dlq — the tenant's service
+      #    accounts are NOT being cleaned up until someone fixes and redrives.
+      - alert: IAMTokenServiceConsumedSchemaViolation
+        expr: |
+          sum by (event_type) (increase(iam_token_service_consumed_schema_violations_total{job="iam-token-service-consumer"}[15m])) > 0
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: iam-token-service is rejecting {{ $labels.event_type }} as a schema violation
+          description: >-
+            {{ $value | humanize }} {{ $labels.event_type }} event(s) in the
+            last 15 minutes failed the embedded consumed-event schema and
+            were sent straight to the offboarding DLQ (DLQReason=
+            schema_violation) — the offboarding cascade did not run for
+            those tenants. Either iam-org-membership broke its contract or
+            api/asyncapi.yaml is stale. Inspect the DLQ message, fix the
+            wrong side, then redrive.
+
       # ── Overlap-expiry sweep failures ─────────────────────────────────
       - alert: IAMTokenServiceRotationSweepFailures
         expr: |

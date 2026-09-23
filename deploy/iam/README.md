@@ -42,7 +42,8 @@ Postgres, never S3).
 | `sns:Publish` | Outbox → SNS `iam-serviceaccount-events` topic (this service's 5 published events) | §7.3.1 |
 | `sqs:ReceiveMessage` / `DeleteMessage` / `GetQueueAttributes` / `ChangeMessageVisibility` | The single inbound consumer on the offboarding queue (`TenantMembershipsPurged`, §7.1) | §7.1 |
 | `sqs:GetQueueAttributes` / `ReceiveMessage` on the offboarding DLQ | Ops visibility into DLQ depth — read-only for triage, not a consume-and-delete grant | §11.5 |
-| `glue:GetSchemaVersion` (+ read-only siblings) | `GlueCodec` pre-fetches schema version IDs at startup, refreshed periodically | §13.4 |
+| `sqs:SendMessage` on the offboarding DLQ (`OffboardingDLQPermanentRejects`) | `cmd/consumer`'s DLQ router sends a `TenantMembershipsPurged` whose payload fails its embedded schema straight to the DLQ (`DLQReason=schema_violation`) instead of burning `maxReceiveCount` retries. The DLQ URL comes from the queue's own `RedrivePolicy`, read with the queue's existing `sqs:GetQueueAttributes` grant | §7.1 |
+| `glue:GetSchemaByDefinition` (+ read-only siblings) | `GlueCodec` resolves each schema's version ID once at startup by definition (this build's embedded schema) — no periodic refresh | §13.4 |
 | `logs:CreateLogStream` / `PutLogEvents` | Container stdout to CloudWatch (if not using an OTel collector for logs) | — |
 
 ## Least-privilege scoping

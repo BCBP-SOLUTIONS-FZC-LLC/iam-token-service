@@ -120,6 +120,17 @@ var (
 	// — this is exactly that pattern, just for this service's consumer.
 	UnknownEventAcknowledged *prometheus.CounterVec
 
+	// ConsumedSchemaViolationsTotal counts inbound events whose payload
+	// failed this service's embedded consumed-event schema
+	// (cmd/consumer/inbound_schema.go) and were sent straight to the
+	// queue's -dlq (cmd/consumer/dlq.go) without reaching the offboarding
+	// cascade or processed_events. Any nonzero rate means the producer
+	// (iam-org-membership) broke its contract or api/asyncapi.yaml is stale
+	// — the tenant's service accounts are not being cleaned up. Pages
+	// (IAMTokenServiceConsumedSchemaViolation). Tier 3, authoritative;
+	// bounded by this service's one consumer and its one consumed type.
+	ConsumedSchemaViolationsTotal *prometheus.CounterVec
+
 	// ── Tier 1: platform_* (REGISTRY-PROPOSED — see package doc) ─────────
 
 	// DependencyRequestDuration is the proposed platform_dependency_request_seconds:
@@ -280,6 +291,12 @@ func registerMetrics() {
 		ConstLabels: t3,
 	}, []string{"consumer", "event_type"})
 
+	ConsumedSchemaViolationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "consumed_schema_violations_total",
+		Help:        "Inbound events rejected straight to the -dlq because the payload failed its embedded consumed-event schema, by consumer and event type — any nonzero rate means a producer contract break.",
+		ConstLabels: t3,
+	}, []string{"consumer", "event_type"})
+
 	// ── Tier 1 (registry-proposed) ───────────────────────────────────────
 	DependencyRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:        tier1Prefix + "dependency_request_seconds",
@@ -323,6 +340,7 @@ func registerMetrics() {
 		JWKSKeyErrorsTotal,
 		ProcessedEventsDuplicates,
 		UnknownEventAcknowledged,
+		ConsumedSchemaViolationsTotal,
 		DependencyRequestDuration,
 		DuplicateMessagesTotal,
 		IAMOffboardingCascadeTotal,
@@ -336,6 +354,7 @@ func registerMetrics() {
 		OpenBaoCallDuration.WithLabelValues(op)
 		DependencyRequestDuration.WithLabelValues("openbao", op)
 	}
+	ConsumedSchemaViolationsTotal.WithLabelValues("tenant_offboarding", "TenantMembershipsPurged")
 	for _, result := range []string{"ok", "error"} {
 		OffboardingCascadeTotal.WithLabelValues(result)
 		IAMOffboardingCascadeTotal.WithLabelValues(result)

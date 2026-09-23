@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -17,6 +18,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// testDefinitions backs the arbitrary schema names these tests use.
+var testDefinitions = map[string][]byte{
+	"X":       []byte("{\n  \"type\": \"object\"\n}\n"),
+	"Missing": []byte(`{"type":"object"}`),
+}
+
+func producedDefinitions(t *testing.T) map[string][]byte {
+	t.Helper()
+	defs, err := ProducedSchemas()
+	require.NoError(t, err)
+	return defs
+}
 
 // TestPrependGlueHeader_ExactByteLayout locks down the AWS Glue Schema
 // Registry wire format byte-for-byte (§7.3.1 territory — a malformed
@@ -98,9 +112,11 @@ func TestGlueCodec_Encode_UsesCachedVersionID(t *testing.T) {
 }
 
 // newFakeGlueServer fakes just enough of the AWS Glue JSON-1.1 protocol for
-// GetSchemaVersion: a schema name present in versions succeeds with that
-// version UUID; any other name (or an empty versions map) responds like a
-// real registry miss (400 + EntityNotFoundException). hits, if non-nil, is
+// GetSchemaByDefinition: a schema name present in versions succeeds with
+// that version UUID (status AVAILABLE); any other name (or an empty
+// versions map) responds like a real registry miss (400 +
+// EntityNotFoundException). Any other Glue action — e.g. the retired
+// GetSchemaVersion LatestVersion lookup — fails the test. hits, if non-nil, is
 // incremented once per request so tests can assert on cache-hit behavior
 // without a network round trip.
 func newFakeGlueServer(t *testing.T, versions map[string]string, hits *int32) *httptest.Server {
@@ -108,6 +124,9 @@ func newFakeGlueServer(t *testing.T, versions map[string]string, hits *int32) *h
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits != nil {
 			atomic.AddInt32(hits, 1)
+		}
+		if target := r.Header.Get("X-Amz-Target"); target != "AWSGlue.GetSchemaByDefinition" {
+			t.Errorf("unexpected Glue action %q — versions must be resolved by definition", target)
 		}
 		var body struct {
 			SchemaID struct {
@@ -124,7 +143,7 @@ func newFakeGlueServer(t *testing.T, versions map[string]string, hits *int32) *h
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"SchemaVersionId":"` + id + `"}`))
+		_, _ = w.Write([]byte(`{"SchemaVersionId":"` + id + `","Status":"AVAILABLE"}`))
 	}))
 }
 
@@ -133,7 +152,7 @@ func newFakeGlueServer(t *testing.T, versions map[string]string, hits *int32) *h
 // actual HTTP/JSON-protocol call be exercised without a live AWS Glue
 // registry: NewGlueCodec and GlueCodec take a concrete *glue.Client, and the
 // AWS SDK v2 wire protocol works against any http.Handler that answers the
-// AWSGlue.GetSchemaVersion shape, not just the real AWS endpoint.
+// AWSGlue.GetSchemaByDefinition shape, not just the real AWS endpoint.
 func newTestGlueClient(t *testing.T, url string) *glue.Client {
 	t.Helper()
 	return glue.New(glue.Options{
@@ -149,7 +168,7 @@ func TestGlueCodec_fetchVersionID_Success(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{"ServiceAccountRegistered": versionID}, nil)
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events"}
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: producedDefinitions(t)}
 	got, err := g.fetchVersionID(context.Background(), "ServiceAccountRegistered")
 	require.NoError(t, err)
 	assert.Equal(t, versionID, got)
@@ -159,8 +178,8 @@ func TestGlueCodec_fetchVersionID_RegistryMissErrors(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{}, nil)
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events"}
-	_, err := g.fetchVersionID(context.Background(), "Unregistered")
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: producedDefinitions(t)}
+	_, err := g.fetchVersionID(context.Background(), "ServiceAccountRevoked")
 	require.Error(t, err)
 }
 
@@ -172,7 +191,7 @@ func TestGlueCodec_fetchVersionID_NilSchemaVersionIDErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events"}
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: producedDefinitions(t)}
 	_, err := g.fetchVersionID(context.Background(), "ServiceAccountRegistered")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil SchemaVersionId")
@@ -180,13 +199,13 @@ func TestGlueCodec_fetchVersionID_NilSchemaVersionIDErrors(t *testing.T) {
 
 func TestNewGlueCodec_PrefetchesEveryNameOnConstruction(t *testing.T) {
 	v1, v2 := uuid.New().String(), uuid.New().String()
-	srv := newFakeGlueServer(t, map[string]string{"A": v1, "B": v2}, nil)
+	srv := newFakeGlueServer(t, map[string]string{"ServiceAccountRegistered": v1, "ServiceAccountRevoked": v2}, nil)
 	defer srv.Close()
 
-	c, err := NewGlueCodec(context.Background(), newTestGlueClient(t, srv.URL), "iam-serviceaccount-events", []string{"A", "B"})
+	c, err := NewGlueCodec(context.Background(), newTestGlueClient(t, srv.URL), "iam-serviceaccount-events", []string{"ServiceAccountRegistered", "ServiceAccountRevoked"})
 	require.NoError(t, err)
-	assert.Equal(t, v1, c.versionCache["A"])
-	assert.Equal(t, v2, c.versionCache["B"])
+	assert.Equal(t, v1, c.versionCache["ServiceAccountRegistered"])
+	assert.Equal(t, v2, c.versionCache["ServiceAccountRevoked"])
 }
 
 // TestNewGlueCodec_PrefetchFailureIsFatal locks down NewGlueCodec's
@@ -197,15 +216,10 @@ func TestNewGlueCodec_PrefetchFailureIsFatal(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{}, nil)
 	defer srv.Close()
 
-	_, err := NewGlueCodec(context.Background(), newTestGlueClient(t, srv.URL), "iam-serviceaccount-events", []string{"Missing"})
+	_, err := NewGlueCodec(context.Background(), newTestGlueClient(t, srv.URL), "iam-serviceaccount-events", []string{"ServiceAccountCredentialIssued"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `prefetch glue schema "Missing"`)
-}
-
-func TestGlueCodec_WithLogger_ReturnsSameCodecForChaining(t *testing.T) {
-	g := &GlueCodec{versionCache: map[string]string{}}
-	got := g.WithLogger(nil)
-	assert.Same(t, g, got)
+	assert.Contains(t, err.Error(), `resolve glue schema "ServiceAccountCredentialIssued"`)
+	assert.Contains(t, err.Error(), "isn't registered yet")
 }
 
 func TestGlueCodec_versionID_CacheMissFetchesThenCachesHit(t *testing.T) {
@@ -214,7 +228,7 @@ func TestGlueCodec_versionID_CacheMissFetchesThenCachesHit(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{"X": versionID}, &hits)
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", versionCache: map[string]string{}}
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: testDefinitions, versionCache: map[string]string{}}
 
 	got, err := g.versionID(context.Background(), "X")
 	require.NoError(t, err)
@@ -231,7 +245,7 @@ func TestGlueCodec_versionID_CacheMissFetchErrorPropagates(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{}, nil)
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", versionCache: map[string]string{}}
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: testDefinitions, versionCache: map[string]string{}}
 	_, err := g.versionID(context.Background(), "Missing")
 	require.Error(t, err)
 }
@@ -240,7 +254,7 @@ func TestGlueCodec_Encode_VersionIDLookupFailurePropagates(t *testing.T) {
 	srv := newFakeGlueServer(t, map[string]string{}, nil)
 	defer srv.Close()
 
-	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", versionCache: map[string]string{}}
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: testDefinitions, versionCache: map[string]string{}}
 	_, _, err := g.Encode(context.Background(), "Missing", []byte(`{}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "get glue schema version")
@@ -262,40 +276,8 @@ func TestGlueCodec_Decode_StripFailurePropagates(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestGlueCodec_StartRefresher_UpdatesCacheOnTick(t *testing.T) {
-	v1, v2 := uuid.New().String(), uuid.New().String()
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&hits, 1)
-		id := v1
-		if n > 1 {
-			id = v2
-		}
-		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"SchemaVersionId":"` + id + `"}`))
-	}))
-	defer srv.Close()
-
-	g := &GlueCodec{
-		client:       newTestGlueClient(t, srv.URL),
-		registryName: "iam-serviceaccount-events",
-		versionCache: map[string]string{"X": v1},
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	g.StartRefresher(ctx, 5*time.Millisecond)
-
-	require.Eventually(t, func() bool {
-		g.mu.RLock()
-		defer g.mu.RUnlock()
-		return g.versionCache["X"] == v2
-	}, time.Second, 5*time.Millisecond, "refresher must overwrite the cache with the newly-fetched version")
-}
-
 // fakeWarnLogger implements port.Logger, recording Warn calls — shared
-// across this package's test files (glue refresher warnings, publisher
-// enqueue-failure warnings) to confirm a WithLogger-attached logger is
+// across this package's test files (publisher enqueue-failure warnings) to confirm a WithLogger-attached logger is
 // actually the sink a failure path writes through, not a stand-in that's
 // merely stored and never called.
 type fakeWarnLogger struct {
@@ -318,59 +300,123 @@ func (f *fakeWarnLogger) count() int {
 	return len(f.warn)
 }
 
-// TestGlueCodec_StartRefresher_LogsWarnAndKeepsStaleCacheOnFetchFailure
-// covers the non-fatal-refresh-error branch: a failed background refetch
-// must not crash the refresher goroutine nor clobber the last-known-good
-// cached version.
-func TestGlueCodec_StartRefresher_LogsWarnAndKeepsStaleCacheOnFetchFailure(t *testing.T) {
-	srv := newFakeGlueServer(t, map[string]string{}, nil) // every schema name 404s
-	defer srv.Close()
+// ── GetSchemaByDefinition resolution ──────────────────────────────────────
 
-	fl := &fakeWarnLogger{}
-	g := &GlueCodec{
-		client:       newTestGlueClient(t, srv.URL),
-		registryName: "iam-serviceaccount-events",
-		versionCache: map[string]string{"X": "seed-version"},
-		log:          fl,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	g.StartRefresher(ctx, 5*time.Millisecond)
-
-	require.Eventually(t, func() bool { return fl.count() > 0 }, time.Second, 5*time.Millisecond)
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	assert.Equal(t, "seed-version", g.versionCache["X"], "a failed refresh must not clobber the last-known-good cache entry")
-}
-
-// TestGlueCodec_StartRefresher_ExitsOnContextCancel covers the ctx.Done()
-// exit branch — the background goroutine must stop ticking once its
-// context is cancelled, not run forever.
-func TestGlueCodec_StartRefresher_ExitsOnContextCancel(t *testing.T) {
-	var hits int32
+// TestNewGlueCodec_SendsRegisteredDefinition verifies the real embedded
+// schema is sent compacted — the exact string schema-gov register uploads
+// — and resolved once: Encode never calls Glue.
+func TestNewGlueCodec_SendsRegisteredDefinition(t *testing.T) {
+	versionID := uuid.New().String()
+	var mu sync.Mutex
+	var sent []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		var body struct{ SchemaDefinition string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		sent = append(sent, body.SchemaDefinition)
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"SchemaVersionId":"` + uuid.New().String() + `"}`))
+		_, _ = w.Write([]byte(`{"SchemaVersionId":"` + versionID + `","Status":"AVAILABLE"}`))
 	}))
 	defer srv.Close()
 
-	g := &GlueCodec{
-		client:       newTestGlueClient(t, srv.URL),
-		registryName: "iam-serviceaccount-events",
-		versionCache: map[string]string{"X": uuid.New().String()},
+	c, err := NewGlueCodec(context.Background(), newTestGlueClient(t, srv.URL), "iam-serviceaccount-events", []string{"ServiceAccountRegistered"})
+	require.NoError(t, err)
+	want, err := registeredDefinition(producedDefinitions(t)["ServiceAccountRegistered"])
+	require.NoError(t, err)
+	assert.NotContains(t, want, "\n", "definition must be compact")
+
+	_, gotVersion, err := c.Encode(context.Background(), "ServiceAccountRegistered", []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, versionID, gotVersion)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{want}, sent, "one lookup at construction, none on Encode")
+}
+
+// TestGlueCodec_fetchVersionID_NonAvailableStatusErrors: a version still
+// PENDING Glue's compatibility check (or FAILURE/DELETING) must never be
+// stamped on events.
+func TestGlueCodec_fetchVersionID_NonAvailableStatusErrors(t *testing.T) {
+	for _, status := range []string{"PENDING", "FAILURE", "DELETING"} {
+		t.Run(status, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+				_, _ = w.Write([]byte(`{"SchemaVersionId":"` + uuid.New().String() + `","Status":"` + status + `"}`))
+			}))
+			defer srv.Close()
+
+			g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: producedDefinitions(t)}
+			_, err := g.fetchVersionID(context.Background(), "ServiceAccountRevoked")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not AVAILABLE")
+		})
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	g.StartRefresher(ctx, 5*time.Millisecond)
+}
 
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&hits) > 0 }, time.Second, 5*time.Millisecond, "expected at least one tick before cancel")
-	cancel()
+// TestGlueCodec_fetchVersionID_NoEmbeddedSchemaErrorsWithoutCallingGlue:
+// a name with no embedded produced schema (e.g. the consumed
+// TenantMembershipsPurged) can't be looked up by definition.
+func TestGlueCodec_fetchVersionID_NoEmbeddedSchemaErrorsWithoutCallingGlue(t *testing.T) {
+	var hits int32
+	srv := newFakeGlueServer(t, map[string]string{}, &hits)
+	defer srv.Close()
 
-	// After cancellation, the hit count must stop increasing.
-	time.Sleep(20 * time.Millisecond)
-	stopped := atomic.LoadInt32(&hits)
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, stopped, atomic.LoadInt32(&hits), "refresher goroutine must stop ticking after ctx is cancelled")
+	g := &GlueCodec{client: newTestGlueClient(t, srv.URL), registryName: "iam-serviceaccount-events", definitions: producedDefinitions(t)}
+	_, err := g.fetchVersionID(context.Background(), "TenantMembershipsPurged")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no embedded schema")
+	assert.Zero(t, atomic.LoadInt32(&hits))
+}
+
+func TestRegisteredDefinition_InvalidJSONErrors(t *testing.T) {
+	_, err := registeredDefinition([]byte("{not json"))
+	require.Error(t, err)
+}
+
+func TestASCIIEscape_MatchesPythonEnsureASCII(t *testing.T) {
+	assert.Equal(t, `{"d":"caf\u00e9 \u2014 \ud83d\ude00"}`, asciiEscape([]byte(`{"d":"café — 😀"}`)))
+	assert.Equal(t, `{"a":1}`, asciiEscape([]byte(`{"a":1}`)))
+}
+
+// TestRegisteredDefinition_MatchesSchemaGov pins registeredDefinition to the
+// exact bytes schema-gov register uploads —
+// json.dumps(json.loads(file), separators=(",", ":")) — for every produced
+// schema. If this drifts, GetSchemaByDefinition may stop matching in real
+// AWS Glue and every pod fails startup.
+func TestRegisteredDefinition_MatchesSchemaGov(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	for name, raw := range producedDefinitions(t) {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), python, "-c", `import json,sys; sys.stdout.write(json.dumps(json.loads(sys.stdin.read()), separators=(",", ":")))`)
+			cmd.Stdin = strings.NewReader(string(raw))
+			want, err := cmd.Output()
+			require.NoError(t, err)
+
+			got, err := registeredDefinition(raw)
+			require.NoError(t, err)
+			assert.Equal(t, string(want), got)
+		})
+	}
+}
+
+// ── GlueDecoder — consumer-side decode-only codec ─────────────────────────
+
+func TestGlueDecoder_DecodeStripsHeaderAndEncodeFails(t *testing.T) {
+	payload := []byte(`{"tenant_id":"x"}`)
+	encoded, err := prependGlueHeader(uuid.New().String(), payload)
+	require.NoError(t, err)
+
+	decoded, err := GlueDecoder{}.Decode(context.Background(), "TenantMembershipsPurged", encoded)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(payload), string(decoded))
+
+	_, err = GlueDecoder{}.Decode(context.Background(), "TenantMembershipsPurged", []byte("short"))
+	assert.Error(t, err)
+
+	_, _, err = GlueDecoder{}.Encode(context.Background(), "TenantMembershipsPurged", payload)
+	assert.ErrorContains(t, err, "decode-only")
 }

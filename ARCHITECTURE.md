@@ -409,6 +409,8 @@ turn into a DLQ storm on this queue.
 ```mermaid
 sequenceDiagram
     participant SQS as tenant-lifecycle-tokensvc-q
+    participant PIPE as cmd/consumer pipeline<br/>(GlueDecoder → DLQ router → metrics → validateConsumed)
+    participant DLQ as tenant-lifecycle-tokensvc-q-dlq
     participant C as OffboardingConsumer.Handle
     participant PE as processed_events
     participant PRIN as service_account_principals
@@ -416,7 +418,13 @@ sequenceDiagram
     participant BAO as OpenBao KV v2
     participant PUB as outbox_events
 
-    SQS->>C: TenantMembershipsPurged{tenant_id}
+    SQS->>PIPE: TenantMembershipsPurged (Glue header stripped if dataschema set)
+    PIPE->>PIPE: validateConsumed — tenant_memberships_purged.json
+    alt schema violation (e.g. tenant_id missing)
+        PIPE->>DLQ: SendMessage(DLQReason=schema_violation) — then ack
+        Note over PIPE,DLQ: consumed_schema_violations_total++, cascade never runs,<br/>IAMTokenServiceConsumedSchemaViolation pages
+    end
+    PIPE->>C: Handle(env) — valid payloads only
     C->>C: validate envelope id (missing/invalid → ack, log, return nil)
     alt event type != TenantMembershipsPurged
         C->>PE: ackUnknown: MarkProcessed + metric + info log
@@ -720,7 +728,14 @@ transaction** as the state write (EVT-1) — an event is never published for
 a rotation that rolled back, and no committed transition lacks its event.
 Enqueue-time validation is schema-check-only against plain JSON; Glue
 wire-encoding happens later, at publish time, so `outbox_events.payload`
-stays human-readable for observability and replay.
+stays human-readable for observability and replay. The Glue version UUID
+each event carries is resolved **once at startup, by definition**
+(`glue:GetSchemaByDefinition` with the binary's own embedded schema, sent in
+exactly the compact form `schema-gov register` uploads) — so every build
+stamps the version that describes its own payloads, never merely the
+registry's latest. No refresher, no per-event Glue call; a definition that
+isn't registered yet fails startup until `schema-registry.yml` registers
+it.
 
 > Source: [event-outbox-flow.mmd](docs/architecture/mermaid/event-outbox-flow.mmd)
 
@@ -736,6 +751,7 @@ sequenceDiagram
     participant SNS as SNS: iam.serviceaccount.events
     participant SQS as serviceaccount-audit-q
 
+    Note over GLUE,REG: At startup only — per produced event type:<br/>GetSchemaByDefinition(embedded schema, schema-gov's exact compact form)<br/>→ version UUID (must be AVAILABLE), cached for the process lifetime.<br/>Never "latest", no refresher. Not registered yet → startup fails.
     SVC->>CODEC: Encode(eventType, jsonPayload) — validate only,<br/>encoded bytes discarded
     CODEC-->>SVC: ok (schema-valid) or error
     SVC->>TX: same RunInTx as the business write:<br/>INSERT/UPDATE credential row<br/>INSERT outbox_events (plain JSON envelope)
@@ -745,9 +761,7 @@ sequenceDiagram
         RUNNER->>OUT: SELECT unrelayed rows (FOR UPDATE SKIP LOCKED)
         OUT-->>RUNNER: batch
         RUNNER->>GLUE: WithCodec(glueCodec).Encode(eventType, payload)
-        GLUE->>REG: fetch/cache schema version UUID for eventType
-        REG-->>GLUE: schema version id
-        GLUE-->>RUNNER: 18-byte Glue header + payload
+        GLUE-->>RUNNER: 18-byte Glue header (cached version UUID) + payload — no Glue call
         RUNNER->>SNS: Publish(EventType attr, glue-wire-encoded body)
         SNS-->>SQS: fan-out (SNS filter policy: EventType present)
         RUNNER->>OUT: mark relayed
@@ -862,7 +876,7 @@ graph LR
 
     HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(:METRICS_PORT/metrics, separate listener)"]
     METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor / PrometheusRule)"]
-    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>outbox_pending growth"]
+    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>outbox_pending growth"]
 
     HANDLER --> LOGS["Structured logs (slog JSON)<br/>tenant_id, principal_id, version, op, result<br/>— never a credential field (CI secret-log gate)"]
     LOGS --> AGG["Log aggregation<br/>(CloudWatch / equivalent)"]
@@ -959,6 +973,8 @@ mutation against a stale read-modify-write.
 | Crash between OpenBao delete and Postgres commit (revoke/offboarding) | Delete is a no-op on an already-missing path, so retrying the whole operation is always safe |
 | Committed credential with no backing OpenBao material | `missing_material` — irrecoverable per-version data loss; the reconciler pages rather than silently reissuing |
 | Unknown inbound event type or malformed envelope id | Acked immediately, never retried — a producer schema addition must never DLQ-storm this consumer |
+| Glue-encoded `TenantMembershipsPurged` (producer has a Glue registry configured) | `cmd/consumer` carries `eventbus.GlueDecoder` (`events.WithConsumerCodec`), which strips the 18-byte header with no registry — before this, every such message failed decode and ended in the DLQ with the cascade never run |
+| `TenantMembershipsPurged` payload fails its embedded consumed schema (e.g. no `tenant_id`) | Rejected before `Handle` and sent straight to `tenant-lifecycle-tokensvc-q-dlq` (`DLQReason=schema_violation`, DLQ URL from the queue's own `RedrivePolicy`) and acked — no retries on a payload that can never pass. `iam_token_service_consumed_schema_violations_total` pages (`IAMTokenServiceConsumedSchemaViolation`). If the DLQ can't be resolved or the send fails, normal SQS redrive after `maxReceiveCount` takes over |
 | Outbox/SNS/SQS relay failure | At-least-once; `processed_events` on both the outbound Audit consumer side (elsewhere) and this service's own inbound offboarding-dedup side make redelivery safe |
 | Offboarding cascade fails partway through a multi-credential tenant (e.g. OpenBao delete succeeds for credential 1 of 3, fails on 2) | `Handle` returns the error before any DB write and before `processed_events` is marked, so nothing commits — SQS redelivers and the whole loop retries from scratch (credential 1's delete is a no-op the second time). If retries exhaust `maxReceiveCount` and the message DLQs, the tenant's Postgres rows remain fully intact (nothing was ever deleted from Postgres) while some OpenBao material is already gone; the §8.6 reconciler's `ListPrincipalMaterialStates` still sees the live principal and correctly reports the missing entries as `missing_material` (page-worthy) rather than silently losing them |
 | A revoke (TS-2, or the overlap-expiry sweep) races another revoke of the exact same row | The loser's `Update` hits `ErrOptimisticLockConflict`; both `revokeCredential` (TS-2) and the sweep's `revokeExpiredRotating` re-check the row afterward and, finding it already `revoked`, return the idempotent success/skip outcome instead of surfacing a conflict for a race that already converged correctly |
@@ -1071,7 +1087,13 @@ subscriber would need to honor.
 - [ ] Strip the 18-byte Glue header (`[0x03][0x00][16-byte schema version
   UUID]`) before deserialising the envelope JSON, when `GLUE_REGISTRY_NAME`
   is set (`GlueCodec`); with `NoopCodec` (dev, unset) the message is plain
-  JSON with no header.
+  JSON with no header. With platform-events, wire `events.WithConsumerCodec`
+  with a header-stripping decoder (this repo's `eventbus.GlueDecoder` needs
+  no registry).
+- [ ] Treat `dataschema` as the version matching the **publishing build's**
+  embedded schema (resolved by definition at its startup), not the
+  registry's latest — it changes only when a build with a changed schema is
+  deployed.
 - [ ] Handle an unrecognised `event_type` gracefully (log + skip, not
   error) — a new event type can be added to this topic without warning
   every existing consumer.

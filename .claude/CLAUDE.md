@@ -107,6 +107,25 @@ package-layout/dependency-rule reference for quick lookups:
   retried** (`ackUnknown`/`dedup.go`) — a producer schema addition must
   never DLQ-storm this queue. Material-first delete ordering here too
   (OpenBao deletes complete before the Postgres cascade commits).
+- **`cmd/consumer/{inbound_schema,dlq}.go`** — the consumer's pipeline,
+  outermost first: DLQ router → cascade metrics → `validateConsumed` →
+  `Handle`, on an SQS consumer built by `buildSQSConsumer` with
+  `events.WithConsumerCodec(eventbus.GlueDecoder{})` (O&M publishes
+  `TenantMembershipsPurged` Glue-encoded — without the decoder every one
+  failed decode into the DLQ). `validateConsumed` checks the payload against
+  the embedded `tenant_memberships_purged.json` (`ValidatingCodec.Validate`,
+  `ErrNoSchema` → pass-through to `ackUnknown`); a violation increments
+  `iam_token_service_consumed_schema_violations_total` and
+  `routeRejectsToDLQ` sends it straight to the DLQ (`DLQReason=
+  schema_violation`, URL from the queue's `RedrivePolicy`, `sqs:SendMessage`
+  grant `OffboardingDLQPermanentRejects`) and acks; falls back to normal
+  redrive if the DLQ can't be resolved or the send fails.
+- **`internal/adapter/outbound/eventbus/glue_codec.go`** — `GlueCodec`
+  resolves each produced schema's version UUID **once at startup by
+  definition** (`glue:GetSchemaByDefinition`, exact `schema-gov register`
+  compact form via `registeredDefinition`, Python-parity-tested), must be
+  `AVAILABLE`; no refresher, no per-event Glue call, unregistered definition
+  fails startup. `GlueDecoder` — decode-only consumer codec.
 - **`internal/adapter/outbound/metrics/metrics.go`** — the Enterprise
   Platform Observability Standard's 3-tier taxonomy. `Register(environment)`
   centrally injects `domain`/`service`/`environment` labels — instrumentation

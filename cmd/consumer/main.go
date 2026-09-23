@@ -7,7 +7,8 @@
 // cmd/server's replica(s) already drain outbox_events (claim-lease safe
 // across multiple pollers), so this process only needs to enqueue, never
 // publish, keeping its AWS footprint to SQS alone (no Glue/SNS
-// credentials required).
+// credentials required — inbound Glue headers are stripped by the
+// registry-free eventbus.GlueDecoder).
 package main
 
 import (
@@ -135,8 +136,11 @@ func main() {
 	// (Enterprise Platform Observability Standard Tier 2, dual-emitted
 	// during the compatibility period) around every delivery, success or
 	// failure.
+	// validated runs the consumed-schema check (inbound_schema.go) before
+	// the cascade; a violation is counted as a failed cascade too.
+	validated := validateConsumed(offboardingConsumer.Handle, enqueueCodec, log)
 	handleWithMetrics := func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-		err := offboardingConsumer.Handle(ctx, env)
+		err := validated(ctx, env)
 		result := "ok"
 		if err != nil {
 			result = "error"
@@ -154,13 +158,18 @@ func main() {
 	// matching iam-user-profile. SQS_OFFBOARDING_QUEUE_URL /
 	// SQS_OFFBOARDING_CONCURRENCY remain accepted aliases so existing Helm
 	// values keep working until they also set the library's canonical names.
+	// Pipeline, outermost first: DLQ router (dlq.go — permanent rejects
+	// straight to the -dlq + ack) → cascade metrics → consumed-schema
+	// validation → OffboardingConsumer.Handle; GlueDecoder strips the Glue
+	// header before any of it (buildSQSConsumer).
 	sqsEnv := loadSQSEnv(appEnv)
 	eventcfg.LogWarningsTo(log, sqsEnv.Warnings)
-	sqsConsumer, err := events.NewSQSConsumer(
-		eventcfg.SQSConfigFromEnv(sqsEnv, log),
-		handleWithMetrics,
-		eventcfg.SQSConsumerOptions(sqsEnv)...,
-	)
+	sqsClient, err := newSQSClient(ctx, sqsEnv)
+	if err != nil {
+		panic(fmt.Sprintf("init sqs client: %v", err))
+	}
+	sqsConsumer, err := buildSQSConsumer(sqsEnv, sqsClient,
+		withDLQRouting(ctx, sqsClient, sqsEnv.QueueURL, handleWithMetrics, log), log)
 	if err != nil {
 		panic(fmt.Sprintf("build offboarding consumer: %v", err))
 	}

@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path"
@@ -83,19 +84,38 @@ func newValidatingCodecFromFS(inner events.Codec, schemas fs.FS) (*ValidatingCod
 // publishes or consumes has an embedded schema, so this branch only
 // protects a future caller invoking Encode with an unrelated string.
 func (c *ValidatingCodec) Encode(ctx context.Context, eventType string, payload json.RawMessage) (encoded []byte, schemaVersionID string, err error) {
+	if err := c.Validate(eventType, payload); err != nil && !errors.Is(err, ErrNoSchema) {
+		return nil, "", err
+	}
+	return c.inner.Encode(ctx, eventType, payload)
+}
+
+// ErrNoSchema is returned (wrapped) by Validate when no embedded schema
+// exists for the event type. Encode treats it as pass-through (above); the
+// inbound consumer does too, so an unknown event type still reaches
+// ackUnknown.
+var ErrNoSchema = errors.New("no compiled schema registered for this event type")
+
+// Validate checks payload against eventType's embedded schema. It backs
+// both Encode (produced events, before the outbox insert) and cmd/consumer's
+// consumed-payload check (TenantMembershipsPurged, before Handle). Returns
+// an error wrapping ErrNoSchema when eventType has none; any other error
+// means the payload violates its schema or isn't JSON.
+func (c *ValidatingCodec) Validate(eventType string, payload []byte) error {
 	c.mu.RLock()
 	sch, ok := c.schemas[eventType]
 	c.mu.RUnlock()
-	if ok {
-		var doc any
-		if err := json.Unmarshal(payload, &doc); err != nil {
-			return nil, "", fmt.Errorf("validate %s: payload is not JSON: %w", eventType, err)
-		}
-		if err := sch.Validate(doc); err != nil {
-			return nil, "", fmt.Errorf("validate %s: %w", eventType, err)
-		}
+	if !ok {
+		return fmt.Errorf("validate %s: %w", eventType, ErrNoSchema)
 	}
-	return c.inner.Encode(ctx, eventType, payload)
+	var doc any
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return fmt.Errorf("validate %s: payload is not JSON: %w", eventType, err)
+	}
+	if err := sch.Validate(doc); err != nil {
+		return fmt.Errorf("validate %s: %w", eventType, err)
+	}
+	return nil
 }
 
 // Decode delegates to inner — enqueue never decodes; this satisfies events.Codec.

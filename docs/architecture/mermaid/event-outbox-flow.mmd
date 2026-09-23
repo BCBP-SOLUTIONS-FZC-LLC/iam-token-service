@@ -12,6 +12,7 @@ sequenceDiagram
     participant SNS as SNS: iam.serviceaccount.events
     participant SQS as serviceaccount-audit-q
 
+    Note over GLUE,REG: At startup only — per produced event type:<br/>GetSchemaByDefinition(embedded schema, schema-gov's exact compact form)<br/>→ version UUID (must be AVAILABLE), cached for the process lifetime.<br/>Never "latest", no refresher. Not registered yet → startup fails.
     SVC->>CODEC: Encode(eventType, jsonPayload) — validate only,<br/>encoded bytes discarded
     CODEC-->>SVC: ok (schema-valid) or error
     SVC->>TX: same RunInTx as the business write:<br/>INSERT/UPDATE credential row<br/>INSERT outbox_events (plain JSON envelope)
@@ -21,9 +22,7 @@ sequenceDiagram
         RUNNER->>OUT: SELECT unrelayed rows (FOR UPDATE SKIP LOCKED)
         OUT-->>RUNNER: batch
         RUNNER->>GLUE: WithCodec(glueCodec).Encode(eventType, payload)
-        GLUE->>REG: fetch/cache schema version UUID for eventType
-        REG-->>GLUE: schema version id
-        GLUE-->>RUNNER: 18-byte Glue header + payload
+        GLUE-->>RUNNER: 18-byte Glue header (cached version UUID) + payload — no Glue call
         RUNNER->>SNS: Publish(EventType attr, glue-wire-encoded body)
         SNS-->>SQS: fan-out (SNS filter policy: EventType present)
         RUNNER->>OUT: mark relayed

@@ -18,7 +18,7 @@ graph LR
 
     HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(:METRICS_PORT/metrics, separate listener)"]
     METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor / PrometheusRule)"]
-    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>outbox_pending growth"]
+    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>outbox_pending growth"]
 
     HANDLER --> LOGS["Structured logs (slog JSON)<br/>tenant_id, principal_id, version, op, result<br/>— never a credential field (CI secret-log gate)"]
     LOGS --> AGG["Log aggregation<br/>(CloudWatch / equivalent)"]

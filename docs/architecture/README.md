@@ -14,11 +14,11 @@ generator).
 | [write-ordering-discipline.mmd](mermaid/write-ordering-discipline.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Write ordering discipline; LLD §9.3, TS-D11 |
 | [credential-issue-rotate-flow.mmd](mermaid/credential-issue-rotate-flow.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Credential issue/rotate flow (TS-1); LLD §5.4, §9.3 |
 | [credential-revoke-flow.mmd](mermaid/credential-revoke-flow.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Credential revoke flow (TS-2); LLD §5.4, TS-INV-7 |
-| [offboarding-cascade-flow.mmd](mermaid/offboarding-cascade-flow.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Offboarding cascade flow; LLD §7.1, §8.4 |
+| [offboarding-cascade-flow.mmd](mermaid/offboarding-cascade-flow.mmd) | `sequenceDiagram` — consumer pipeline (GlueDecoder → DLQ router → consumed-schema validation) then the cascade | ARCHITECTURE.md § Offboarding cascade flow; LLD §7.1, §8.4 |
 | [reconciler-sweep-flow.mmd](mermaid/reconciler-sweep-flow.mmd) | `flowchart TD` | ARCHITECTURE.md § Reconciler sweep flow (cmd/rotator); LLD §8.3, §8.6 |
 | [cadence-scheduler-flow.mmd](mermaid/cadence-scheduler-flow.mmd) | `flowchart TD` | ARCHITECTURE.md § Cadence scheduler flow (cmd/scheduler); LLD §16 TSQ-6 Resolved, TS-D14 |
 | [rls-guc-flow.mmd](mermaid/rls-guc-flow.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Row-Level Security and GUC injection; LLD §4.3 |
-| [event-outbox-flow.mmd](mermaid/event-outbox-flow.mmd) | `sequenceDiagram` | ARCHITECTURE.md § Event and outbox flow; LLD §7.3.1, §7.4 |
+| [event-outbox-flow.mmd](mermaid/event-outbox-flow.mmd) | `sequenceDiagram` — Glue version resolved once at startup by definition | ARCHITECTURE.md § Event and outbox flow; LLD §7.3.1, §7.4 |
 | [openbao-credential-lifecycle.mmd](mermaid/openbao-credential-lifecycle.mmd) | `sequenceDiagram` | ARCHITECTURE.md § OpenBao credential custody lifecycle; LLD §6.3, §10.5 |
 | [observability-stack.mmd](mermaid/observability-stack.mmd) | `graph LR` | ARCHITECTURE.md § Observability stack; LLD §11 |
 

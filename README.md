@@ -209,7 +209,7 @@ detail live in [`ARCHITECTURE.md`](ARCHITECTURE.md); this is the summary.
 iam-token-service/
 ├── cmd/
 │   ├── server/                        # HTTP composition root: pool+GUC wiring, migrations, outbox runner
-│   ├── consumer/                      # SQS composition root: the one inbound subscription (offboarding)
+│   ├── consumer/                      # SQS composition root: the one inbound subscription (offboarding) — GlueDecoder, DLQ router, consumed-schema validation
 │   ├── rotator/                       # CronJob binary: overlap sweep + orphan reconciler + prune — BYPASSRLS, no `service` dependency (RLS-7)
 │   └── scheduler/                     # CronJob binary: cadence-driven auto-rotation (§16 TSQ-6, TS-D14) — BYPASSRLS scan, but DOES depend on `service`
 ├── internal/
@@ -224,7 +224,7 @@ iam-token-service/
 │       └── outbound/
 │           ├── postgres/              # Repository impls, RLS/GUC wiring, migrations — its own component (not folded into adapters_outbound)
 │           ├── openbao/               # KV v2 client, Kubernetes-auth only — its own component, mirroring TS-INV-1's isolation shape
-│           ├── eventbus/              # Outbox publisher (topic iam-serviceaccount-events) + Glue/Noop/Validating codecs
+│           ├── eventbus/              # Outbox publisher (topic iam-serviceaccount-events) + Glue (version by definition)/GlueDecoder/Noop/Validating codecs
 │           ├── realmprovisioner/      # RP-17 (ClearServiceAccountKeysCache) HTTP client — the one outbound dependency on another IAM service
 │           ├── httpx/                 # Shared instrumented http.RoundTripper (traceparent injection) that realmprovisioner builds on
 │           └── metrics/               # iam_token_service_* (Tier 3) + platform_*/iam_* (Tier 1/2 proposed) Prometheus counters/histograms
@@ -643,6 +643,8 @@ docker compose exec postgres psql -U serviceaccount_app -d serviceaccount -c \
 | `outbox_events` row never gets `published_at` set | `SNS_TOPIC_SERVICEACCOUNT_ARN` mismatch, or outbox runner not started | Re-check `.env` against `aws --region ap-south-1 sns list-topics` (or floci-ui at http://localhost:4502) |
 | `outbox_events` empty after a write | Row was published and pruned, or the write never committed | Re-check the HTTP response code — a `2xx` guarantees the row was committed |
 | Messages keep reappearing after `receive-message` | Normal — SQS visibility timeout, not deletion | Use `delete-message` |
+| `make run` panics with `resolve glue schema ... by definition` | This build's schema definition isn't registered in floci's Glue registry (e.g. a schema changed since floci started) | Recreate floci so `init-floci.sh` re-registers, or unset `GLUE_REGISTRY_NAME` for plain JSON |
+| A `TenantMembershipsPurged` lands in `tenant-lifecycle-tokensvc-q-dlq` immediately | Permanent reject — its `DLQReason` message attribute is `schema_violation` (payload failed `tenant_memberships_purged.json`, e.g. no `tenant_id`); `iam_token_service_consumed_schema_violations_total` rose | Fix the producer payload, or `api/asyncapi.yaml` + `make extract-schemas` if our schema is wrong, then redrive — that tenant's cascade has not run |
 | `floci` never reports healthy | Its healthcheck specifically waits for the `ServiceAccountRevoked` Glue schema to exist (the last resource `init-floci.sh` creates), not just SNS reachability | Check `docker compose logs floci` — a slow init looks like a stuck healthcheck rather than a real failure for the first ~10–20s |
 
 ---
@@ -659,6 +661,11 @@ docker compose exec postgres psql -U serviceaccount_app -d serviceaccount -c \
   end-to-end (this cannot be faked with a static-token shortcut).
 - `test/unit/consumer` — the offboarding cascade's ack-vs-retry semantics
   (missing/invalid envelope id, unknown event type → ack, never DLQ-storm).
+- `cmd/consumer` — the inbound pipeline: a Glue-framed `TenantMembershipsPurged`
+  decoded by the real consumer, consumed-schema validation, straight-to-DLQ
+  routing (`dlq_test.go`, `inbound_schema_test.go`).
+- `test/integration/glue_codec_test.go` — floci Glue: versions resolved by
+  definition, never "latest".
 
 ### Coverage
 
@@ -683,7 +690,7 @@ profiles with a max-count strategy, and enforces the CI coverage floor in
 | `RECONCILER_DATABASE_URL` | direct port | `serviceaccount_reconciler` (`BYPASSRLS`, `SELECT`-only) pool for `cmd/rotator` and `cmd/scheduler` |
 | `OPENBAO_ADDR`, `OPENBAO_ROLE`, `OPENBAO_KV_MOUNT` | `http://localhost:8210`, `iam-token-service`, `iam` | OpenBao Kubernetes-auth login + KV v2 mount |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL` | `ap-south-1`, `test`/`test`, Floci endpoint | AWS SDK config (Floci locally, real AWS in deployed environments) |
-| `GLUE_REGISTRY_NAME` | `iam-serviceaccount-events` | Glue Schema Registry name |
+| `GLUE_REGISTRY_NAME` | `iam-serviceaccount-events` | Glue Schema Registry name. Set → `cmd/server` resolves each produced schema's version UUID once at startup by definition (`glue:GetSchemaByDefinition`); a schema not registered yet fails startup until `schema-registry.yml` registers it. Unset → `NoopCodec` (plain JSON). `cmd/consumer` needs no Glue config — it only strips inbound headers |
 | `SNS_TOPIC_SERVICEACCOUNT_ARN` (or `SNS_TOPIC_ARN` alias) | — | Produced-event topic |
 | `OUTBOX_POLL_INTERVAL`, `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_PUBLISH_CONCURRENCY`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_STARTUP_JITTER`, `OUTBOX_CLAIM_LEASE_DURATION` | see `.env-example` | `platform-events` outbox runner tuning |
 | `SQS_OFFBOARDING_QUEUE_URL`, `SQS_OFFBOARDING_CONCURRENCY`, `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT` | see `.env-example` | Offboarding consumer's one inbound subscription |

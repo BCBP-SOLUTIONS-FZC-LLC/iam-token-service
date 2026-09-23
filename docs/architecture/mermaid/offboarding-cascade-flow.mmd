@@ -2,9 +2,13 @@
 %% subscription. Idempotent via processed_events keyed on envelope id.
 %% Unknown event types and malformed envelope ids are acked, never
 %% retried (ackUnknown / dedup.go) — a producer schema addition must
-%% never DLQ-storm this queue.
+%% never DLQ-storm this queue. Before Handle, cmd/consumer's pipeline strips
+%% the Glue header (GlueDecoder) and validates the payload against the
+%% embedded consumed schema; a violation goes straight to the DLQ.
 sequenceDiagram
     participant SQS as tenant-lifecycle-tokensvc-q
+    participant PIPE as cmd/consumer pipeline<br/>(GlueDecoder → DLQ router → metrics → validateConsumed)
+    participant DLQ as tenant-lifecycle-tokensvc-q-dlq
     participant C as OffboardingConsumer.Handle
     participant PE as processed_events
     participant PRIN as service_account_principals
@@ -12,7 +16,13 @@ sequenceDiagram
     participant BAO as OpenBao KV v2
     participant PUB as outbox_events
 
-    SQS->>C: TenantMembershipsPurged{tenant_id}
+    SQS->>PIPE: TenantMembershipsPurged (Glue header stripped if dataschema set)
+    PIPE->>PIPE: validateConsumed — tenant_memberships_purged.json
+    alt schema violation (e.g. tenant_id missing)
+        PIPE->>DLQ: SendMessage(DLQReason=schema_violation) — then ack
+        Note over PIPE,DLQ: consumed_schema_violations_total++, cascade never runs,<br/>IAMTokenServiceConsumedSchemaViolation pages
+    end
+    PIPE->>C: Handle(env) — valid payloads only
     C->>C: validate envelope id (missing/invalid → ack, log, return nil)
     alt event type != TenantMembershipsPurged
         C->>PE: ackUnknown: MarkProcessed + metric + info log

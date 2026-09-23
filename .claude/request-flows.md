@@ -79,6 +79,12 @@ that converged correctly.
 
 ## 8.4 Offboarding cascade (`TenantMembershipsPurged`)
 
+0. **Before `Handle`** (`cmd/consumer` pipeline): `GlueDecoder` strips the
+   Glue header (O&M publishes this event Glue-encoded); the payload is
+   validated against the embedded `tenant_memberships_purged.json`. A
+   violation (e.g. no `tenant_id`) never reaches the steps below — it is
+   counted (`consumed_schema_violations_total`) and sent straight to the
+   DLQ (`DLQReason=schema_violation`), then acked.
 1. Envelope-id validation: missing or non-UUID → **acked, not retried**
    (logged, no side effect). Unknown event type → `ackUnknown` (metric +
    info log + marked processed) — never DLQ-storms this queue on a
@@ -127,6 +133,7 @@ data loss for that version, never fabricated).
 | Replay against a revoked version (TS-D13) | `409 credential_replay_revoked`, not a misleading `502` |
 | Issue against a revoked principal | `422 principal_revoked` |
 | Offboarding event redelivered | `processed_events` short-circuit, no-op |
+| Offboarding payload fails its embedded schema | Straight to `-dlq` (`DLQReason=schema_violation`) + ack, cascade not run, critical alert; normal redrive if the DLQ can't be resolved or the send fails |
 | Outbox relay lag / SNS outage | Queues in `outbox_events`; drains on recovery; audit delayed, never lost |
 
 ## 15. GDPR / data lifecycle

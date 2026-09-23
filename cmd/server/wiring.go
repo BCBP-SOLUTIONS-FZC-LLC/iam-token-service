@@ -16,23 +16,15 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
-// buildGlueCodec returns a GlueCodec pre-fetching schemaNames from
-// registryName (refreshed every 5 minutes so a new schema version takes
-// effect without a pod restart), or a NoopCodec (plain JSON) when
-// registryName is empty (dev/test without a Glue registry configured) —
-// the frozen registry name (§25) is supplied via GLUE_REGISTRY_NAME in
-// real environments, never hardcoded here.
-func buildGlueCodec(ctx context.Context, glueClient *glue.Client, registryName string, schemaNames []string, log port.Logger) (events.Codec, error) {
+// buildGlueCodec returns a GlueCodec whose schema version UUIDs are
+// resolved once, by definition, from registryName — fixed for the life of
+// the process, so no refresher — or a NoopCodec (plain JSON) when
+// registryName is empty (dev/test without a Glue registry configured).
+func buildGlueCodec(ctx context.Context, glueClient *glue.Client, registryName string, schemaNames []string) (events.Codec, error) {
 	if registryName == "" {
 		return events.NoopCodec{}, nil
 	}
-	gc, err := eventbusadapter.NewGlueCodec(ctx, glueClient, registryName, schemaNames)
-	if err != nil {
-		return nil, err
-	}
-	gc.WithLogger(log)
-	gc.StartRefresher(ctx, 5*time.Minute)
-	return gc, nil
+	return eventbusadapter.NewGlueCodec(ctx, glueClient, registryName, schemaNames)
 }
 
 // loadSNSEnv reads SNS publisher config through platform-events
