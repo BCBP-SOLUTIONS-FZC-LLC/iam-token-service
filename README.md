@@ -498,7 +498,7 @@ CronJob-equivalent binary via `make docker-run-rotator`.
 | `make schema-validate` | Validate AsyncAPI + this service's 5 event schemas — no AWS credentials needed |
 | `make schema-diff CURRENT=… PROPOSED=…` | Show compatibility diff between two schema files |
 | `make schema-register` | Register this service's 5 event schemas to the Glue registry (requires AWS) |
-| `make schema-verify` | Pre-deploy check that all 5 of this service's schemas exist in the target registry |
+| `make schema-verify` | Pre-deploy check that each of this service's 5 schema definitions is registered and `AVAILABLE` — the same lookup the pod runs at startup |
 | `make schema-prune` | Dry-run: list orphaned Glue schemas (`EXECUTE=true` to archive+delete) |
 | `make pin-base-images` | Fetch and pin the current SHA digests for the Dockerfile's base images |
 | `make godoc` | Serve package documentation locally (pkgsite, `:8080`) |

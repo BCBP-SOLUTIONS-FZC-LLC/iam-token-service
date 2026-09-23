@@ -300,7 +300,7 @@ func doRequest(t *testing.T, method, path string, headers map[string]string, bod
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read response body: %v", err)

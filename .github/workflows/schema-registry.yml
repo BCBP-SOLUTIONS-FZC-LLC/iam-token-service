@@ -165,6 +165,19 @@ jobs:
             --env      staging \
             --output   "${{ runner.temp }}/schema-prune-metrics.json"
 
+      # Stages this service's 5 produced schemas under their PascalCase Glue
+      # name (internal/adapter/outbound/eventbus/schemas/*.json is
+      # snake_case) — schema-gov usage-check/diff/register take a schema's
+      # name from its file stem and need the name every other reference to
+      # these events uses (eventbus.ProducedSchemas' map keys, LLD §25,
+      # api/asyncapi.yaml, the EventType metric label). Runs before
+      # usage-check: with the snake_case stems no event ever matched an
+      # asyncapi message, so lifecycle enforcement silently no-op'd.
+      - name: Stage produced Glue schemas
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       # Source selection (v0.4+):
       #   PROMETHEUS_URL set → --source prometheus  (no AWS needed)
       #   not set            → --source disabled   (enforce-lifecycle no-ops)
@@ -184,7 +197,7 @@ jobs:
             SOURCE_FLAGS="--source disabled"
           fi
           schema-gov usage-check \
-            --schema-dir  internal/adapter/outbound/eventbus/schemas \
+            --schema-dir  .tmp/glue-schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -197,15 +210,6 @@ jobs:
           schema-gov enforce-lifecycle \
             --usage-file "${{ runner.temp }}/schema-usage-metrics.json" \
             --asyncapi   api/asyncapi.yaml
-
-      # Stages this service's 5 produced schemas under their PascalCase Glue
-      # name (internal/adapter/outbound/eventbus/schemas/*.json is snake_case) — schema-gov
-      # diff/register need the name every other reference to these events
-      # uses (eventbus.ProducedSchemas' map keys, LLD §25, api/asyncapi.yaml).
-      - name: Stage produced Glue schemas
-        run: |
-          rm -rf .tmp/glue-schemas
-          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
 
       # Fetches current Glue definition per-schema (aws CLI) then diffs via
       # the container. Runs MAX_PARALLEL diffs concurrently; output is
@@ -399,6 +403,12 @@ jobs:
             --env      production \
             --output   "${{ runner.temp }}/schema-prune-metrics.json"
 
+      # Staged before usage-check — see the staging job's step comment.
+      - name: Stage produced Glue schemas
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       - name: Assess event usage
         env:
           PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
@@ -409,7 +419,7 @@ jobs:
             SOURCE_FLAGS="--source disabled"
           fi
           schema-gov usage-check \
-            --schema-dir  internal/adapter/outbound/eventbus/schemas \
+            --schema-dir  .tmp/glue-schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -422,11 +432,6 @@ jobs:
           schema-gov enforce-lifecycle \
             --usage-file "${{ runner.temp }}/schema-usage-metrics.json" \
             --asyncapi   api/asyncapi.yaml
-
-      - name: Stage produced Glue schemas
-        run: |
-          rm -rf .tmp/glue-schemas
-          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
 
       - name: Diff schemas against registry
         env:

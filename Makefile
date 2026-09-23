@@ -63,6 +63,11 @@ TEST_INTERNAL_PKGS := ./cmd/rotator/... \
 # works, black-box.
 COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... 2>/dev/null | tr '\n' ',' | sed 's/,$$//')
 
+# Every build tag a test file here declares (integration: test/integration + test/postgres, e2e: test/e2e). vet and lint run a
+# second pass with all of them — CI's quality gate calls `make vet` /
+# `make lint`, so without it the tagged test files were never checked.
+ALL_TEST_TAGS := integration,e2e
+
 SCHEMA_GOV_IMAGE ?= ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
 
 # -----------------------------
@@ -113,8 +118,9 @@ help:
 	@echo "  make tidy            - go mod tidy"
 	@echo "  make fmt             - go fmt ./..."
 	@echo "  make fmt-check       - verify gofmt formatting (mirrors CI)"
-	@echo "  make vet             - go vet all packages"
-	@echo "  make lint            - run golangci-lint (via go tool)"
+	@echo "  make vet             - go vet (default build + every test build tag)"
+	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
+	@echo "  make arch-lint       - run go-arch-lint against .go-arch-lint.yml"
 	@echo "  make gates           - invariant gates (no-gocloak, no-secret-log, SET-LOCAL-only, gincommon-obs, metrics-taxonomy)"
 	@echo "  make test            - unit + contract + postgres + integration tests (requires Docker)"
 	@echo "  make test-ci         - test with race detector + coverage (used in CI)"
@@ -131,7 +137,7 @@ help:
 	@echo "  make build           - compile all four binaries to bin/"
 	@echo "  make cover           - coverage HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + gates + test-ci + build"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + gates + test-ci + build"
 	@echo "  make docker-up       - start local infra (Postgres/PgBouncer/Floci/OpenBao) + floci-ui web console"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make docker-run-app  - build+run the containerized server+consumer (requires .go_private_token)"
@@ -153,7 +159,7 @@ help:
 	@echo "  make schema-validate  - validate AsyncAPI + event schemas (no AWS needed)"
 	@echo "  make schema-diff      - diff two schemas: CURRENT=<path> PROPOSED=<path>"
 	@echo "  make schema-register  - register event schemas to Glue (requires AWS)"
-	@echo "  make schema-verify    - pre-deploy check for expected schemas"
+	@echo "  make schema-verify    - pre-deploy check: each produced schema definition registered + AVAILABLE (requires AWS)"
 	@echo "  make schema-prune     - dry-run: list orphaned Glue schemas"
 
 # -----------------------------
@@ -171,6 +177,7 @@ fmt:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags=$(ALL_TEST_TAGS) ./...
 
 .PHONY: fmt-check
 fmt-check:
@@ -208,7 +215,14 @@ sast:
 .PHONY: lint
 lint:
 	@echo "Running linter..."
-	$(GO) tool golangci-lint run
+	$(GO) tool golangci-lint run ./...
+	$(GO) tool golangci-lint run --build-tags=$(ALL_TEST_TAGS) ./...
+
+# arch-lint: enforce .go-arch-lint.yml component boundaries — the same script
+# CI runs (validate-test.yml).
+.PHONY: arch-lint
+arch-lint:
+	bash .github/scripts/arch-lint.sh
 
 .PHONY: no-gocloak
 no-gocloak:
@@ -420,7 +434,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint gates test-ci build
+ci: tidy fmt-check vet lint arch-lint gates test-ci build
 
 # -----------------------------
 # COVERAGE
@@ -500,29 +514,41 @@ schema-register:
 	  --registry   "$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)" \
 	  --schema-dir .tmp/glue-schemas
 
-# schema-verify: fail if any of this service's 5 frozen PascalCase schema
-# names (eventbus.ProducedSchemas, §25) is missing from the Glue
-# registry. Requires GLUE_REGISTRY_SERVICEACCOUNT_NAME and AWS credentials.
+# schema-verify: fail unless every produced schema has an AVAILABLE version
+# whose definition matches this checkout's file — the exact lookup GlueCodec
+# does at startup (GetSchemaByDefinition, compact + ASCII-escaped like
+# schema-gov register uploads it). Reads the same PascalCase staged copy
+# schema-register uploads, so it covers exactly the produced schemas. Surfaces
+# "pod would CrashLoop on NewGlueCodec" pre-deploy, which a name-only
+# get-schema check cannot. Requires GLUE_REGISTRY_SERVICEACCOUNT_NAME, AWS credentials (or
+# AWS_ENDPOINT_URL for floci) and python3.
 .PHONY: schema-verify
 schema-verify:
 	@test -n "$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)" || { \
-	  echo "GLUE_REGISTRY_SERVICEACCOUNT_NAME is not set — add it to .env"; \
+	  echo "GLUE_REGISTRY_SERVICEACCOUNT_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	@missing=""; \
-	for name in ServiceAccountRegistered ServiceAccountCredentialIssued ServiceAccountCredentialRotated ServiceAccountCredentialRevoked ServiceAccountRevoked; do \
-	  if ! aws glue get-schema \
+	@rm -rf .tmp/glue-schemas-verify
+	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas-verify >/dev/null
+	@failed=""; count=0; \
+	for file in .tmp/glue-schemas-verify/*.json; do \
+	  name=$$(basename "$$file" .json); count=$$((count + 1)); \
+	  def=$$(python3 -c 'import json,sys; sys.stdout.write(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$$file"); \
+	  status=$$(aws glue get-schema-by-definition \
 	      --schema-id "RegistryName=$(GLUE_REGISTRY_SERVICEACCOUNT_NAME),SchemaName=$$name" \
-	      --region "$(AWS_REGION)" >/dev/null 2>&1; then \
-	    missing="$$missing $$name"; \
+	      --schema-definition "$$def" \
+	      --region "$(AWS_REGION)" --query Status --output text 2>/dev/null); \
+	  if [ "$$status" != "AVAILABLE" ]; then \
+	    failed="$$failed $$name($${status:-not-registered})"; \
 	  fi; \
 	done; \
-	if [ -n "$$missing" ]; then \
-	  echo "FAIL: missing Glue schemas:$$missing"; \
-	  echo "     run 'make schema-register' to create them"; \
+	rm -rf .tmp/glue-schemas-verify; \
+	if [ -n "$$failed" ]; then \
+	  echo "FAIL: this checkout's schema definition is not registered+AVAILABLE in '$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)':$$failed"; \
+	  echo "     run 'make schema-register' (or wait for schema-registry.yml) to register it"; \
 	  exit 1; \
 	fi; \
-	echo "OK: all 5 iam-token-service schemas present in registry '$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)'"
+	echo "OK: all $$count iam-token-service schema definitions registered and AVAILABLE in '$(GLUE_REGISTRY_SERVICEACCOUNT_NAME)'"
 
 # schema-prune: dry-run scan for orphaned Glue schemas (exist in Glue, not in
 # this repo). Pass EXECUTE=true to archive and delete:
