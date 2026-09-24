@@ -22,10 +22,12 @@ type PrincipalService interface {
 	Register(ctx context.Context, tenantID uuid.UUID, req service.RegisterRequest, actor uuid.UUID) (*service.RegisterResult, error)
 	ReadPrincipal(ctx context.Context, tenantID, principalID uuid.UUID) (*service.ReadPrincipalResult, error)
 	FindPrincipalBySub(ctx context.Context, tenantID, principalSub uuid.UUID) (*service.FindBySubResult, error)
+	ReadPlatformAutomation(ctx context.Context, tenantID uuid.UUID) (*service.AutomationPrincipalResult, error)
 }
 
-// PrincipalHandler implements TS-3 (read), TS-4 (register), and TS-5
-// (find-by-sub, AUTH-9) (§5.4).
+// PrincipalHandler implements TS-3 (read), TS-4 (register), TS-5
+// (find-by-sub, AUTH-9), and TS-6 (read the automation principal,
+// TS-D17) (§5.4).
 type PrincipalHandler struct {
 	svc PrincipalService
 }
@@ -244,5 +246,58 @@ func (h *PrincipalHandler) FindBySub(c *gin.Context) {
 	c.JSON(http.StatusOK, principalResponseBody{
 		PrincipalID: res.PrincipalID, TenantID: res.TenantID,
 		PrincipalType: string(res.PrincipalType), Status: string(res.Status), RecordVersion: res.RecordVersion,
+	})
+}
+
+type automationPrincipalResponseBody struct {
+	PrincipalID      uuid.UUID `json:"principal_id"`
+	TenantID         uuid.UUID `json:"tenant_id"`
+	PrincipalSub     uuid.UUID `json:"principal_sub"`
+	KeycloakClientID string    `json:"keycloak_client_id"`
+	PrincipalType    string    `json:"principal_type"`
+	Status           string    `json:"status"`
+	RecordVersion    int       `json:"record_version"`
+}
+
+// ReadPlatformAutomation implements TS-6: GET
+// /api/v1/internal/tenants/:id/service-accounts/platform-automation
+// (TS-D17) — the reverse of TS-5: resolves tenant T's automation subject
+// from the tenant id alone. Addressed by the frozen principal name (the
+// same segment the EXT-6 JWKS route already uses) rather than a
+// principal_id the caller would first have to learn. Identity only, never
+// credential metadata.
+//
+// @Summary      TS-6 — Read the tenant's platform-automation principal
+// @Description  Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material.
+// @Tags         ServiceAccounts
+// @Produce      json
+// @Param        id   path      string  true  "Tenant UUID"  format(uuid)
+// @Success      200  {object}  automationPrincipalResponseBody
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      404  {object}  ErrorResponse  "principal_not_found"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     SystemRole
+// @Security     TenantID
+// @Security     UserID
+// @Router       /tenants/{id}/service-accounts/platform-automation [get]
+func (h *PrincipalHandler) ReadPlatformAutomation(c *gin.Context) {
+	rc, ok := requestctx.FromContext(c.Request.Context())
+	if !ok {
+		writeMissingIdentityHeaders(c)
+		return
+	}
+
+	res, err := h.svc.ReadPlatformAutomation(c.Request.Context(), rc.TenantID)
+	if err != nil {
+		HandleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, automationPrincipalResponseBody{
+		PrincipalID: res.PrincipalID, TenantID: res.TenantID, PrincipalSub: res.PrincipalSub,
+		KeycloakClientID: res.KeycloakClientID, PrincipalType: string(res.PrincipalType),
+		Status: string(res.Status), RecordVersion: res.RecordVersion,
 	})
 }

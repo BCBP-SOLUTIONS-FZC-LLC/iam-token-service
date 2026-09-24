@@ -229,6 +229,16 @@ func TestPrincipalRepository_FindByPrincipalSub_ScanErrorPropagates(t *testing.T
 	assert.Nil(t, got)
 }
 
+func TestPrincipalRepository_FindByType_ScanErrorPropagates(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+	wantErr := errors.New("scan boom")
+	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: wantErr}}}
+
+	got, err := r.FindByType(ctxWithFakeTx(tx), uuid.New(), domain.PrincipalTypePlatformAutomation)
+	require.ErrorIs(t, err, wantErr)
+	assert.Nil(t, got)
+}
+
 func TestPrincipalRepository_Register_InsertScanErrorPropagates(t *testing.T) {
 	r := NewPrincipalRepository(nil)
 	wantErr := errors.New("insert scan boom")

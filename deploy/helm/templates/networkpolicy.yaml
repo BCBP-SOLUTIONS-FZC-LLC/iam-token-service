@@ -57,6 +57,16 @@ spec:
             {{- .Values.networkPolicy.keycloakNamespaceSelector | toYaml | nindent 12 }}
       ports:
         - port: http
+    {{- with .Values.networkPolicy.workflowNamespaceSelector }}
+    # Workflow connector workers reading TS-6 (TS-D17) — optional, only
+    # rendered when Workflow runs outside ingressNamespaceSelector's
+    # namespaces. Header auth still gates the route itself.
+    - from:
+        - namespaceSelector:
+            {{- . | toYaml | nindent 12 }}
+      ports:
+        - port: http
+    {{- end }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
 ---

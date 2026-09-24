@@ -175,6 +175,77 @@ const docTemplate = `{
                 }
             }
         },
+        "/tenants/{id}/service-accounts/platform-automation": {
+            "get": {
+                "security": [
+                    {
+                        "SystemRole": []
+                    },
+                    {
+                        "TenantID": []
+                    },
+                    {
+                        "UserID": []
+                    }
+                ],
+                "description": "Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "ServiceAccounts"
+                ],
+                "summary": "TS-6 — Read the tenant's platform-automation principal",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Tenant UUID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/http.automationPrincipalResponseBody"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_request",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "missing_identity_headers",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "principal_not_found",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "db_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/tenants/{id}/service-accounts/platform-automation/jwks.json": {
             "get": {
                 "description": "Public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches to verify that principal's client_assertion (§2.5). Always 200 with a (possibly empty) keys array; an unknown tenant or absent principal is never distinguished from a principal with zero live keys, since this route has no caller identity to authorize a 404 against.",
@@ -504,6 +575,32 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "trace_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "http.automationPrincipalResponseBody": {
+            "type": "object",
+            "properties": {
+                "keycloak_client_id": {
+                    "type": "string"
+                },
+                "principal_id": {
+                    "type": "string"
+                },
+                "principal_sub": {
+                    "type": "string"
+                },
+                "principal_type": {
+                    "type": "string"
+                },
+                "record_version": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "tenant_id": {
                     "type": "string"
                 }
             }

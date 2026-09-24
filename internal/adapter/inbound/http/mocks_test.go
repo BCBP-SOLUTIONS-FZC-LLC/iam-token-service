@@ -30,6 +30,9 @@ type fakePrincipalService struct {
 
 	findBySubResult *service.FindBySubResult
 	findBySubErr    error
+
+	automationResult *service.AutomationPrincipalResult
+	automationErr    error
 }
 
 func (f *fakePrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req service.RegisterRequest, actor uuid.UUID) (*service.RegisterResult, error) {
@@ -45,6 +48,10 @@ func (f *fakePrincipalService) ReadPrincipal(_ context.Context, _, _ uuid.UUID) 
 
 func (f *fakePrincipalService) FindPrincipalBySub(_ context.Context, _, _ uuid.UUID) (*service.FindBySubResult, error) {
 	return f.findBySubResult, f.findBySubErr
+}
+
+func (f *fakePrincipalService) ReadPlatformAutomation(_ context.Context, _ uuid.UUID) (*service.AutomationPrincipalResult, error) {
+	return f.automationResult, f.automationErr
 }
 
 var _ PrincipalService = (*fakePrincipalService)(nil)

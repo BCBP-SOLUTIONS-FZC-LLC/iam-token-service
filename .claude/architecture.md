@@ -7,7 +7,7 @@ Deep-dive narrative + diagrams: root `ARCHITECTURE.md`.
 
 ```
 cmd/
-  server/      HTTP API (TS-1..TS-5 + EXT-6 JWKS route) + outbox runner  [composition root]
+  server/      HTTP API (TS-1..TS-6 + EXT-6 JWKS route) + outbox runner  [composition root]
   consumer/    offboarding SQS subscriber                   [composition root]
   rotator/     overlap sweep + orphan reconciler + prune     [composition root]
   scheduler/   automatic cadence-driven rotation scan        [composition root]

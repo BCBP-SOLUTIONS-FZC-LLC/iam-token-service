@@ -46,6 +46,7 @@ value. Path params typed-parsed; malformed → `400` before any DB checkout.
 | TS-2 revoke | operators, the offboarding cascade |
 | TS-3 read | Org & Membership, operators |
 | TS-5 find-by-sub | Org & Membership (AUTH-9 non-member defense-in-depth, TS-D16) |
+| TS-6 read platform-automation | Workflow Service connector workers (TS-D17). Admitted by the optional `networkPolicy.workflowNamespaceSelector` when outside the mesh namespaces |
 | JWKS (unauthenticated) | Keycloak's own outbound client-jwt fetch (EXT-6) — the one route not on this list's system-principal model |
 
 `cmd/rotator` never calls TS-1 and calls no HTTP route at all — it drives

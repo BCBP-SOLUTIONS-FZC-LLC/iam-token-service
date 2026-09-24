@@ -30,6 +30,14 @@ type PrincipalRepository interface {
 	// principal.
 	FindByPrincipalSub(ctx context.Context, tenantID, principalSub uuid.UUID) (*domain.ServiceAccountPrincipal, error)
 
+	// FindByType reads the tenant's principal of principalType
+	// (uq_sap_active_principal — at most one per tenant) under the
+	// caller's RLS-scoped tenant — the TS-6 lookup (TS-D17), the reverse
+	// of FindByPrincipalSub: "which subject is tenant T's automation
+	// principal". Returns domain.ErrPrincipalNotFound when the tenant has
+	// none yet (not minted, or offboarded).
+	FindByType(ctx context.Context, tenantID uuid.UUID, principalType domain.PrincipalType) (*domain.ServiceAccountPrincipal, error)
+
 	// Register inserts p if no principal yet exists for
 	// (tenant_id, principal_type) (uq_sap_active_principal); idempotent —
 	// a repeat call with an unchanged principal_sub/keycloak_client_id

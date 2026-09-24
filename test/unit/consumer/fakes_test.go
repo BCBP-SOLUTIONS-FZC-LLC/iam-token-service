@@ -84,6 +84,15 @@ func (f *fakePrincipalRepository) FindByPrincipalSub(_ context.Context, tenantID
 	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
 }
 
+func (f *fakePrincipalRepository) FindByType(_ context.Context, tenantID uuid.UUID, principalType domain.PrincipalType) (*domain.ServiceAccountPrincipal, error) {
+	for _, p := range f.byTenant[tenantID] {
+		if p.PrincipalType == principalType {
+			return p, nil
+		}
+	}
+	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+}
+
 func (f *fakePrincipalRepository) ListByTenant(_ context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
 	if f.listByTenantErr != nil {
 		return nil, f.listByTenantErr

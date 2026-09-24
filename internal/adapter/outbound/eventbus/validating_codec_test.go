@@ -65,6 +65,38 @@ func TestValidatingCodec_Encode_ValidPayloadPassesThroughToInner(t *testing.T) {
 	assert.JSONEq(t, string(payload), string(encoded))
 }
 
+// ServiceAccountRegistered's keycloak_client_id accepts exactly the two
+// shapes TS-4 accepts (domain.ValidPlatformAutomationClientID, §25 rev
+// 1.1) — the tenant-scoped one is every RP-1 trial mint and RP-4 revert
+// re-mint, which a const "platform-automation" rejected with a 500.
+func TestValidatingCodec_Encode_ServiceAccountRegisteredClientIDShapes(t *testing.T) {
+	c, err := NewValidatingCodec(NoopCodec{})
+	require.NoError(t, err)
+
+	for clientID, ok := range map[string]bool{
+		"platform-automation": true,
+		"platform-automation-11111111-1111-1111-1111-111111111111": true,
+		"platform-automation-":           false,
+		"platform-automation-not-a-uuid": false,
+		"other-client":                   false,
+	} {
+		payload := []byte(`{
+			"tenant_id": "11111111-1111-1111-1111-111111111111",
+			"principal_id": "22222222-2222-2222-2222-222222222222",
+			"principal_sub": "33333333-3333-3333-3333-333333333333",
+			"keycloak_client_id": "` + clientID + `",
+			"principal_type": "platform_automation",
+			"created_at": "2026-01-01T00:00:00Z"
+		}`)
+		_, _, err := c.Encode(context.Background(), "ServiceAccountRegistered", payload)
+		if ok {
+			assert.NoError(t, err, clientID)
+		} else {
+			assert.Error(t, err, clientID)
+		}
+	}
+}
+
 func TestValidatingCodec_Encode_MissingRequiredFieldFails(t *testing.T) {
 	c, err := NewValidatingCodec(NoopCodec{})
 	require.NoError(t, err)

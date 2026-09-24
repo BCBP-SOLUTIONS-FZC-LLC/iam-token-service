@@ -123,6 +123,16 @@ networkPolicy:
   #     matchLabels:
   #       app: keycloak
   keycloakNamespaceSelector: {}
+  # Optional (TS-D17) — the Workflow Service's connector workers call TS-6
+  # (GET .../service-accounts/platform-automation) to learn each tenant's
+  # automation subject. Leave empty when Workflow already runs inside the
+  # ingressNamespaceSelector namespaces; otherwise set it to Workflow's own
+  # namespace, e.g.:
+  #   workflowNamespaceSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/part-of: workflow
+  # Header auth (x-user-id: iam-system) still gates every route here.
+  workflowNamespaceSelector: {}
   postgresPort: 5432
   openbaoPort: 8200
   otelPort: 4317

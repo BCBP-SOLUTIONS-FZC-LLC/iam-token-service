@@ -8,6 +8,12 @@ This service has never been deployed to any environment — there is no released
 
 ### Added
 
+- **TS-6 `GET /api/v1/internal/tenants/:id/service-accounts/platform-automation` (TS-D17).** Reads the tenant's automation principal, including `principal_sub`, from the tenant id alone. The Workflow Service's connector workers use it to name the acting principal on step callbacks; TS-5 answers only the reverse question.
+  - Code: `PrincipalRepository.FindByType`, `PrincipalService.ReadPlatformAutomation` and `PrincipalHandler.ReadPlatformAutomation`.
+  - Tests: unit, postgres and e2e. The e2e covers register, re-mint and read, and asserts `principal_id` is stable while `principal_sub` follows the re-mint.
+  - Helm: new optional `networkPolicy.workflowNamespaceSelector` ingress rule.
+  - Docs: LLD §5.3/§5.4/§18.5a/§22.
+
 - **`cmd/scheduler` — automatic cadence-driven rotation (§16 TSQ-6 Resolved, TS-D14).** A fourth binary, alongside `server`/`consumer`/`rotator`, closing the gap the "Corrected an overclaim" entry below first identified:
   - `service_account_credentials` gained `rotation_cadence_days`/`next_rotation_at` (migration `000002_rotation_cadence`) plus the partial index `idx_sac_next_rotation`; `CredentialService.IssueOrRotate` now stamps both on every issue/rotate (default `domain.DefaultCadenceDays` = 90, overridable via `WithCadenceDays`/`ROTATION_DEFAULT_CADENCE_DAYS`) and clears them on demote-to-rotating — only the current `active` row is ever "due". TS-3 exposes both fields read-only.
   - New `port.ReconcilerRepository.ListDueForRotation` + Postgres impl — the same BYPASSRLS `serviceaccount_reconciler` enumeration pattern `cmd/rotator` uses (RLS-7), reused here for the due-list scan only; every actual rotation still goes through the ordinary RLS-scoped `CredentialService.IssueOrRotate`.
@@ -41,6 +47,10 @@ Initial build of the Token Service — custodian of the platform-automation serv
 - **CI** (`.github/workflows/ci.yml`) — go-arch-lint, the three invariant gates (no-gocloak/TS-INV-1, no-secret-log/TS-INV-2, SET-LOCAL-only/RLS-6), format/vet/build, unit/contract/Postgres-RLS test suites.
 
 ### Fixed
+
+- **`ServiceAccountRegistered` rejected every shared-realm registration.** `keycloak_client_id` was still `const: "platform-automation"` in `api/asyncapi.yaml` and the embedded schema after rev 1.1 widened TS-4 to `platform-automation-<tenant_id>`.
+  - Effect: the enqueue-time `ValidatingCodec` failed TS-4's transaction with a 500, so every RP-1 trial mint and every RP-4 revert re-mint broke.
+  - Fix: the field is now `pattern: ^platform-automation(-<uuid>)?$`, a BACKWARD-compatible loosening that matches `domain.ValidPlatformAutomationClientID`. A codec table test covers it.
 
 **Event pipeline hardening (LLD rev 1.4), 2026-09-23:**
 

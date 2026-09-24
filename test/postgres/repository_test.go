@@ -500,6 +500,71 @@ func TestPrincipalRepository_FindByPrincipalSub(t *testing.T) {
 	assert.Equal(t, domain.ErrPrincipalNotFound, domainErr.Code)
 }
 
+// TestPrincipalRepository_FindByType covers TS-6 (TS-D17): the tenant's
+// automation principal resolves from the tenant id alone; an RP-3/RP-4
+// re-mint carry-over changes the sub it returns but not principal_id; a
+// tenant with none, or a caller GUC bound to another tenant, is
+// principal_not_found.
+func TestPrincipalRepository_FindByType(t *testing.T) {
+	t.Parallel()
+	appPool, _, _ := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	repo := pgadapter.NewPrincipalRepository(appPool)
+	txRunner := pgadapter.NewTxRunner(appPool, nil)
+
+	find := func(guc, tenant uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+		var found *domain.ServiceAccountPrincipal
+		err := txRunner.RunInTx(withTenant(ctx, guc), func(ctx context.Context) error {
+			var err error
+			found, err = repo.FindByType(ctx, tenant, domain.PrincipalTypePlatformAutomation)
+			return err
+		})
+		return found, err
+	}
+	register := func(sub uuid.UUID, clientID string) *domain.ServiceAccountPrincipal {
+		var out *domain.ServiceAccountPrincipal
+		require.NoError(t, txRunner.RunInTx(withTenant(ctx, tenantID), func(ctx context.Context) error {
+			var err error
+			out, _, _, err = repo.Register(ctx, &domain.ServiceAccountPrincipal{
+				TenantID: tenantID, PrincipalSub: sub, KeycloakClientID: clientID,
+				PrincipalType: domain.PrincipalTypePlatformAutomation,
+			})
+			return err
+		}))
+		return out
+	}
+	assertNotFound := func(err error) {
+		t.Helper()
+		require.Error(t, err)
+		domainErr, ok := err.(*domain.Error)
+		require.True(t, ok, "expected *domain.Error, got %T: %v", err, err)
+		assert.Equal(t, domain.ErrPrincipalNotFound, domainErr.Code)
+	}
+
+	_, err := find(tenantID, tenantID)
+	assertNotFound(err)
+
+	trialSub := uuid.New()
+	minted := register(trialSub, domain.KeycloakClientPlatformAutomation+"-"+tenantID.String())
+	found, err := find(tenantID, tenantID)
+	require.NoError(t, err)
+	assert.Equal(t, minted.ID, found.ID)
+	assert.Equal(t, trialSub, found.PrincipalSub)
+
+	// RP-3 convert re-mints in the dedicated realm: new sub, same principal.
+	dedicatedSub := uuid.New()
+	register(dedicatedSub, domain.KeycloakClientPlatformAutomation)
+	found, err = find(tenantID, tenantID)
+	require.NoError(t, err)
+	assert.Equal(t, minted.ID, found.ID, "principal_id must survive a re-mint")
+	assert.Equal(t, dedicatedSub, found.PrincipalSub, "principal_sub follows the re-mint")
+
+	// Cross-tenant invisible under RLS (§5.5).
+	_, err = find(uuid.New(), tenantID)
+	assertNotFound(err)
+}
+
 // TestCredentialRepository_FindNotFoundReturnsNilNotError — FindByVersion,
 // FindActive, and FindByRotationID all return (nil, nil) — not an error —
 // when no matching row exists, mirroring the in-memory fake's behavior

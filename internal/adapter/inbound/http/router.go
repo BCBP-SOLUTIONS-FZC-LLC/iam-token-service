@@ -62,7 +62,7 @@ func (r *Router) Handler() http.Handler { return r.engine }
 
 // NewRouter builds and wires every route this service exposes: the
 // unauthenticated infra probes and the mesh-only /api/v1/internal/*
-// credential-lifecycle API (TS-1..TS-4, §5.1).
+// credential-lifecycle API (TS-1..TS-6, §5.1).
 func NewRouter(cfg RouterConfig) *Router {
 	errorLogger = cfg.GinConfig.Logger
 
@@ -219,7 +219,7 @@ func registerJWKSRoutes(r *gin.Engine, cfg RouterConfig) {
 	r.GET("/api/v1/internal/tenants/:id/service-accounts/platform-automation/jwks.json", h.JWKS.JWKS)
 }
 
-// ── Credential-lifecycle API — /api/v1/internal/* (TS-1..TS-4, §5.1/§25) ──
+// ── Credential-lifecycle API — /api/v1/internal/* (TS-1..TS-6, §5.1/§25) ──
 
 func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 	h := cfg.Handlers
@@ -236,6 +236,7 @@ func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 	tenantScoped := internal.Group("/tenants/:id", RequireTenantPathMatch())
 	tenantScoped.POST("/service-accounts", h.Principal.Register)                                          // TS-4
 	tenantScoped.GET("/service-accounts", h.Principal.FindBySub)                                          // TS-5 (AUTH-9)
+	tenantScoped.GET("/service-accounts/platform-automation", h.Principal.ReadPlatformAutomation)         // TS-6 (TS-D17)
 	tenantScoped.GET("/service-accounts/:principal_id", h.Principal.Read)                                 // TS-3
 	tenantScoped.POST("/service-accounts/:principal_id/credentials", h.Credential.IssueOrRotate)          // TS-1
 	tenantScoped.POST("/service-accounts/:principal_id/credentials/:version/revoke", h.Credential.Revoke) // TS-2

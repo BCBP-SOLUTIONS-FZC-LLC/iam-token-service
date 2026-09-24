@@ -10,8 +10,9 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 )
 
-// PrincipalService implements TS-4 (register) and TS-3 (read metadata)
-// (§5.4, §8.1, §8.5).
+// PrincipalService implements TS-4 (register), TS-3 (read metadata),
+// TS-5 (find by sub) and TS-6 (read the automation principal) (§5.4,
+// §8.1, §8.5).
 type PrincipalService struct {
 	principals  port.PrincipalRepository
 	credentials port.CredentialRepository
@@ -123,6 +124,40 @@ func (s *PrincipalService) FindPrincipalBySub(ctx context.Context, tenantID, pri
 	return &FindBySubResult{
 		PrincipalID: p.ID, TenantID: p.TenantID,
 		PrincipalType: p.PrincipalType, Status: p.Status, RecordVersion: p.RecordVersion,
+	}, nil
+}
+
+// AutomationPrincipalResult is the TS-6 response body (TS-D17): the
+// tenant's platform-automation identity — the subject a caller names as
+// the acting principal — without credential metadata (TS-3 serves that).
+type AutomationPrincipalResult struct {
+	PrincipalID      uuid.UUID
+	TenantID         uuid.UUID
+	PrincipalSub     uuid.UUID
+	KeycloakClientID string
+	PrincipalType    domain.PrincipalType
+	Status           domain.PrincipalStatus
+	RecordVersion    int
+}
+
+// ReadPlatformAutomation implements TS-6 (TS-D17): resolves tenant T's
+// platform-automation principal, so a caller that has only a tenant id (a
+// Workflow connector worker naming the acting principal on a callback)
+// can learn its Keycloak sub. The reverse of FindPrincipalBySub. The sub
+// is stable across credential rotation (TS-1 never touches the principal
+// row) but NOT across an RP-3 convert / RP-4 revert re-mint, which
+// re-registers the same principal_id against a new sub (TS-4, §5.4) —
+// principal_id is the identity that survives. Returns
+// domain.ErrPrincipalNotFound when the tenant has none.
+func (s *PrincipalService) ReadPlatformAutomation(ctx context.Context, tenantID uuid.UUID) (*AutomationPrincipalResult, error) {
+	p, err := s.principals.FindByType(ctx, tenantID, domain.PrincipalTypePlatformAutomation)
+	if err != nil {
+		return nil, err
+	}
+	return &AutomationPrincipalResult{
+		PrincipalID: p.ID, TenantID: p.TenantID, PrincipalSub: p.PrincipalSub,
+		KeycloakClientID: p.KeycloakClientID, PrincipalType: p.PrincipalType,
+		Status: p.Status, RecordVersion: p.RecordVersion,
 	}, nil
 }
 

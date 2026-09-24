@@ -14,6 +14,23 @@ definitions:
       trace_id:
         type: string
     type: object
+  http.automationPrincipalResponseBody:
+    properties:
+      keycloak_client_id:
+        type: string
+      principal_id:
+        type: string
+      principal_sub:
+        type: string
+      principal_type:
+        type: string
+      record_version:
+        type: integer
+      status:
+        type: string
+      tenant_id:
+        type: string
+    type: object
   http.credentialSummaryBody:
     properties:
       expires_at:
@@ -406,6 +423,55 @@ paths:
       summary: TS-2 — Revoke credential version
       tags:
       - Credentials
+  /tenants/{id}/service-accounts/platform-automation:
+    get:
+      description: Returns the tenant's platform-automation principal, including its
+        Keycloak sub (principal_sub) — the subject a caller names as the acting principal
+        (e.g. Workflow's connector callbacks). principal_sub is stable across credential
+        rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints
+        the client in another realm; principal_id is stable across both. Never returns
+        credential metadata or material.
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.automationPrincipalResponseBody'
+        "400":
+          description: invalid_request
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "401":
+          description: missing_identity_headers
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "404":
+          description: principal_not_found
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+      security:
+      - SystemRole: []
+      - TenantID: []
+      - UserID: []
+      summary: TS-6 — Read the tenant's platform-automation principal
+      tags:
+      - ServiceAccounts
   /tenants/{id}/service-accounts/platform-automation/jwks.json:
     get:
       description: Public JWK Set for the tenant's platform-automation principal —

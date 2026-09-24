@@ -41,6 +41,7 @@ on `/api/v1/internal/*`.
 | TS-2 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials/:version/revoke` | Revoke one version | Yes (re-revoke is a no-op) |
 | TS-3 | `GET /api/v1/internal/tenants/:id/service-accounts/:principal_id` | Read metadata — never a secret | Read |
 | TS-5 | `GET /api/v1/internal/tenants/:id/service-accounts?principal_sub=<uuid>` | Find by Keycloak `sub` (AUTH-9, TS-D16) — identity/status only, never credential metadata; used by org-membership's non-member defense-in-depth check | Read |
+| TS-6 | `GET /api/v1/internal/tenants/:id/service-accounts/platform-automation` | Read the tenant's automation principal (TS-D17). It's the reverse of TS-5, returning `principal_sub` from the tenant id alone. Identity only; used by the Workflow Service's connector callbacks. `principal_sub` changes on an RP-3/RP-4 re-mint, and `principal_id` doesn't | Read |
 | TS-H | `GET /healthz`, `GET /readyz` | Liveness/readiness | Read |
 | TS-D | `GET /asyncapi`, `GET /asyncapi.yaml`, `GET /swagger/*any` | Rendered/raw contracts (gated) | Read |
 | — | `GET .../service-accounts/platform-automation/jwks.json` | EXT-6: public JWK Set for Keycloak's client-jwt authenticator; the one unauthenticated-by-header route, rate-limited | Read |
@@ -48,7 +49,8 @@ on `/api/v1/internal/*`.
 `GET .../service-accounts` is not a listing endpoint — TS-5's
 `principal_sub` query parameter is required, and the response is a single
 principal or `404`, never a collection. Exactly one automation principal
-per tenant, read directly by TS-3 or TS-5.
+per tenant, read directly by TS-3 (by id), TS-5 (by sub) or TS-6 (by
+its frozen name, returning the sub).
 
 ## 5.5 Status codes (full taxonomy in `internal/core/domain/errors.go`)
 
@@ -106,7 +108,7 @@ side effect matters); Glue wire-encoding happens later, at publish time
 
 | Event | Emitted when | Consumers |
 |---|---|---|
-| `ServiceAccountRegistered` | TS-4 registers a principal | Audit |
+| `ServiceAccountRegistered` | TS-4 registers a principal, or re-registers it against a re-minted client (RP-3/RP-4; new `principal_sub`, same `principal_id`) | Audit; Workflow may use it to refresh a cached TS-6 sub |
 | `ServiceAccountCredentialIssued` | TS-1 first credential (`version=1`) | Audit |
 | `ServiceAccountCredentialRotated` | TS-1 rotation (`version>1`) | Audit |
 | `ServiceAccountCredentialRevoked` | TS-2, overlap sweep, or offboarding revoke | Audit |

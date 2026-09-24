@@ -85,7 +85,7 @@ issue/rotate semantics, or the offboarding cascade. Concretely:
 
 ## API overview
 
-6 routes (TS-1..TS-5 plus the EXT-6 JWKS route) plus health/docs, all
+7 routes (TS-1..TS-6 plus the EXT-6 JWKS route) plus health/docs, all
 registered from `internal/adapter/inbound/http/router.go`'s `NewRouter` —
 the single source of truth; the generated Swagger spec (`make swag`,
 `docs/swagger/`) is derived from `swaggo` annotations on the handlers,
@@ -111,7 +111,7 @@ intrinsically part of the request's meaning (which rotation this is), not
 an opaque retry token layered on top. Reusing the same `rotation_id`
 against an in-flight or already-committed rotation replays the stored
 result (`200`, not `201`); a *different* `rotation_id` arriving while one
-is still in flight is `409 rotation_in_flight`. TS-2/TS-3/TS-4/TS-5 are
+is still in flight is `409 rotation_in_flight`. TS-2/TS-3/TS-4/TS-5/TS-6 are
 naturally idempotent from their own request shape (a revoke of an
 already-revoked version, or a repeat registration, is a no-op success)
 and need no separate token at all.
@@ -125,10 +125,11 @@ and need no separate token at all.
 | TS-2 | `POST /api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials/:version/revoke` | Revoking an already-revoked version is a no-op success | Revoke one credential version immediately; deletes its OpenBao material | `…CredentialRevoked` |
 | TS-3 | `GET /api/v1/internal/tenants/:id/service-accounts/:principal_id` | Read-only | Read principal + credential **metadata** — never a key | — |
 | TS-5 | `GET /api/v1/internal/tenants/:id/service-accounts?principal_sub=<uuid>` | Read-only | Find a principal by its Keycloak `sub` instead of this service's own internal id (AUTH-9) — identity/status only, never credential metadata; used by org-membership's non-member defense-in-depth check | — |
+| TS-6 | `GET /api/v1/internal/tenants/:id/service-accounts/platform-automation` | Read-only | Read the tenant's automation principal, including its Keycloak `sub` (TS-D17). It's the reverse of TS-5, and the Workflow Service's connector workers use it to name the acting principal. The sub is stable across rotation and changes on an RP-3/RP-4 re-mint; `principal_id` is the stable handle | — |
 | — | `GET .../service-accounts/platform-automation/jwks.json` | Read-only, unauthenticated | EXT-6: public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches | — |
 
 There are no "operator-only" routes on this service the way the Realm
-Provisioner has RP-13/RP-14 behind `RequireOperatorRole` — every TS-1..TS-5
+Provisioner has RP-13/RP-14 behind `RequireOperatorRole` — every TS-1..TS-6
 route accepts the same one caller identity, the reserved system principal
 (`x-user-id: 00000000-0000-0000-0000-0000000000a1`); there is no
 `platform_operator`-vs-`iam-system` distinction anywhere in this service's
@@ -216,10 +217,10 @@ iam-token-service/
 │   ├── core/
 │   │   ├── domain/                    # Entities, value objects, ErrorCode taxonomy (§17), event payload structs
 │   │   ├── port/                      # CredentialRepository, PrincipalRepository, SecretStore, EventPublisher, RealmProvisionerClient, TxRunner, ReconcilerRepository
-│   │   └── service/                   # CredentialService (TS-1/TS-2), PrincipalService (TS-3/TS-4/TS-5), JWKSService, secret_generator (RSA-2048 keypairs)
+│   │   └── service/                   # CredentialService (TS-1/TS-2), PrincipalService (TS-3/TS-4/TS-5/TS-6), JWKSService, secret_generator (RSA-2048 keypairs)
 │   └── adapter/
 │       ├── inbound/
-│       │   ├── http/                  # Gin handlers (TS-1..TS-5), JWKS handler, middleware, router.go, /swagger, /asyncapi
+│       │   ├── http/                  # Gin handlers (TS-1..TS-6), JWKS handler, middleware, router.go, /swagger, /asyncapi
 │       │   └── consumer/              # The one SQS consumer: offboarding_consumer.go + dedup.go (ackUnknown semantics)
 │       └── outbound/
 │           ├── postgres/              # Repository impls, RLS/GUC wiring, migrations — its own component (not folded into adapters_outbound)
@@ -406,7 +407,7 @@ same result (TS-D13).
 
 ### 10. Rate limits
 
-**Every internal route (TS-1..TS-5) applies no inbound rate limiting of
+**Every internal route (TS-1..TS-6) applies no inbound rate limiting of
 its own** — all callers are trusted in-mesh backends behind a
 NetworkPolicy allow-list, not external/public traffic. The one exception
 is the EXT-6 JWKS route, which is deliberately unauthenticated by header
@@ -781,7 +782,7 @@ Structured `slog` JSON logs carry `tenant_id`/`principal_id`/`version`/`op`/
 
 | Binary | Entrypoint | Purpose |
 |---|---|---|
-| `cmd/server` | `/iam-token-service` (default) | HTTP API (TS-1..TS-5 + EXT-6 JWKS route) + outbox runner |
+| `cmd/server` | `/iam-token-service` (default) | HTTP API (TS-1..TS-6 + EXT-6 JWKS route) + outbox runner |
 | `cmd/consumer` | `/iam-token-service-consumer` | Offboarding SQS subscriber |
 | `cmd/rotator` | `/iam-token-service-rotator` | Overlap-expiry sweep + orphan-material reconciler + prune, run-to-completion |
 | `cmd/scheduler` | `/iam-token-service-scheduler` | Automatic cadence-driven rotation scan + RP-17 key-refresh call (§16 TSQ-6 Resolved, TS-D14), run-to-completion |
@@ -962,6 +963,7 @@ AWS_REGION=ap-south-1 AWS_ENDPOINT_URL=http://localhost:4568 GLUE_REGISTRY_NAME=
 |---|---|---|
 | Called by | Realm Provisioner | TS-4 (register), TS-1 (issue/rotate) — RP discards the returned private-key plaintext immediately and calls Keycloak's `ClearServiceAccountKeysCache` (RP-17) instead, so Keycloak re-fetches this service's own JWKS (EXT-6) |
 | Called by | Org & Membership, operators | TS-3 (read metadata), TS-5 (find-by-sub, AUTH-9 non-member defense-in-depth) |
+| Called by | Workflow Service | TS-6 (read the tenant's automation subject for connector callbacks, TS-D17) |
 | Called by | Keycloak | The EXT-6 JWKS route — the one unauthenticated-by-header, fully public route |
 | Called by | Operators, O&M tooling, `cmd/scheduler` | TS-1 (rotate), TS-2 (revoke) — `cmd/scheduler` automatically rotates any principal past its `next_rotation_at` (LLD §16 TSQ-6 Resolved, TS-D14), then calls RP-17 itself so Keycloak re-fetches the JWKS. `cmd/rotator` never calls TS-1, but it does call RP-17 after every automatic revoke (TS-D15) |
 | Consumes from | Org & Membership / Core | `TenantMembershipsPurged` (tenant-lifecycle topic) |

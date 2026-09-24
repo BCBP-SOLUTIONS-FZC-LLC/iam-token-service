@@ -264,7 +264,10 @@ components:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
         principal_sub: { type: string, format: uuid }
-        keycloak_client_id: { type: string, const: "platform-automation" }
+        # The frozen base name (dedicated realm) or that name suffixed with the
+        # owning tenant UUID (shared trial realm, RP-1/RP-4) — the same two shapes
+        # TS-4 accepts (domain.ValidPlatformAutomationClientID, §25 rev 1.1).
+        keycloak_client_id: { type: string, pattern: "^platform-automation(-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$" }
         principal_type: { type: string, enum: [platform_automation] }
         created_at: { type: string, format: date-time }
 

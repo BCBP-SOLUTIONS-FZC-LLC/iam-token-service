@@ -153,8 +153,9 @@ func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 	principalID := uuid.New()
 
 	principalSvc := &fakePrincipalService{
-		registerResult: &service.RegisterResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive, Created: true},
-		readResult:     &service.ReadPrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive},
+		registerResult:   &service.RegisterResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive, Created: true},
+		readResult:       &service.ReadPrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive},
+		automationResult: &service.AutomationPrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive},
 	}
 	credentialSvc := &fakeCredentialService{
 		issueResult:  &service.IssueOrRotateResult{Version: 1, Secret: "s"},
@@ -171,6 +172,7 @@ func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 		want   int
 	}{
 		{"TS-4 register", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts", []byte(`{"principal_sub":"` + uuid.New().String() + `","keycloak_client_id":"platform-automation"}`), http.StatusCreated},
+		{"TS-6 read platform-automation", http.MethodGet, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/platform-automation", nil, http.StatusOK},
 		{"TS-3 read", http.MethodGet, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String(), nil, http.StatusOK},
 		{"TS-1 issue", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String() + "/credentials", []byte(`{"rotation_id":"` + uuid.New().String() + `"}`), http.StatusCreated},
 		{"TS-2 revoke", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String() + "/credentials/1/revoke", nil, http.StatusOK},

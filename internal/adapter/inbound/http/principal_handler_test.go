@@ -19,6 +19,7 @@ func newPrincipalTestRouter(svc PrincipalService) *gin.Engine {
 	return newTenantScopedTestRouter(func(g *gin.RouterGroup) {
 		g.POST("/service-accounts", h.Register)
 		g.GET("/service-accounts", h.FindBySub)
+		g.GET("/service-accounts/platform-automation", h.ReadPlatformAutomation)
 		g.GET("/service-accounts/:principal_id", h.Read)
 	})
 }
@@ -224,4 +225,42 @@ func TestPrincipalHandler_DefensiveMissingRequestContext(t *testing.T) {
 
 	rec = doRequest(t, r, http.MethodGet, "/service-accounts?principal_sub="+uuid.New().String(), nil, nil)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestPrincipalHandler_ReadPlatformAutomation(t *testing.T) {
+	tenantID := uuid.New()
+	principalID := uuid.New()
+	principalSub := uuid.New()
+	path := "/tenants/" + tenantID.String() + "/service-accounts/platform-automation"
+
+	t.Run("200 found — carries principal_sub", func(t *testing.T) {
+		svc := &fakePrincipalService{automationResult: &service.AutomationPrincipalResult{
+			PrincipalID: principalID, TenantID: tenantID, PrincipalSub: principalSub,
+			KeycloakClientID: domain.KeycloakClientPlatformAutomation, PrincipalType: domain.PrincipalTypePlatformAutomation,
+			Status: domain.PrincipalStatusActive, RecordVersion: 2,
+		}}
+		r := newPrincipalTestRouter(svc)
+		var body automationPrincipalResponseBody
+		rec := doJSON(t, r, http.MethodGet, path, sysHeaders(tenantID), nil, &body)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, principalID, body.PrincipalID)
+		assert.Equal(t, principalSub, body.PrincipalSub)
+		assert.Equal(t, domain.KeycloakClientPlatformAutomation, body.KeycloakClientID)
+		assert.Equal(t, "platform_automation", body.PrincipalType)
+		assert.Equal(t, 2, body.RecordVersion)
+		assert.NotContains(t, rec.Body.String(), "credentials", "TS-6 is identity only — no credential metadata")
+	})
+
+	t.Run("404 not minted yet", func(t *testing.T) {
+		svc := &fakePrincipalService{automationErr: domain.NewError(domain.ErrPrincipalNotFound, "no principal")}
+		r := newPrincipalTestRouter(svc)
+		rec := doRequest(t, r, http.MethodGet, path, sysHeaders(tenantID), nil)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("401 missing identity headers", func(t *testing.T) {
+		r := newPrincipalTestRouter(&fakePrincipalService{})
+		rec := doRequest(t, r, http.MethodGet, path, nil, nil)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	})
 }

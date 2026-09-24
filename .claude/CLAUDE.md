@@ -190,8 +190,14 @@ Full detail in **[.claude/database-schema.md](database-schema.md)**.
 
 ## API & events
 
-6 routes (TS-1..TS-5 plus the EXT-6 JWKS route) under
-`/api/v1/internal/*`. TS-5 (`GET …/service-accounts?principal_sub=<uuid>`,
+7 routes (TS-1..TS-6 plus the EXT-6 JWKS route) under
+`/api/v1/internal/*`. TS-6 (`GET …/service-accounts/platform-automation`,
+TS-D17) is the reverse of TS-5: it gives the Workflow Service's connector
+workers a tenant's automation `principal_sub` from the tenant id alone.
+The sub is stable across rotation but changes on an RP-3/RP-4 re-mint;
+`principal_id` doesn't. `ServiceAccountRegistered`'s `keycloak_client_id`
+now accepts the tenant-scoped shape too. It was a `const`, which 500'd
+every RP-1/RP-4 registration. TS-5 (`GET …/service-accounts?principal_sub=<uuid>`,
 TS-D16) finds a principal by Keycloak sub instead of this service's own
 internal id — org-membership's AUTH-9 non-member defense-in-depth check
 needs it, since a subject's sub is the only identifier that check ever
