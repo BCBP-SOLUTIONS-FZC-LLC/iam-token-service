@@ -1,6 +1,6 @@
 # Operations
 
-Section numbers mirror the LLD's own numbering (`docs/iam-lld-token-service.md`)
+Section numbers mirror the LLD's own numbering (`docs/lld/iam-lld-token-service.md`)
 so this file stays traceable to the signed-off design. This is the
 canonical source for exact metric/env-var names — README summarizes and
 points here; the LLD is still the tie-breaker on any conflict.

@@ -4,7 +4,7 @@ This document is the deep-dive companion to `README.md`. It assumes you've
 read the README's mental model and API overview; this file exists to make
 every cross-cutting mechanism — layering, RLS, the outbox, OpenBao custody,
 observability — traceable to the exact code and LLD section that define it.
-The canonical, signed-off design is `docs/iam-lld-token-service.md` (rev
+The canonical, signed-off design is `docs/lld/iam-lld-token-service.md` (rev
 1.2, Approved); this file is a navigable summary of it, kept in sync by
 hand.
 
@@ -1215,7 +1215,7 @@ decision — they are code-level pragmatism, not architecture.
 | `ARCHITECTURE.md` (this file) | Deep-dive mechanisms, one diagram per cross-cutting concern |
 | `docs/architecture/mermaid/*.mmd` | Canonical diagram sources — edit here first |
 | `docs/architecture/README.md` | Index mapping each diagram to its section/LLD reference |
-| `docs/iam-lld-token-service.md` | The signed-off Low-Level Design (rev 1.3) — the ultimate source of truth |
+| `docs/lld/iam-lld-token-service.md` | The signed-off Low-Level Design (rev 1.3) — the ultimate source of truth |
 | `api/asyncapi.yaml` | Event contract (design-time); served at `/asyncapi` |
 | `docs/swagger/` | Generated OpenAPI spec (`make swag`); served at `/swagger` |
 | `VERSIONING.md` | SemVer scope, release process, frozen-contract enumeration |
@@ -1224,7 +1224,7 @@ decision — they are code-level pragmatism, not architecture.
 
 ```mermaid
 graph LR
-    LLD["docs/iam-lld-token-service.md<br/>(signed-off, source of truth)"] --> ARCH["ARCHITECTURE.md"]
+    LLD["docs/lld/iam-lld-token-service.md<br/>(signed-off, source of truth)"] --> ARCH["ARCHITECTURE.md"]
     LLD --> README["README.md"]
     LLD --> ASYNC["api/asyncapi.yaml"]
     MMD["docs/architecture/mermaid/*.mmd<br/>(canonical diagram source)"] --> ARCH

@@ -14,7 +14,7 @@ Realm Provisioner never receives key material, only triggers Keycloak's
 key-cache refresh (RP-17, `ClearServiceAccountKeysCache`) after every
 rotate/revoke.
 
-The signed-off design is `docs/iam-lld-token-service.md` (rev 1.3,
+The signed-off design is `docs/lld/iam-lld-token-service.md` (rev 1.3,
 Approved) — it is the tie-breaker on any discrepancy between this file and
 reality. A frozen name (LLD §25) or a resolved open question (§16) cannot
 be changed in place; that requires a new LLD revision. Everything else
@@ -228,6 +228,6 @@ vars, deployment topology, testing strategy. Full detail in
 - [request-flows.md](request-flows.md) — per-flow walkthroughs, concurrency, failure handling
 - [database-schema.md](database-schema.md) — tables, RLS, triggers, invariants
 - [api-events.md](api-events.md) — endpoint catalogue, event contract
-- [`docs/iam-lld-token-service.md`](../docs/iam-lld-token-service.md) — the signed-off LLD (source of truth)
+- [`docs/lld/iam-lld-token-service.md`](../docs/lld/iam-lld-token-service.md) — the signed-off LLD (source of truth)
 - [`docs/observability-registry-proposals.md`](../docs/observability-registry-proposals.md) — Tier-1/Tier-2 metric registry submissions
 - [`../README.md`](../README.md) / [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — human-facing onboarding and deep-dive docs

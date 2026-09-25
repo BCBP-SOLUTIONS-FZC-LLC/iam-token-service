@@ -5,7 +5,7 @@ versioning applies to the container image, the Helm chart, and the runtime
 contract (routes, event schemas, error codes, required configuration), not
 to a Go module API. This document is modeled on the equivalent file in
 sibling IAM services, adapted for this service's own frozen contract
-surface (§25 of `docs/iam-lld-token-service.md`).
+surface (§25 of `docs/lld/iam-lld-token-service.md`).
 
 ## Semantic versioning (SemVer)
 
@@ -146,7 +146,7 @@ own authority over exact version strings.
 | `CHANGELOG.md` | Human-readable history, Keep a Changelog format |
 | `README.md` | Onboarding, API overview, environment variables |
 | `ARCHITECTURE.md` | Deep-dive mechanisms and diagrams |
-| `docs/iam-lld-token-service.md` | The signed-off design (§25 is the frozen name inventory this document's contract table mirrors) |
+| `docs/lld/iam-lld-token-service.md` | The signed-off design (§25 is the frozen name inventory this document's contract table mirrors) |
 | `deploy/helm/Chart.yaml` | The chart `version` / `appVersion` this process bumps |
 | `.github/workflows/release.yml` | The automation this process describes |
 | `.github/workflows/changelog-check.yml` | The PR-time enforcement that a `CHANGELOG.md` entry exists |

@@ -1,6 +1,6 @@
 # Request flows, concurrency, and failure handling
 
-Prose numbered-step walkthroughs (matching `docs/iam-lld-token-service.md` §8
+Prose numbered-step walkthroughs (matching `docs/lld/iam-lld-token-service.md` §8
 numbering) — meant to be read directly, not rendered. Visual sequence
 diagrams for the same flows: root `ARCHITECTURE.md` (mermaid, one per flow).
 
