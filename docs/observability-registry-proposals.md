@@ -22,6 +22,17 @@ All three metrics are implemented and dual-emitted today (see
 Tier-3 equivalent, per the Standard's Backward Compatibility migration
 process (step 1: emit old and new in parallel).
 
+**Update (platform libraries' metrics contract):** Proposals 1 and 2 are
+now entries in the central Platform Observability Registry
+(platform-gincommon `internal/obsregistry/registry.json`, status
+`proposed`, owner platform-events) with platform-events' label shapes —
+`platform_dependency_request_seconds{dependency, operation, outcome}` and
+`platform_duplicate_messages_total{queue, event_type}`. This service now
+emits exactly those shapes and records into platform-events' own
+collectors (one series set per process; see the metrics package doc), so
+the label tables below reflect the registry. Proposal 3 is not in the
+registry yet.
+
 ---
 
 ## Proposal 1 — `platform_dependency_request_seconds` (Tier 1)
@@ -44,15 +55,16 @@ a **histogram** (Standard rule #5 — histograms end in `_seconds`).
 | Label | Meaning | Source |
 |---|---|---|
 | `domain` | Owning platform domain | Centrally injected (`"iam"`) |
-| `service` | Domain-less service name | Centrally injected (`"token-service"`) |
+| `service` | Emitting service (`APP_NAME`) | Centrally injected by platform-gincommon (`"iam-token-service"`) — the same value platform-events and platform-pgcommon emit |
 | `environment` | Deployment environment | Centrally injected from `APP_ENV` |
 
 ### Approved dimensions used
 
 | Label | Allowed values (this service) | Meaning |
 |---|---|---|
-| `dependency` | `openbao` | The external system being called |
+| `dependency` | `openbao` | The external system being called (platform-events adds `sns`, `sqs`, `codec` in the same process) |
 | `operation` | `write`, `delete` | The logical operation performed against that dependency |
+| `outcome` | `success`, `error` | Whether the call returned an error (registry outcome vocabulary) |
 
 `read`/`list` OpenBao calls are deliberately NOT instrumented on this
 metric (nor on its legacy parallel) — TS-1's rotation_id-replay `Read` is
@@ -88,7 +100,7 @@ delivery.
 | Label | Meaning | Source |
 |---|---|---|
 | `domain` | Owning platform domain | Centrally injected (`"iam"`) |
-| `service` | Domain-less service name | Centrally injected (`"token-service"`) |
+| `service` | Emitting service (`APP_NAME`) | Centrally injected by platform-gincommon (`"iam-token-service"`) — the same value platform-events and platform-pgcommon emit |
 | `environment` | Deployment environment | Centrally injected from `APP_ENV` |
 
 ### Approved dimensions used
@@ -96,6 +108,7 @@ delivery.
 | Label | Allowed values (this service) | Meaning |
 |---|---|---|
 | `queue` | `tenant-lifecycle-tokensvc-q` | The SQS queue the duplicate was received on |
+| `event_type` | `TenantMembershipsPurged` | The duplicate's envelope type (registry shape, shared with platform-events' inbox) |
 
 This service has exactly one inbound subscription today
 (`TenantMembershipsPurged` on `tenant-lifecycle-tokensvc-q`, §7.1), so
@@ -116,6 +129,15 @@ service) differentiates without a new metric name.
 concept is IAM-specific, not applicable to Billing/Workflow/etc.).
 **Parallels:** `iam_token_service_offboarding_cascade_total`.
 
+**Not emitted until ratified.** Under the platform libraries' metrics
+contract an `iam_*` name outside `iam_token_service_*` must be an entry in
+the central Platform Observability Registry before any service emits it
+(`metricslint check` reports it as an error otherwise). The service stopped
+dual-emitting it; `iam_token_service_offboarding_cascade_total` is the only
+cascade metric until this proposal is added to the registry. Note for the
+reviewer: the registry's `outcome` vocabulary is `success | failure |
+error`, so `ok` below should become `success` on ratification.
+
 ### Semantic definition
 
 Outcome of one IAM service's own reaction to a tenant-offboarding signal
@@ -135,7 +157,7 @@ This is a **counter**.
 
 | Label | Meaning | Source |
 |---|---|---|
-| `service` | Domain-less service name | Centrally injected (`"token-service"`) |
+| `service` | Emitting service (`APP_NAME`) | Centrally injected by platform-gincommon (`"iam-token-service"`) — the same value platform-events and platform-pgcommon emit |
 | `environment` | Deployment environment | Centrally injected from `APP_ENV` |
 
 `domain` is not a label — it is already the `iam_` name prefix, per the
@@ -166,7 +188,7 @@ consistent the moment a second IAM service adopts this metric.
 |---|---|---|---|---|
 | `iam_token_service_openbao_call_duration_seconds` | `platform_dependency_request_seconds` | Yes | No — `IAMTokenServiceOpenBaoCallLatencyHigh` (`deploy/monitoring/app-alerts.yml`) still reads the legacy metric until ratified | No — out of this repo's scope; no cross-service dashboard repo is available to this service |
 | `iam_token_service_processed_events_duplicates_total` | `platform_duplicate_messages_total` | Yes | No | No |
-| `iam_token_service_offboarding_cascade_total` | `iam_offboarding_cascade_total` | Yes | No | No |
+| `iam_token_service_offboarding_cascade_total` | `iam_offboarding_cascade_total` | No — withheld until ratified in the registry | No | No |
 
 Per the Standard's Backward Compatibility process, steps 2–8 (migrate
 dashboards → migrate alerts → migrate recording rules → migrate SLOs →

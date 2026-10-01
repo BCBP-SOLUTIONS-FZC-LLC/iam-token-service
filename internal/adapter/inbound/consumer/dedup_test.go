@@ -12,7 +12,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
@@ -52,21 +52,21 @@ func (stubTx) RunInTx(_ context.Context, fn func(context.Context) error) error {
 
 func TestSkipDuplicate_IncrementsMetricOnHit(t *testing.T) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
-		ServiceName: "iam-token-service", BuildVersion: "test",
+		ServiceName: "iam-token-service", BuildVersion: "test", Domain: "iam", Environment: "test",
 	})
 	metrics.Register("test")
 	before := testutil.ToFloat64(metrics.ProcessedEventsDuplicates.WithLabelValues(string(port.ProcessedEventsConsumerTenantOffboarding)))
-	beforePlatform := testutil.ToFloat64(metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(port.ProcessedEventsConsumerTenantOffboarding)))
+	beforePlatform := testutil.ToFloat64(metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(port.ProcessedEventsConsumerTenantOffboarding), "TenantMembershipsPurged"))
 	dedup := &stubDedup{seen: map[string]bool{"evt-1": true}}
 
-	hit, err := skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-1")
+	hit, err := skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-1", "TenantMembershipsPurged")
 	require.NoError(t, err)
 	assert.True(t, hit)
 	assert.InDelta(t, before+1, testutil.ToFloat64(metrics.ProcessedEventsDuplicates.WithLabelValues(string(port.ProcessedEventsConsumerTenantOffboarding))), 0.01)
-	assert.InDelta(t, beforePlatform+1, testutil.ToFloat64(metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(port.ProcessedEventsConsumerTenantOffboarding))), 0.01,
-		"the Tier-1 platform_duplicate_messages_total{queue} must be dual-emitted alongside the legacy metric")
+	assert.InDelta(t, beforePlatform+1, testutil.ToFloat64(metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(port.ProcessedEventsConsumerTenantOffboarding), "TenantMembershipsPurged")), 0.01,
+		"the Tier-1 platform_duplicate_messages_total{queue,event_type} must be dual-emitted alongside the legacy metric")
 
-	hit, err = skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-new")
+	hit, err = skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-new", "TenantMembershipsPurged")
 	require.NoError(t, err)
 	assert.False(t, hit)
 }
@@ -92,7 +92,7 @@ func TestSkipDuplicate_IsProcessedErrorPropagates(t *testing.T) {
 	wantErr := errors.New("dedup store unavailable")
 	dedup := &stubDedup{err: wantErr}
 
-	hit, err := skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-x")
+	hit, err := skipDuplicate(context.Background(), dedup, port.ProcessedEventsConsumerTenantOffboarding, "evt-x", "TenantMembershipsPurged")
 	require.ErrorIs(t, err, wantErr)
 	assert.False(t, hit)
 }

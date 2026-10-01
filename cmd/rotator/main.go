@@ -36,14 +36,13 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/realmprovisioner"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 
-	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // buildVersion is injected by -ldflags at build time (see Dockerfile / Makefile).
@@ -64,11 +63,23 @@ func main() {
 		Logger:       log,
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
+		// Observability identity (Enterprise Platform Observability
+		// Standard): domain "iam" (OBSERVABILITY_DOMAIN overrides it) and the
+		// environment label, which must be one of local/dev/test/staging/prod
+		// — ObservabilityMiddlewares panics on anything else (e.g. "production").
+		Domain:      envOr("OBSERVABILITY_DOMAIN", metrics.ObservabilityDomain),
+		Environment: appEnv,
 	}
 	_ = gincommon.ObservabilityMiddlewares(cfg) // metrics-init side effect only — this process has no Gin router
+	// platform-events' (outbox/publish/consume/SQS/SNS) and platform-pgcommon's
+	// (platform_db_*) metrics share gincommon's registerer and identity so one
+	// /metrics scrape serves HTTP + business + messaging + DB collectors. Must
+	// run before NewPool (pool gauges are registered by NewPool) and before
+	// metrics.Register (which records into platform-events' shared collectors).
+	if err := metrics.InitLibraryMetrics(log); err != nil {
+		panic(fmt.Sprintf("init library metrics: %v", err))
+	}
 	metrics.Register(appEnv)
-	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
 
 	// ── Database: two pools — the normal RLS-scoped app pool for the
 	// sweep's per-row revokes, and the BYPASSRLS serviceaccount_reconciler
@@ -88,7 +99,6 @@ func main() {
 		panic(fmt.Sprintf("connect app pool: %v", err))
 	}
 	defer appPool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(appPool, cfg.ServiceName))
 
 	reconDSN := pgadapter.ReconcilerDSNFromEnv()
 	reconCfg := pgadapter.SystemPoolConfig(reconDSN, log)
@@ -98,10 +108,6 @@ func main() {
 		panic(fmt.Sprintf("connect reconciler pool: %v", err))
 	}
 	defer reconcilerPool.Close()
-	// Suffixed "service" label distinguishes this pool's gauges from the
-	// app pool's (registered above) — Prometheus rejects two collectors
-	// exporting identical metric names under the exact same label set.
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(reconcilerPool, cfg.ServiceName+"-reconciler"))
 	if reconDSN == pgCfg.DSN {
 		log.Warn("RECONCILER_DATABASE_URL not set — reconciler pool reuses app DSN; cross-tenant queries will be RLS-filtered", nil)
 	}

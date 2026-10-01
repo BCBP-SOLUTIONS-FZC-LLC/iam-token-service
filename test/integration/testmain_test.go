@@ -24,6 +24,8 @@ func TestMain(m *testing.M) {
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
 		ServiceName:  "iam-token-service",
 		BuildVersion: "test",
+		Domain:       "iam",
+		Environment:  "test",
 	})
 	metrics.Register("test")
 	os.Exit(m.Run())

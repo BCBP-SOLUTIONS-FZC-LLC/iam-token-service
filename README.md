@@ -744,8 +744,9 @@ taxonomy:
   business counters: `credentials_issued_total`, `rotation_overlap_active`,
   `openbao_call_duration_seconds`, `offboarding_cascade_total`,
   `rotation_sweep_total`, `material_reconcile_total`,
-  `processed_events_duplicates_total`, `unknown_event_acknowledged_total`,
-  `outbox_pending`.
+  `processed_events_duplicates_total`, `unknown_event_acknowledged_total`.
+  The outbox backlog gauge is platform-events' Tier 1
+  `platform_outbox_pending_events`, not a metric of this service.
 
 Tier-1/Tier-2 labels are injected **centrally**
 (`metrics.Register(environment)`), never at the instrumentation call site,
@@ -753,18 +754,25 @@ so they can't be omitted or misspelled — see
 [ARCHITECTURE.md § Observability stack](ARCHITECTURE.md#observability-stack)
 for the full table and [`docs/observability-registry-proposals.md`](docs/observability-registry-proposals.md)
 for this service's proposed `platform_dependency_request_seconds`,
-`platform_duplicate_messages_total`, and `iam_offboarding_cascade_total`
-metrics (dual-emitted alongside their legacy Tier-3 equivalents pending
-registry ratification). `make gates` includes a `metrics-taxonomy` check
+`platform_duplicate_messages_total` (dual-emitted alongside their legacy
+Tier-3 equivalents pending registry ratification) and
+`iam_offboarding_cascade_total` (not emitted until it is ratified: the
+platform libraries reject an unregistered `iam_*` name). `make gates` includes a `metrics-taxonomy` check
 enforcing naming/namespace compliance.
 
-Shared-library metrics (`http_request_duration_seconds`/`http_requests_total`
-from `platform-gincommon`; `events_*`/`outbox_*`/`sqs_*` from
-`platform-events`; `pgcommon_pool_*` from `platform-pgcommon`) predate this
-Standard and carry a `service` label that combines domain+service
-(`"iam-token-service"`) rather than the Standard's separate `domain`/
-`service` labels — a known gap this service cannot fix unilaterally (it
-would require a change in each shared library).
+Shared-library metrics follow the Enterprise Platform Observability
+Standard: `platform_http_*` (`platform-gincommon`),
+`platform_messages_*` / `platform_outbox_*` / `platform_dlq_messages_total` /
+`platform_dependency_request_seconds` (`platform-events`) and
+`platform_db_*` (`platform-pgcommon`, whose `pool` label is `default` for
+the RLS-scoped app pool and `reconciler` for the BYPASSRLS pool). They all
+carry one identity, `{domain="iam", service="iam-token-service",
+environment=APP_ENV}`, set on `gincommon.Config` (`Domain`, or
+`OBSERVABILITY_DOMAIN`) and handed to platform-events / platform-pgcommon by
+`metrics.InitLibraryMetrics`, which every binary runs before creating a
+pool. The libraries' pre-standard names were removed (no compatibility
+period); map old queries with platform-gincommon's
+`docs/observability/migration.md`.
 
 ### Tracing and logs
 

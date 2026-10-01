@@ -10,7 +10,7 @@ import (
 // InstrumentedSecretStore wraps a port.SecretStore and records call
 // duration around Write and Delete — the two ops §11.2 freezes labels for
 // — on both the legacy Tier-3 iam_token_service_openbao_call_duration_seconds{op}
-// and the registry-proposed Tier-1 platform_dependency_request_seconds{dependency="openbao",operation}
+// and the registry-proposed Tier-1 platform_dependency_request_seconds{dependency="openbao",operation,outcome}
 // (Enterprise Platform Observability Standard, dual-emitted during the
 // compatibility period). Read and List pass through unmeasured (TS-1's
 // rotation_id-replay Read is rare and not part of the frozen op label set;
@@ -36,7 +36,7 @@ var _ port.SecretStore = (*InstrumentedSecretStore)(nil)
 func (s *InstrumentedSecretStore) Write(ctx context.Context, path string, secret string) error {
 	start := time.Now()
 	err := s.inner.Write(ctx, path, secret)
-	observeOpenBaoCall("write", time.Since(start).Seconds())
+	observeOpenBaoCall("write", err, time.Since(start).Seconds())
 	return err
 }
 
@@ -49,7 +49,7 @@ func (s *InstrumentedSecretStore) Read(ctx context.Context, path string) (string
 func (s *InstrumentedSecretStore) Delete(ctx context.Context, path string) error {
 	start := time.Now()
 	err := s.inner.Delete(ctx, path)
-	observeOpenBaoCall("delete", time.Since(start).Seconds())
+	observeOpenBaoCall("delete", err, time.Since(start).Seconds())
 	return err
 }
 
@@ -64,11 +64,18 @@ func (s *InstrumentedSecretStore) List(ctx context.Context, pathPrefix string) (
 // style) so a decorator constructed before Register runs — e.g. in a test
 // that forgets to call it — degrades to a no-op instead of a nil-pointer
 // panic.
-func observeOpenBaoCall(op string, elapsedSeconds float64) {
+//
+// outcome is "error" when the call returned an error, else "success" — the
+// registry's outcome vocabulary for platform_dependency_request_seconds.
+func observeOpenBaoCall(op string, err error, elapsedSeconds float64) {
 	if OpenBaoCallDuration != nil {
 		OpenBaoCallDuration.WithLabelValues(op).Observe(elapsedSeconds)
 	}
 	if DependencyRequestDuration != nil {
-		DependencyRequestDuration.WithLabelValues("openbao", op).Observe(elapsedSeconds)
+		outcome := OutcomeSuccess
+		if err != nil {
+			outcome = OutcomeError
+		}
+		DependencyRequestDuration.WithLabelValues(DependencyOpenBao, op, outcome).Observe(elapsedSeconds)
 	}
 }

@@ -102,16 +102,23 @@ metric above — not yet ratified, see `docs/observability-registry-proposals.md
 
 | Metric | Tier | Labels | Parallels |
 |---|---|---|---|
-| `platform_dependency_request_seconds` | 1 | `domain,service,environment,dependency,operation` | `openbao_call_duration_seconds` |
-| `platform_duplicate_messages_total` | 1 | `domain,service,environment,queue` | `processed_events_duplicates_total` |
-| `iam_offboarding_cascade_total` | 2 | `service,environment,outcome` | `offboarding_cascade_total` |
+| `platform_dependency_request_seconds` | 1 | `domain,service,environment,dependency,operation,outcome` | `openbao_call_duration_seconds` |
+| `platform_duplicate_messages_total` | 1 | `domain,service,environment,queue,event_type` | `processed_events_duplicates_total` |
+| `iam_offboarding_cascade_total` (proposed; not emitted until ratified in the registry) | 2 | `service,environment,outcome` | `offboarding_cascade_total` |
 
-Shared-library metrics: `http_request_duration_seconds`/`http_requests_total`
-(`platform-gincommon`), `outbox_*`/`sqs_*`/`events_*` (`platform-events`),
-`pgcommon_pool_*` (`platform-pgcommon`, wired for both the app pool and the
-`-reconciler`-suffixed BYPASSRLS pool). These predate the Standard and
-carry a domain+service-combined `service` label — a known gap fixable only
-in the shared library itself.
+Shared-library metrics follow the Enterprise Platform Observability
+Standard: `platform_http_*` (`platform-gincommon`),
+`platform_messages_*` / `platform_outbox_*` / `platform_dlq_messages_total` /
+`platform_dependency_request_seconds` (`platform-events`) and
+`platform_db_*` (`platform-pgcommon`, whose `pool` label is `default` for
+the RLS-scoped app pool and `reconciler` for the BYPASSRLS pool). They all
+carry one identity, `{domain="iam", service="iam-token-service",
+environment=APP_ENV}`, set on `gincommon.Config` (`Domain`, or
+`OBSERVABILITY_DOMAIN`) and handed to platform-events / platform-pgcommon by
+`metrics.InitLibraryMetrics`, which every binary runs before creating a
+pool. The libraries' pre-standard names were removed (no compatibility
+period); map old queries with platform-gincommon's
+`docs/observability/migration.md`.
 
 ### Tracing
 
@@ -137,9 +144,9 @@ advanced), `jwks_key_errors_total` > 0 (page — a live credential the JWKS
 route couldn't serve, i.e. a real per-credential Keycloak auth outage,
 TS-D15), `consumed_schema_violations_total` > 0 (page — a
 `TenantMembershipsPurged` failed its embedded schema and went straight to
-the DLQ, so that tenant's cascade did not run), offboarding-cascade DLQ depth, `outbox_pending_total` growth
+the DLQ, so that tenant's cascade did not run), offboarding-cascade DLQ depth, `platform_outbox_pending_events` growth
 (both a warning-stage backlog alert and the later DLQ-depth alert),
-`pgcommon_pool_empty_acquire_total` growth (pool exhaustion, either pool),
+`platform_db_pool_empty_acquires_total` growth (pool exhaustion, per `pool`),
 offboarding-queue message age (dormant until a CloudWatch exporter is
 deployed — SQS depth/age isn't available in-process). Defined in
 `deploy/monitoring/app-alerts.yml`, mirrored in
@@ -229,7 +236,7 @@ reasoning on each.
 
 ## 20. Operational considerations
 
-- **Outbox health:** `outbox_pending_total` is the primary bus-health
+- **Outbox health:** `platform_outbox_pending_events` is the primary bus-health
   signal; sustained growth means the SNS relay is stalled (credential
   operations still succeed — only audit emission is delayed, EVT-4).
 - **Stuck `rotating` versions:** `rotation_overlap_active` should trend to

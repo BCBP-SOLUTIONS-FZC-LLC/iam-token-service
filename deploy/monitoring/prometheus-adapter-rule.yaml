@@ -1,5 +1,5 @@
 # Prometheus Adapter ConfigMap — maps Prometheus metrics to the Custom Metrics API
-# so the HPA can scale on http_requests_per_second.
+# so the HPA can scale on platform_http_requests_per_second.
 #
 # Deploy into the namespace where prometheus-adapter runs (typically kube-system
 # or monitoring). Merge with any existing prometheus-adapter ConfigMap rather
@@ -9,7 +9,7 @@
 #   https://github.com/kubernetes-sigs/prometheus-adapter/blob/master/docs/config.md
 #
 # After applying, verify the metric is visible:
-#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep rps
+#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep platform_http_requests_per_second
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,11 +21,14 @@ metadata:
 data:
   config.yaml: |
     rules:
-      # Expose per-pod RPS as http_requests_per_second so the HPA can use
-      # type: Pods / metric: http_requests_per_second.
-      # Computed from the Prometheus counter http_requests_total scraped by
-      # the ServiceMonitor (serviceMonitor.enabled: true in Helm values).
-      - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+      # Expose per-pod RPS as platform_http_requests_per_second so the HPA can
+      # use type: Pods / metric: platform_http_requests_per_second.
+      # Computed from platform-gincommon's counter platform_http_requests_total
+      # (metric_status: proposed in the Platform Observability Registry)
+      # scraped by the ServiceMonitor (serviceMonitor.enabled: true in Helm
+      # values). Each pod's series carry {domain, service, environment}; the
+      # adapter's <<.GroupBy>> (pod) aggregation sums them away.
+      - seriesQuery: 'platform_http_requests_total{namespace!="",pod!=""}'
         resources:
           overrides:
             namespace:

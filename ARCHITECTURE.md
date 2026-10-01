@@ -863,7 +863,7 @@ graph LR
         R1["PanicRecovery"] --> R2["RequestID"]
         R2 --> R3["Tracing<br/>(OTel span per request)"]
         R3 --> R4["CorrelationHeaders"]
-        R4 --> R5["Metrics<br/>(http_request_duration_seconds)"]
+        R4 --> R5["Metrics<br/>(platform_http_request_duration_seconds)"]
         R5 --> R6["Logging<br/>(slog JSON)"]
         R6 --> R7["RequireAuth<br/>(iam-system only)"]
         R7 --> R8["ContextMiddleware"]
@@ -876,7 +876,7 @@ graph LR
 
     HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(:METRICS_PORT/metrics, separate listener)"]
     METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor / PrometheusRule)"]
-    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>outbox_pending growth"]
+    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>platform_outbox_pending_events growth"]
 
     HANDLER --> LOGS["Structured logs (slog JSON)<br/>tenant_id, principal_id, version, op, result<br/>— never a credential field (CI secret-log gate)"]
     LOGS --> AGG["Log aggregation<br/>(CloudWatch / equivalent)"]
@@ -911,25 +911,29 @@ ratifies the proposal.
 | `iam_token_service_credentials_issued_total{op}` | 3 | counter | Credential state transitions (`issue`/`rotate`/`revoke`) |
 | `iam_token_service_rotation_overlap_active` | 3 | gauge | Live `rotating` versions — should trend to zero between rotations |
 | `iam_token_service_openbao_call_duration_seconds{op}` | 3 (legacy) | histogram | OpenBao KV latency (`write`/`delete`) |
-| `platform_dependency_request_seconds{domain,service,environment,dependency,operation}` | 1 (proposed) | histogram | Same as above, generalized across dependencies/services |
+| `platform_dependency_request_seconds{domain,service,environment,dependency,operation,outcome}` | 1 (proposed) | histogram | Same as above, generalized across dependencies/services |
 | `iam_token_service_offboarding_cascade_total{result}` | 3 (legacy) | counter | Offboarding-cascade outcomes |
-| `iam_offboarding_cascade_total{service,environment,outcome}` | 2 (proposed) | counter | Same as above, generalized across IAM services |
+| `iam_offboarding_cascade_total{service,environment,outcome}` | 2 (proposed, **not emitted** until ratified in the registry) | counter | Same as above, generalized across IAM services |
 | `iam_token_service_rotation_sweep_total{result}` | 3 | counter | Overlap-expiry sweep outcomes |
 | `iam_token_service_material_reconcile_total{result}` | 3 | counter | Orphan-material reconciler outcomes; `missing_material` is page-worthy |
 | `iam_token_service_processed_events_duplicates_total` | 3 (legacy) | counter | Deduped redeliveries (skipDuplicate) |
-| `platform_duplicate_messages_total{domain,service,environment,queue}` | 1 (proposed) | counter | Same as above, generalized across queues/services |
+| `platform_duplicate_messages_total{domain,service,environment,queue,event_type}` | 1 (proposed) | counter | Same as above, generalized across queues/services |
 | `iam_token_service_unknown_event_acknowledged_total` | 3 | counter | Forward-compat acks of unrecognized event types |
-| `iam_token_service_outbox_pending` | 3 | gauge | Unrelayed outbox rows — bus-health signal |
+| `platform_outbox_pending_events` | 1 (proposed, platform-events) | gauge | Unrelayed outbox rows — bus-health signal |
 
-Shared-library metrics (`http_request_duration_seconds`/`http_requests_total`
-from `platform-gincommon`, `outbox_*`/`sqs_*`/`events_*` from
-`platform-events`, `pgcommon_pool_*` from `platform-pgcommon`) are emitted
-under those libraries' own pre-Standard names and a `service` const label
-that is domain+service combined (`"iam-token-service"`), not the
-Standard's domain-less `service` + separate `domain` shape — bringing
-those into full compliance requires a change in the shared library itself,
-outside this repo's scope; noted here as a known platform-wide follow-up,
-not something this service can unilaterally fix.
+Shared-library metrics follow the Enterprise Platform Observability
+Standard: `platform_http_*` (`platform-gincommon`),
+`platform_messages_*` / `platform_outbox_*` / `platform_dlq_messages_total` /
+`platform_dependency_request_seconds` (`platform-events`) and
+`platform_db_*` (`platform-pgcommon`, whose `pool` label is `default` for
+the RLS-scoped app pool and `reconciler` for the BYPASSRLS pool). They all
+carry one identity, `{domain="iam", service="iam-token-service",
+environment=APP_ENV}`, set on `gincommon.Config` (`Domain`, or
+`OBSERVABILITY_DOMAIN`) and handed to platform-events / platform-pgcommon by
+`metrics.InitLibraryMetrics`, which every binary runs before creating a
+pool. The libraries' pre-standard names were removed (no compatibility
+period); map old queries with platform-gincommon's
+`docs/observability/migration.md`.
 
 `credential.issue_rotate` and `credential.revoke` spans propagate their
 `trace_id` onto the produced event envelope, so a rotation is traceable
@@ -1135,7 +1139,7 @@ subscriber would need to honor.
 
 **Observability**
 - [ ] Emit a metric or alert on DLQ delivery — this service alerts on
-  `IAMTokenServiceOutboxStuck` (`outbox_dead_letters_total` rate > 0,
+  `IAMTokenServiceOutboxStuck` (`platform_dlq_messages_total{operation="outbox_publish"}` increase > 0,
   `deploy/monitoring/app-alerts.yml`); a consuming service should hold
   itself to the same bar.
 - [ ] Log the envelope `id` and `type` on every processed message for

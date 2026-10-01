@@ -23,8 +23,12 @@ in Go code, not in the Opts literal's static text in every case). The
 required-label contract (domain/service/environment per tier) is verified
 by internal/adapter/outbound/metrics/metrics_test.go's
 TestTier1Labels_CarryDomainServiceEnvironment /
-TestTier2Labels_CarryServiceEnvironmentOnly instead, against the real
-registered collectors.
+TestRegister_EmitsNoUnregisteredDomainMetric instead, against the real
+registered collectors; `metricslint check` validates a full scrape against
+the Platform Observability Registry. Tier 1 names this service records into
+(platform_dependency_request_seconds, platform_duplicate_messages_total) are
+built from their registry entry by name constant, not a literal, so they are
+outside this static gate.
 """
 import pathlib
 import re

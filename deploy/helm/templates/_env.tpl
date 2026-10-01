@@ -9,6 +9,8 @@ prune tuning for rotator).
   value: {{ include "iam-token-service.name" . }}
 - name: APP_ENV
   value: {{ .Values.appEnv | quote }}
+- name: OBSERVABILITY_DOMAIN
+  value: {{ .Values.observabilityDomain | default "iam" | quote }}
 - name: BUILD_VERSION
   value: {{ include "iam-token-service.imageTag" . | quote }}
 - name: LOG_LEVEL

@@ -7,7 +7,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // queueNameForConsumer maps this service's small, fixed set of
@@ -31,7 +31,10 @@ func queueNameForConsumer(consumer port.ProcessedEventsConsumer) string {
 // processed-events API — Envelope.ID + INSERT ON CONFLICT DO NOTHING is the
 // library's documented consumer pattern (same as iam-user-profile /
 // iam-org-membership).
-func skipDuplicate(ctx context.Context, dedup port.ProcessedEventsStore, consumer port.ProcessedEventsConsumer, eventID string) (bool, error) {
+//
+// eventType is the envelope type — platform_duplicate_messages_total's
+// event_type label (the registry shape platform-events also emits).
+func skipDuplicate(ctx context.Context, dedup port.ProcessedEventsStore, consumer port.ProcessedEventsConsumer, eventID, eventType string) (bool, error) {
 	processed, err := dedup.IsProcessed(ctx, consumer, eventID)
 	if err != nil {
 		return false, err
@@ -41,7 +44,7 @@ func skipDuplicate(ctx context.Context, dedup port.ProcessedEventsStore, consume
 			metrics.ProcessedEventsDuplicates.WithLabelValues(string(consumer)).Inc()
 		}
 		if metrics.DuplicateMessagesTotal != nil {
-			metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(consumer)).Inc()
+			metrics.DuplicateMessagesTotal.WithLabelValues(queueNameForConsumer(consumer), eventType).Inc()
 		}
 		return true, nil
 	}

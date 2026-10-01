@@ -52,10 +52,10 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/test/dbseed"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // ── package-level test environment, built once by TestMain ─────────────────
@@ -184,7 +184,7 @@ func runE2ESuite(m *testing.M) (int, error) {
 	}
 	defer appPool.Close()
 
-	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{ServiceName: "iam-token-service-e2e", Logger: noopLogger{}})
+	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{ServiceName: "iam-token-service-e2e", Logger: noopLogger{}, Domain: "iam", Environment: "test"})
 
 	// ── Production wiring (mirrors cmd/server/main.go/wiring.go §6-9) ──────
 	enqueueCodec, err := eventbusadapter.NewValidatingCodec(eventbusadapter.NoopCodec{})
@@ -202,7 +202,7 @@ func runE2ESuite(m *testing.M) (int, error) {
 	principalSvc := service.NewPrincipalService(principalRepo, credentialRepo, txRunner)
 
 	router := httpadapter.NewRouter(httpadapter.RouterConfig{
-		GinConfig: gincommon.Config{ServiceName: "iam-token-service-e2e", Logger: noopLogger{}},
+		GinConfig: gincommon.Config{ServiceName: "iam-token-service-e2e", Logger: noopLogger{}, Domain: "iam", Environment: "test"},
 		Docs:      httpadapter.DocsConfig{Environment: "test"},
 		Handlers: httpadapter.Handlers{
 			Principal:  httpadapter.NewPrincipalHandler(principalSvc),

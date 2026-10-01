@@ -5,7 +5,7 @@ graph LR
         R1["PanicRecovery"] --> R2["RequestID"]
         R2 --> R3["Tracing<br/>(OTel span per request)"]
         R3 --> R4["CorrelationHeaders"]
-        R4 --> R5["Metrics<br/>(http_request_duration_seconds)"]
+        R4 --> R5["Metrics<br/>(platform_http_request_duration_seconds)"]
         R5 --> R6["Logging<br/>(slog JSON)"]
         R6 --> R7["RequireAuth<br/>(iam-system only)"]
         R7 --> R8["ContextMiddleware"]
@@ -18,7 +18,7 @@ graph LR
 
     HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(:METRICS_PORT/metrics, separate listener)"]
     METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor / PrometheusRule)"]
-    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>outbox_pending growth"]
+    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>platform_outbox_pending_events growth"]
 
     HANDLER --> LOGS["Structured logs (slog JSON)<br/>tenant_id, principal_id, version, op, result<br/>— never a credential field (CI secret-log gate)"]
     LOGS --> AGG["Log aggregation<br/>(CloudWatch / equivalent)"]

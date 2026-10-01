@@ -235,9 +235,9 @@ As with the sibling services, the REST OpenAPI spec is **generated** by `swag` (
 
 ```
 require (
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon           v1.3.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events              v1.4.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon            v1.2.1
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon           v1.4.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2              v2.0.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2            v2.0.0
     github.com/openbao/openbao/api/v2                              v2.x.x  // OpenBao KV v2 client (Vault-API-compatible)
     github.com/aws/aws-sdk-go-v2/service/glue                      v1.x.x  // Glue Schema Registry client
 )
@@ -299,7 +299,7 @@ The Token Service is a **Gin HTTP service only** (internal API) — it exposes n
 | Symbol | Where | Use in Token Service |
 |---|---|---|
 | `logger.NewLogger(env)` | `main.go` | Builds the structured `port.Logger` injected into the pool, middleware config, outbox runner, and OpenBao client |
-| `gincommon.Config{Logger, ServiceName, BuildVersion, Tracing}` | `main.go` | One config feeding all middleware stacks; `ServiceName = "iam-token-service"` (required — `ObservabilityMiddlewares` panics on empty). Tracing configured via `OTEL_*` env + `InitTracingFromEnv`, not the optional `Tracing` field |
+| `gincommon.Config{Logger, ServiceName, BuildVersion, Domain, Environment, Tracing}` | `main.go` | One config feeding all middleware stacks; `ServiceName = "iam-token-service"` (required — `ObservabilityMiddlewares` panics on empty), `Domain = "iam"` (`OBSERVABILITY_DOMAIN` overrides; required — panics when missing), `Environment = APP_ENV` (must be `local`/`dev`/`test`/`staging`/`prod` — panics on e.g. `production`). Tracing configured via `OTEL_*` env + `InitTracingFromEnv`, not the optional `Tracing` field |
 | `gincommon.TimeoutMiddleware(30*time.Second)` | router | Per-request deadline on the `/api` group; inserted before `DefaultMiddlewares` |
 | `gincommon.DefaultMiddlewares(cfg)` | `/api` group | Full stack = Observability ++ Protected (order below) |
 | `gincommon.HealthHandler()` | `/healthz` | Liveness; registered before auth |
@@ -334,7 +334,7 @@ The entire data-access substrate and the enforcement point for Layer-2 tenant is
 | `pgcommon.Pool.DrainAndClose(ctx)` | `main.go` shutdown | Graceful shutdown; registered first in the LIFO defer chain so it runs last, after the outbox runner and consumer stop (§13) |
 | `pgcommon.ConfigFromEnv() (Config, []ConfigWarning)` | `main.go` | Builds `Config` from `DATABASE_URL`/`PG_*`; structured warnings logged at startup, not silently discarded |
 | `migrate.Runner{DSN, Logger}.Up(ctx)` | `main.go` | Runs `postgres/migrations/` on startup; appends `lock_timeout=30s` for rolling-deploy safety |
-| `pgmetrics.Init(serviceName, buildVersion)` / `pgmetrics.NewOTelQueryTracer(tracer)` | `main.go` | Registers pg Prometheus collectors before `NewPool`; per-query OTel spans via `Config.Tracer` |
+| `pgmetrics.InitWithIdentity(pgmetrics.IdentityFromLabels(gincommon.MetricsConstLabels()), gincommon.MetricsRegisterer())` / `pgmetrics.NewOTelQueryTracer(tracer)` | `metrics.InitLibraryMetrics` (every `main.go`) | Registers the `platform_db_*` collectors with the service identity before `NewPool` (which then registers each pool's connection gauges); returns `RegistrationWarning`s (logged) and fails startup on an invalid identity; per-query OTel spans via `Config.Tracer` |
 
 **The GUC names are fixed by the library**: `app.user_id`, `app.tenant_id`. Under `PGBouncerMode=true` they are set with `set_config(..., true)` (transaction-local) at the start of each `RunInTx`/`WithConn`, so they clear at commit and cannot leak across the pooled backend — the mechanism the §4.3 RLS policies depend on (RLS-6). `app.tenant_roles` is **not** used — this service makes no role-based decision (TS-INV-4), so only `app.user_id` (the system principal) and `app.tenant_id` (the target tenant) are injected. **Pool sizing:** `MinConns: 0` under PgBouncer transaction pooling; `MaxConns: 10` per pod (this service is trivially small, §21). Under `PGBouncerMode=true`, migrations bypass PgBouncer (`MIGRATION_DATABASE_URL` on the direct 5432 port; advisory locks are session-scoped, §4.4).
 
@@ -351,7 +351,7 @@ The Token Service is a **single-topic producer** (`iam.serviceaccount.events`) *
 | `outbox.NewRunner(Config{Pool, Publisher, PollInterval:500ms, BatchSize:50, MaxAttempts:5, DrainTimeout:30s, ...})` | `main.go` | Background publisher; `Stop()` drained before pool close (LIFO defers). All tunables `OUTBOX_*`-env-configurable (§12) |
 | `outbox.Runner.PrunePublished(ctx, olderThan, limit)` | scheduled `CronJob` | Deletes successfully-published rows older than `olderThan`; wired into `cmd/rotator`'s maintenance tick (daily, `olderThan: 24h`) so `outbox_events` does not grow unbounded |
 | `events.NewSQSConsumer(SQSConfig{QueueURL, Region, MaxMessages}, handler, opts...)` | `adapter/inbound/consumer` | **One active subscription: `TenantMembershipsPurged`** on `iam.tenant.events` (queue `tenant-lifecycle-tokensvc-q`, §7.1), dispatched to `OffboardingService.ScrubTenant` (§8.4). Options: `WithConcurrency`, `WithVisibilityTimeout` |
-| `events.metrics.Init` / OTel | implicit | Publish/consume Prometheus + tracing from the library; `outbox_dead_letters_total` counter (alert on `rate() > 0`, §11.5) |
+| `events.InitMetrics(identity, gincommon.MetricsRegisterer())` / OTel | `metrics.InitLibraryMetrics` | Publish/consume/outbox Prometheus (`platform_*`, identity from `gincommon.MetricsConstLabels`) + tracing from the library; `platform_dlq_messages_total{operation="outbox_publish",reason="max_attempts"}` (alert on newly dead-lettered events, §11.5) |
 
 **HMAC signing/verification is out of scope** — this service is reached only as authenticated in-mesh HTTP (Realm Provisioner, operators) and SNS→SQS transport, never a raw external webhook. The `Envelope` is published with its UUID v7 `ID` as the dedup key so the Audit consumer stays idempotent (HLD §9.3). Retryable AWS errors (`ThrottlingException`, `ServiceUnavailable`, …) are reschedule-without-attempt-advance (library v1.1.0), so transient SNS throttling never dead-letters a credential-lifecycle event.
 
@@ -894,7 +894,7 @@ The Token Service **does not** consume `MembershipRevoked` — a per-user member
 **Consumer pipeline (rev 1.4).** `cmd/consumer` builds its consumer with `events.NewSQSConsumerWithClient` plus `events.WithConsumerCodec(eventbus.GlueDecoder{})`: O&M publishes `TenantMembershipsPurged` through its own `GlueCodec`, and the decoder strips the self-describing 18-byte header (`[0x03][0x00][16-byte version UUID]`) with no Glue client or registry — this process still needs no Glue credentials. Each message then runs, outermost first:
 
 1. **DLQ router** (`cmd/consumer/dlq.go`) — a permanent reject is `SendMessage`'d to `tenant-lifecycle-tokensvc-q-dlq` (the decoded envelope with `dataschema` cleared; `EventType` + `DLQReason` attributes) and the source message acked. The DLQ URL is read once at startup from the queue's own `RedrivePolicy` (no env var). If it can't be resolved, or a send fails, the message falls back to normal retry + SQS redrive after `maxReceiveCount = 5`.
-2. **Cascade metrics** — `offboarding_cascade_total{result}` / `iam_offboarding_cascade_total{outcome}` (a rejected payload counts as `error`).
+2. **Cascade metrics** — `iam_token_service_offboarding_cascade_total{result}` (a rejected payload counts as `error`). The proposed Tier-2 `iam_offboarding_cascade_total{outcome}` is not emitted until it is ratified in the Platform Observability Registry.
 3. **`validateConsumed`** (`cmd/consumer/inbound_schema.go`) — the payload is checked against the embedded `tenant_memberships_purged.json` (this service's own contract: `tenant_id` required, open schema). No schema for the type → pass through to `ackUnknown`. A violation never reaches the cascade or `processed_events`: it increments `iam_token_service_consumed_schema_violations_total{consumer,event_type}` (pages via `IAMTokenServiceConsumedSchemaViolation` — that tenant's credentials were **not** cleaned up) and routes to the DLQ as `DLQReason=schema_violation`.
 4. **`OffboardingConsumer.Handle`** — the cascade (§8.4).
 
@@ -1156,9 +1156,9 @@ Three Tier-3 metrics have a **registry-proposed** Tier-1/Tier-2 equivalent, **du
 
 | Legacy (Tier 3, unchanged) | Proposed (dual-emitted) |
 |---|---|
-| `iam_token_service_openbao_call_duration_seconds{op}` | `platform_dependency_request_seconds{domain,service,environment,dependency,operation}` (Tier 1) |
-| `iam_token_service_processed_events_duplicates_total` | `platform_duplicate_messages_total{domain,service,environment,queue}` (Tier 1) |
-| `iam_token_service_offboarding_cascade_total{result}` | `iam_offboarding_cascade_total{service,environment,outcome}` (Tier 2) |
+| `iam_token_service_openbao_call_duration_seconds{op}` | `platform_dependency_request_seconds{domain,service,environment,dependency,operation,outcome}` (Tier 1, shared with platform-events) |
+| `iam_token_service_processed_events_duplicates_total` | `platform_duplicate_messages_total{domain,service,environment,queue,event_type}` (Tier 1, shared with platform-events) |
+| `iam_token_service_offboarding_cascade_total{result}` | `iam_offboarding_cascade_total{service,environment,outcome}` (Tier 2 — proposed, not emitted until ratified) |
 
 Full Tier-3 set (prefix `iam_token_service_*`):
 
@@ -1173,9 +1173,9 @@ Full Tier-3 set (prefix `iam_token_service_*`):
 | `iam_token_service_processed_events_duplicates_total` | counter | `consumer` | Deduped SQS redeliveries (§9.2) |
 | `iam_token_service_unknown_event_acknowledged_total` | counter | `consumer`, `event_type` | Forward-compat acks of unrecognized event types |
 | `iam_token_service_consumed_schema_violations_total` | counter | `consumer`, `event_type` | Inbound payloads that failed the embedded consumed schema and were sent straight to the DLQ (rev 1.4, §7.1) — pages |
-| `iam_token_service_outbox_pending` | gauge | — | Unrelayed outbox rows (bus-health signal; emitted by `platform-events`, not this service directly) |
+| `platform_outbox_pending_events` | gauge | — | Unrelayed outbox rows (bus-health signal; Tier 1, emitted by `platform-events`, not this service directly) |
 
-Additionally, `platform-pgcommon`'s `pgcommon_pool_*` gauges (total/idle/acquired/max conns, `pgcommon_pool_empty_acquire_total`) are registered for every connection pool this service opens (the app pool and the BYPASSRLS reconciler pool, distinguished by a `-reconciler`-suffixed `service` label) — a pre-Standard shared-library metric family, noted here as a known platform-wide follow-up (§25 is unaffected; this is a shared-library naming gap, not something this service can fix unilaterally).
+Additionally, `platform-pgcommon`'s Tier 1 pool metrics (`platform_db_pool_connections{state=idle|acquired|constructing}`, `platform_db_pool_max_connections`, `platform_db_pool_empty_acquires_total`, plus `platform_db_queries_total` / `platform_db_query_duration_seconds` etc.) are registered automatically by `pgcommon.NewPool` for every pool this service opens, because `metrics.InitLibraryMetrics` (`pgmetrics.InitWithIdentity`) runs before the first pool is created. The `pool` label distinguishes the app pool (`default`, `PG_POOL_NAME`) from the BYPASSRLS reconciler pool (`reconciler`, `SystemPoolConfig`). §25 is unaffected.
 
 ### 11.3 Tracing
 
@@ -1189,9 +1189,9 @@ OpenTelemetry via `platform-gincommon` middleware on the internal API; each use-
 
 **Consumed-schema violations (rev 1.4):** `IAMTokenServiceConsumedSchemaViolation` — `increase(iam_token_service_consumed_schema_violations_total[15m]) > 0` by `event_type` (critical — a `TenantMembershipsPurged` went straight to the DLQ and its cascade did not run; fix the producer or `api/asyncapi.yaml`, then redrive).
 
-Grafana dashboard: credential-transition rate by `op`, `rotation_overlap_active`, OpenBao call latency/error rate, offboarding-cascade / rotation-sweep / material-reconcile outcomes, and `outbox_pending`. Alerts: OpenBao failure-rate (page), stuck `rotating` versions past `expires_at` (`rotation_overlap_active` non-zero beyond one interval), **`iam_token_service_material_reconcile_total{result="missing_material"}` > 0 (page — a committed credential whose OpenBao material is gone, §8.6)**, offboarding-cascade DLQ depth, and `outbox_pending` growth (bus stall).
+Grafana dashboard: credential-transition rate by `op`, `rotation_overlap_active`, OpenBao call latency/error rate, offboarding-cascade / rotation-sweep / material-reconcile outcomes, and `platform_outbox_pending_events`. Alerts: OpenBao failure-rate (page), stuck `rotating` versions past `expires_at` (`rotation_overlap_active` non-zero beyond one interval), **`iam_token_service_material_reconcile_total{result="missing_material"}` > 0 (page — a committed credential whose OpenBao material is gone, §8.6)**, offboarding-cascade DLQ depth, and `platform_outbox_pending_events` growth (bus stall).
 
-**Implementation-phase additions (TS-D13):** `pgcommon_pool_empty_acquire_total` growth (Postgres connection-pool exhaustion, either pool), a growing `outbox_pending_total` backlog (earlier warning stage than the DLQ-depth alert above), and an offboarding-queue message-age alert (`aws_sqs_approximate_age_of_oldest_message_maximum` — dormant until a CloudWatch exporter is deployed for this queue, since neither this service nor `platform-events` exposes SQS queue depth/age in-process). `deploy/monitoring/app-alerts.yml` and the Helm chart's `templates/prometheusrule.yaml` are kept in sync by hand (the file's own header comment states this).
+**Implementation-phase additions (TS-D13):** `platform_db_pool_empty_acquires_total` growth (Postgres connection-pool exhaustion, per `pool`), a growing `platform_outbox_pending_events` backlog (earlier warning stage than the DLQ-depth alert above), and an offboarding-queue message-age alert (`aws_sqs_approximate_age_of_oldest_message_maximum` — dormant until a CloudWatch exporter is deployed for this queue, since neither this service nor `platform-events` exposes SQS queue depth/age in-process). `deploy/monitoring/app-alerts.yml` and the Helm chart's `templates/prometheusrule.yaml` are kept in sync by hand (the file's own header comment states this).
 
 ---
 
@@ -1254,7 +1254,7 @@ Key env vars (non-secret in Helm `env`; OpenBao access via Kubernetes auth, not 
 
 ### 12.1 Docs gating and fail-fast
 
-`DocsConfig` gates `/asyncapi` and `/swagger` exactly as the siblings do — always mounted outside `APP_ENV=production`, opt-in via `DOCS_ENABLED` in production, optionally bearer-gated. `cmd/server/config.go` fail-fast-validates on startup: an empty `OPENBAO_ADDR`, `SNS_TOPIC_SERVICEACCOUNT_ARN`, or `SQS_OFFBOARDING_QUEUE_URL` (outside dev defaults) panics rather than starting a mis-wired service.
+`DocsConfig` gates `/asyncapi` and `/swagger` exactly as the siblings do — always mounted outside production (`APP_ENV=prod`; the legacy spelling `production` is still treated as production), opt-in via `DOCS_ENABLED` in production, optionally bearer-gated. `cmd/server/config.go` fail-fast-validates on startup: an empty `OPENBAO_ADDR`, `SNS_TOPIC_SERVICEACCOUNT_ARN`, or `SQS_OFFBOARDING_QUEUE_URL` (outside dev defaults) panics rather than starting a mis-wired service.
 
 ---
 
@@ -1475,7 +1475,7 @@ Nothing is deployed to any environment. Initial deployment is a single migration
 
 ### 20.1 Outbox health
 
-`outbox_pending` (§11.2) is the primary bus-health signal — sustained growth means the SNS relay is stalled; credential operations still succeed (state is committed), only audit emission is delayed (EVT-4). Drain resumes automatically when SNS recovers. A warning-level `outbox_pending_total` growth alert (TS-D13, §11.5) fires before the DLQ-depth alert, at an earlier and still fully-recoverable stage.
+`platform_outbox_pending_events` (§11.2) is the primary bus-health signal — sustained growth means the SNS relay is stalled; credential operations still succeed (state is committed), only audit emission is delayed (EVT-4). Drain resumes automatically when SNS recovers. A warning-level `platform_outbox_pending_events` growth alert (TS-D13, §11.5) fires before the DLQ-depth alert, at an earlier and still fully-recoverable stage.
 
 ### 20.2 Stuck `rotating` versions
 
@@ -1557,11 +1557,11 @@ Prefix `TS-D#`.
 - **Stuck `rotating` version.** Check `cmd/rotator` is scheduled and healthy and OpenBao is reachable; the next TS-1 for the principal also sweeps it (§8.3). If OpenBao delete is failing, drain the OpenBao incident first — the Postgres row is already `revoked`, only material cleanup is pending.
 - **OpenBao outage.** Issue/rotate returns `502`; do not force a Postgres-only credential row (it would have no material). Wait for OpenBao recovery, then retry the provisioning/rotation; the §8.6 reconciler reclaims any orphaned material on its next run. If the reconciler reports `missing_material` (a committed row whose material is gone), rotate that principal (regenerate → RP re-applies) rather than trying to recover the lost secret.
 - **Offboarding DLQ drain.** Inspect `tenant-lifecycle-tokensvc-q-dlq`; confirm the tenant is genuinely purged, then re-drive DLQ → main queue (idempotent, §9.2). For a malformed event, capture and file a Core tenant-lifecycle bug.
-- **Outbox backlog.** If `outbox_pending` grows, check SNS/`iam-serviceaccount-events` health; the runner drains automatically on recovery. Credential operations are unaffected (EVT-4).
+- **Outbox backlog.** If `platform_outbox_pending_events` grows, check SNS/`iam-serviceaccount-events` health; the runner drains automatically on recovery. Credential operations are unaffected (EVT-4).
 - **Secret-logging gate failure in CI.** A credential field name reached a `slog`/`fmt` sink; remove it — no credential field may ever be a log attribute (§11.4).
 - **`409 credential_replay_revoked` from TS-1.** The caller replayed a `rotation_id` whose credential has since been revoked (overlap-expiry, a TS-2 revoke, or offboarding) — the material no longer exists in OpenBao. This is expected for a stale idempotency key; the caller must issue a fresh `rotation_id` to rotate again, not retry the old one (§9.2, §17).
 - **`networkPolicy.ingressNamespaceSelector is required` Helm render failure.** Set a real namespace label selector scoping ingress to the mesh namespace(s) in your values file — an empty selector is refused deliberately, it is not a bug in the chart (§10.2/§13.4).
-- **`pgcommon_pool_empty_acquire_total` growth alert.** A pool (app or `-reconciler`-suffixed) is exhausted — requests are waiting for a connection. Check `pgcommon_pool_acquired_conns` vs `pgcommon_pool_max_conns` and slow-query/long-held-transaction logs before raising `PG_MAX_CONNS` (§11.5).
+- **`platform_db_pool_empty_acquires_total` growth alert.** A pool (`pool="default"` app pool or `pool="reconciler"`) is exhausted — requests are waiting for a connection. Check `platform_db_pool_connections{state="acquired"}` vs `platform_db_pool_max_connections` and slow-query/long-held-transaction logs before raising `PG_MAX_CONNS` (§11.5).
 
 ---
 

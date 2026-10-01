@@ -288,7 +288,15 @@ otel:
   serviceName: iam-token-service
   exporterEndpoint: ""
 
-appEnv: production
+# APP_ENV — also the `environment` label on every metric. Must be one of
+# local | dev | test | staging | prod (Enterprise Platform Observability
+# Standard vocabulary, no aliases): platform-gincommon panics at startup on
+# anything else, e.g. "production". The docs surfaces treat "prod" as
+# production (docs.enabled gates them there).
+appEnv: prod
+# OBSERVABILITY_DOMAIN — the `domain` label on every metric. Required by
+# platform-gincommon; this service's business domain is "iam".
+observabilityDomain: iam
 logLevel: info
 
 # Graceful shutdown budget for the HTTP+metrics server and the outbox

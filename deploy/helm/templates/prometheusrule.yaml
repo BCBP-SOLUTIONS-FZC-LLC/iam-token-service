@@ -88,14 +88,16 @@ spec:
         # ── HTTP 5xx error rate (server) ──────────────────────────────────
         - alert: IAMTokenServiceHighErrorRate
           expr: |
-            sum(rate(http_requests_total{job={{ printf "%s-server" $job | quote }}, status=~"5.."}[5m]))
+            sum by (domain, service, environment) (rate(platform_http_requests_total{job={{ printf "%s-server" $job | quote }}, status_class="5xx"}[5m]))
               /
-            sum(rate(http_requests_total{job={{ printf "%s-server" $job | quote }}}[5m]))
+            sum by (domain, service, environment) (rate(platform_http_requests_total{job={{ printf "%s-server" $job | quote }}}[5m]))
             > 0.05
           for: 5m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service 5xx error rate above 5%
             description: >-
@@ -240,14 +242,16 @@ spec:
         - alert: IAMTokenServiceHighLatency
           expr: |
             histogram_quantile(0.99,
-              sum by (le) (
-                rate(http_request_duration_seconds_bucket{job={{ printf "%s-server" $job | quote }}}[5m])
+              sum by (le, domain, service, environment) (
+                rate(platform_http_request_duration_seconds_bucket{job={{ printf "%s-server" $job | quote }}}[5m])
               )
             ) > 1
           for: 10m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service p99 latency above 1s
             description: >-
@@ -276,12 +280,20 @@ spec:
     - name: iam_token_service_outbox_and_queues
       rules:
 
-        # ── Transactional outbox dead-letters — outbox_dead_letters_total
-        #    is platform-events' own metric (registered automatically by
-        #    events.Init), not something this service defines itself.
+        # ── Transactional outbox dead-letters — platform_dlq_messages_total
+        #    {operation="outbox_publish", reason="max_attempts"} is
+        #    platform-events' own metric (registered by events.InitMetrics),
+        #    not something this service defines itself. Its per-event_type
+        #    series are born at 1, which increase() alone reports as 0, so a
+        #    series born inside the window counts too (platform-events'
+        #    reference-rule pattern).
         - alert: IAMTokenServiceOutboxStuck
           expr: |
-            increase(outbox_dead_letters_total{service={{ $job | quote }}}[30m]) > 0
+            sum by (domain, service, environment) (
+              (platform_dlq_messages_total{service={{ $job | quote }}, operation="outbox_publish", reason="max_attempts"} unless last_over_time(platform_dlq_messages_total{service={{ $job | quote }}, operation="outbox_publish", reason="max_attempts"}[1h] offset 30m))
+                or
+              increase(platform_dlq_messages_total{service={{ $job | quote }}, operation="outbox_publish", reason="max_attempts"}[30m])
+            ) > 0
           for: 15m
           labels:
             severity: warning
@@ -298,35 +310,52 @@ spec:
               connectivity; outbox_dead_letters is queryable/retryable via
               standard SQL.
 
-        # ── SQS ReceiveMessage errors on the offboarding queue ────────────
+        # ── SQS ReceiveMessage errors ─────────────────────────────────────
+        # platform_dependency_request_seconds_count{dependency="sqs",
+        # operation="receive_message", outcome="error"} is the successor of the
+        # removed per-queue SQS receive-error counter: it has NO queue label, so this is per
+        # service (cmd/consumer reads only the offboarding queue, so nothing is
+        # lost here). Error series are born at 1 — counted like the DLQ alert.
         - alert: IAMTokenServiceSQSReceiveErrors
           expr: |
-            increase(sqs_receive_errors_total{service={{ $job | quote }}}[30m]) > 0
+            sum by (domain, service, environment) (
+              (platform_dependency_request_seconds_count{service={{ $job | quote }}, dependency="sqs", operation="receive_message", outcome="error"} unless last_over_time(platform_dependency_request_seconds_count{service={{ $job | quote }}, dependency="sqs", operation="receive_message", outcome="error"}[1h] offset 30m))
+                or
+              increase(platform_dependency_request_seconds_count{service={{ $job | quote }}, dependency="sqs", operation="receive_message", outcome="error"}[30m])
+            ) > 0
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
-            summary: iam-token-service is failing to receive from the offboarding queue
+            summary: iam-token-service is failing to receive from SQS
             description: >-
-              {{ "{{ $value | humanize }}" }} SQS ReceiveMessage error(s) (excludes context
-              cancellation) in the last 30 minutes. Check IAM permissions
-              and queue connectivity for the offboarding queue.
+              SQS ReceiveMessage error(s) (excludes context cancellation) in
+              the last 30 minutes. The metric has no queue label; this
+              service consumes only the offboarding queue. Check IAM
+              permissions and queue connectivity for it.
 
         # ── Outbox backlog building up (before dead-letter, above) ────────
-        # outbox_pending_total is platform-events' own gauge (see
+        # platform_outbox_pending_events is platform-events' own gauge (see
         # internal/adapter/outbound/metrics/metrics.go's header comment for
-        # why this service does not duplicate it) — a sustained backlog here
+        # why this service does not duplicate it; unlike its removed predecessor
+        # it is never -1 — a failed count keeps the last
+        # value and increments platform_outbox_errors_total{operation="pending_count"})
+        # — a sustained backlog here
         # means the 500ms outbox runner is falling behind or stalled,
         # distinct from IAMTokenServiceOutboxStuck (only fires once
         # MaxAttempts is exhausted and a row is dead-lettered — this catches
         # the earlier, still-recoverable stage).
         - alert: IAMTokenServiceOutboxBacklogGrowing
           expr: |
-            outbox_pending_total{service={{ $job | quote }}} > 100
+            max by (domain, service, environment) (platform_outbox_pending_events{service={{ $job | quote }}}) > 100
           for: 15m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service outbox has a growing unrelayed backlog
             description: >-
@@ -335,28 +364,33 @@ spec:
               connectivity before this escalates to dead-lettered events.
 
         # ── Postgres connection pool exhaustion ───────────────────────────
-        # pgcommon_pool_empty_acquire_total (platform-pgcommon's
-        # PoolStatsCollector, wired in cmd/server/consumer/rotator's
-        # main.go) counts acquires that had to wait because the pool had no
-        # idle connection — a rising count under normal traffic means
-        # PG_MAX_CONNS is undersized for current concurrency, or a slow
-        # query/transaction is holding connections open longer than
-        # expected. The "-reconciler" suffix on the service label
-        # distinguishes the BYPASSRLS reconciler pool from the RLS-scoped
-        # app pool.
+        # platform_db_pool_empty_acquires_total (platform-pgcommon; registered
+        # per pool by pgcommon.NewPool once pgmetrics.InitWithIdentity has run)
+        # counts acquires that had to wait because the pool had no idle
+        # connection — a rising count under normal traffic means PG_MAX_CONNS
+        # is undersized for current concurrency, or a slow query/transaction is
+        # holding connections open longer than expected. The `pool` label
+        # distinguishes the RLS-scoped app pool ("default") from the BYPASSRLS
+        # reconciler pool ("reconciler") — it replaces the old "-reconciler"
+        # suffix on the service label.
         - alert: IAMTokenServicePostgresPoolExhaustion
           expr: |
-            increase(pgcommon_pool_empty_acquire_total{service=~{{ printf "^%s.*" $job | quote }}}[15m]) > 0
+            sum by (domain, service, environment, pool) (
+              increase(platform_db_pool_empty_acquires_total{service={{ $job | quote }}}[15m])
+            ) > 0
           for: 5m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service Postgres connection pool is exhausted
             description: >-
-              One or more requests on pool "{{ "{{ $labels.service }}" }}" had to wait
+              One or more requests on pool "{{ "{{ $labels.pool }}" }}" had to wait
               for a connection because none were idle. Compare
-              pgcommon_pool_acquired_conns to pgcommon_pool_max_conns and check
+              platform_db_pool_connections{state="acquired"} to
+              platform_db_pool_max_connections and check
               for slow queries/long-held transactions before raising
               PG_MAX_CONNS.
 

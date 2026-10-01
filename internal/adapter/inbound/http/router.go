@@ -30,7 +30,20 @@ type DocsConfig struct {
 }
 
 func (d DocsConfig) active() bool {
-	return d.Environment != "production" || d.Enabled
+	return !d.production() || d.Enabled
+}
+
+// production reports whether Environment is the production environment.
+// APP_ENV uses the platform observability vocabulary (local, dev, test,
+// staging, prod — platform-gincommon rejects "production"), so "prod" is
+// the value deployments set; "production" is still honoured so a stale
+// value can never silently expose the docs surfaces.
+func (d DocsConfig) production() bool {
+	switch strings.ToLower(strings.TrimSpace(d.Environment)) {
+	case "prod", "production":
+		return true
+	}
+	return false
 }
 
 // Handlers bundles the Gin handler methods NewRouter wires onto routes.
@@ -173,7 +186,7 @@ func registerDocsRoutes(r *gin.Engine, cfg RouterConfig) {
 	}
 
 	var authMiddleware gin.HandlerFunc = func(c *gin.Context) { c.Next() }
-	if cfg.Docs.Environment == "production" && cfg.Docs.AuthToken != "" {
+	if cfg.Docs.production() && cfg.Docs.AuthToken != "" {
 		expected := []byte("Bearer " + cfg.Docs.AuthToken)
 		authMiddleware = func(c *gin.Context) {
 			// Constant-time compare — a plain != leaks how many leading

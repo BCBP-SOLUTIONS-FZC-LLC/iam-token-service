@@ -32,14 +32,13 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/openbao"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
 
-	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // buildVersion is injected by -ldflags at build time (see Dockerfile / Makefile).
@@ -62,16 +61,28 @@ func main() {
 		Logger:       log,
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
+		// Observability identity (Enterprise Platform Observability
+		// Standard): domain "iam" (OBSERVABILITY_DOMAIN overrides it) and the
+		// environment label, which must be one of local/dev/test/staging/prod
+		// — ObservabilityMiddlewares panics on anything else (e.g. "production").
+		Domain:      envOr("OBSERVABILITY_DOMAIN", metrics.ObservabilityDomain),
+		Environment: appEnv,
 	}
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
 	// it here (before any collector registration) so business metrics land
-	// on gincommon.MetricsRegisterer with matching {service, version} const
+	// on gincommon.MetricsRegisterer with matching {domain, service, environment} const
 	// labels. The health engine below applies the same middleware slice so
 	// probe traffic gets Zap access logs / HTTP metrics / HTTP traces.
 	_ = gincommon.ObservabilityMiddlewares(cfg)
+	// platform-events' (outbox/publish/consume/SQS/SNS) and platform-pgcommon's
+	// (platform_db_*) metrics share gincommon's registerer and identity so one
+	// /metrics scrape serves HTTP + business + messaging + DB collectors. Must
+	// run before NewPool (pool gauges are registered by NewPool) and before
+	// metrics.Register (which records into platform-events' shared collectors).
+	if err := metrics.InitLibraryMetrics(log); err != nil {
+		panic(fmt.Sprintf("init library metrics: %v", err))
+	}
 	metrics.Register(appEnv)
-	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
 
 	// ── 2. Database ────────────────────────────────────────────────────────
 	pgCfg, pgWarnings := pgcommon.ConfigFromEnv()
@@ -90,7 +101,6 @@ func main() {
 		panic(fmt.Sprintf("connect to postgres: %v", err))
 	}
 	defer pool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(pool, cfg.ServiceName))
 
 	ctx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
@@ -130,12 +140,11 @@ func main() {
 		principalRepo, credentialRepo, instrumentedSecrets, processedEventsRepo, txRunner, log,
 	)
 
-	// handleWithMetrics wraps offboardingConsumer.Handle to record both the
-	// legacy iam_token_service_offboarding_cascade_total{result} (§8.4,
-	// §11.2) and the registry-proposed iam_offboarding_cascade_total{outcome}
-	// (Enterprise Platform Observability Standard Tier 2, dual-emitted
-	// during the compatibility period) around every delivery, success or
-	// failure.
+	// handleWithMetrics wraps offboardingConsumer.Handle to record
+	// iam_token_service_offboarding_cascade_total{result} (§8.4, §11.2)
+	// around every delivery, success or failure. (The proposed Tier-2
+	// iam_offboarding_cascade_total is not emitted until it is ratified in
+	// the Platform Observability Registry.)
 	// validated runs the consumed-schema check (inbound_schema.go) before
 	// the cascade; a violation is counted as a failed cascade too.
 	validated := validateConsumed(offboardingConsumer.Handle, enqueueCodec, log)
@@ -147,9 +156,6 @@ func main() {
 		}
 		if metrics.OffboardingCascadeTotal != nil {
 			metrics.OffboardingCascadeTotal.WithLabelValues(result).Inc()
-		}
-		if metrics.IAMOffboardingCascadeTotal != nil {
-			metrics.IAMOffboardingCascadeTotal.WithLabelValues(result).Inc()
 		}
 		return err
 	}

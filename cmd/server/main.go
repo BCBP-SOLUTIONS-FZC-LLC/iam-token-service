@@ -33,13 +33,11 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // buildVersion is injected by -ldflags at build time (see Dockerfile / Makefile).
@@ -67,20 +65,27 @@ func main() {
 		Logger:       log,
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
+		// Observability identity (Enterprise Platform Observability
+		// Standard): domain "iam" (OBSERVABILITY_DOMAIN overrides it) and the
+		// environment label, which must be one of local/dev/test/staging/prod
+		// — ObservabilityMiddlewares panics on anything else (e.g. "production").
+		Domain:      envOr("OBSERVABILITY_DOMAIN", metrics.ObservabilityDomain),
+		Environment: appEnv,
 	}
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
 	// it here (before any collector registration) so business metrics land
-	// on gincommon.MetricsRegisterer with matching {service, version} const
+	// on gincommon.MetricsRegisterer with matching {domain, service, environment} const
 	// labels. NewRouter applies the same middleware slice to the engine.
 	_ = gincommon.ObservabilityMiddlewares(cfg)
+	// platform-events' (outbox/publish/consume/SQS/SNS) and platform-pgcommon's
+	// (platform_db_*) metrics share gincommon's registerer and identity so one
+	// /metrics scrape serves HTTP + business + messaging + DB collectors. Must
+	// run before NewPool (pool gauges are registered by NewPool) and before
+	// metrics.Register (which records into platform-events' shared collectors).
+	if err := metrics.InitLibraryMetrics(log); err != nil {
+		panic(fmt.Sprintf("init library metrics: %v", err))
+	}
 	metrics.Register(appEnv) // Tier 1/2/3 business metrics (Enterprise Platform Observability Standard)
-	// platform-events' own outbox/publish/consume metrics (including
-	// outbox_pending_total — this service's iam_token_service_outbox_pending,
-	// see metrics package doc comment) and platform-pgcommon's pool/query
-	// metrics share gincommon's registerer so one /metrics scrape serves
-	// HTTP + business + outbox + pg collectors together.
-	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
 
 	// ── 3. Database — pgcommon.ConfigFromEnv reads DATABASE_URL/PG_* so
 	// pool sizing, PgBouncer mode, and DSN assembly have exactly one
@@ -107,7 +112,6 @@ func main() {
 		panic(fmt.Sprintf("connect to postgres: %v", err))
 	}
 	defer pool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(pool, cfg.ServiceName))
 
 	ctx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
@@ -149,10 +153,6 @@ func main() {
 		panic(fmt.Sprintf("connect reconciler pool: %v", err))
 	}
 	defer reconcilerPool.Close()
-	// Suffixed "service" label distinguishes this pool's gauges from the
-	// app pool's (registered above) — Prometheus rejects two collectors
-	// exporting identical metric names under the exact same label set.
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(reconcilerPool, cfg.ServiceName+"-reconciler"))
 	if reconDSN == dsn {
 		log.Warn("RECONCILER_DATABASE_URL not set — reconciler pool reuses app DSN; cross-tenant queries will be RLS-filtered", nil)
 	}

@@ -11,13 +11,12 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
 func newFullTestRouter(t *testing.T, docs DocsConfig, principalSvc PrincipalService, credentialSvc CredentialService, postgres, openbao, outbox Pinger) *Router {
 	t.Helper()
 	return NewRouter(RouterConfig{
-		GinConfig: gincommon.Config{ServiceName: "iam-token-service-test"},
+		GinConfig: testGinConfig,
 		Docs:      docs,
 		Handlers: Handlers{
 			Principal:  NewPrincipalHandler(principalSvc),
@@ -85,6 +84,20 @@ func TestRouter_DocsSurface_Gating(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 	})
 
+	t.Run("prod (APP_ENV vocabulary), not enabled — docs routes absent", func(t *testing.T) {
+		r := newFullTestRouter(t, DocsConfig{Environment: "prod", Enabled: false}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("prod + AuthToken — requires bearer token", func(t *testing.T) {
+		r := newFullTestRouter(t, DocsConfig{Environment: "prod", Enabled: true, AuthToken: "s3cr3t"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		rec = doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", map[string]string{"Authorization": "Bearer s3cr3t"}, nil)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
 	t.Run("non-production — active without Enabled", func(t *testing.T) {
 		r := newFullTestRouter(t, DocsConfig{Environment: "dev"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
 		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
@@ -136,7 +149,7 @@ func TestRouter_DocsSurface_Gating(t *testing.T) {
 func TestRouter_JWKSRoute_RegisteredWhenHandlerPresent(t *testing.T) {
 	tenantID := uuid.New()
 	r := NewRouter(RouterConfig{
-		GinConfig: gincommon.Config{ServiceName: "iam-token-service-test"},
+		GinConfig: testGinConfig,
 		Handlers: Handlers{
 			Principal:  NewPrincipalHandler(&fakePrincipalService{}),
 			Credential: NewCredentialHandler(&fakeCredentialService{}),

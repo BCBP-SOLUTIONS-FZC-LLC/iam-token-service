@@ -14,7 +14,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/consumer"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 func newTestConsumer(t *testing.T) (*consumer.OffboardingConsumer, *fakePrincipalRepository, *fakeCredentialRepository, *fakeSecretStore, *fakeProcessedEventsStore, *fakeEventPublisher) {

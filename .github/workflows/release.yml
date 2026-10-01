@@ -372,7 +372,10 @@ jobs:
           done
 
       # status_class="5xx" is emitted by platform-gincommon's Gin
-      # middleware on http_requests_total.
+      # middleware on platform_http_requests_total (Enterprise Platform
+      # Observability Standard; metric_status: proposed in the registry —
+      # the pre-standard name is no longer emitted). domain="iam" pins the
+      # gate to this service's own series.
       - name: Health gate — error rate < 1% for 2 minutes
         run: |
           PROM_URL="${{ vars.PROMETHEUS_URL }}"
@@ -380,7 +383,7 @@ jobs:
             echo "PROMETHEUS_URL not set — skipping error-rate check"
             exit 0
           fi
-          QUERY='sum(rate(http_requests_total{job=~".*iam-token-service.*",status_class="5xx"}[2m]))/sum(rate(http_requests_total{job=~".*iam-token-service.*"}[2m]))'
+          QUERY='sum(rate(platform_http_requests_total{domain="iam",job=~".*iam-token-service.*",status_class="5xx"}[2m]))/sum(rate(platform_http_requests_total{domain="iam",job=~".*iam-token-service.*"}[2m]))'
           # Sleep AFTER confirming Prometheus is configured so the 2-minute window
           # only runs when there is actually something to measure.
           sleep 120

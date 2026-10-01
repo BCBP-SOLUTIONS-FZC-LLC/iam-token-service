@@ -126,6 +126,8 @@ func TestSystemPoolConfig_ForcesPGBouncerMode(t *testing.T) {
 	assert.Nil(t, cfg.Tracer, "Tracer is wired by the call site, not SystemPoolConfig")
 	assert.Nil(t, cfg.Logger, "nil log must leave Logger unset")
 	assert.Equal(t, int32(20), cfg.MaxConns, "reconciler pool inherits pool sizing from ConfigFromEnv")
+	assert.Equal(t, SystemPoolName, cfg.PoolName,
+		"reconciler pool needs its own platform_db_* pool label — same-named live pools share (sum) one gauge collector")
 }
 
 func TestSystemPoolConfig_NonNilLoggerWiresAdapter(t *testing.T) {

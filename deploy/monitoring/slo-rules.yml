@@ -36,6 +36,15 @@
 #         fires on ANY error in 1h — this tracks the success ratio as a
 #         budget instead of a raw count.
 #
+# Metrics: platform_http_request_duration_seconds / platform_http_requests_total
+# (platform-gincommon, Enterprise Platform Observability Standard). They carry
+# {domain, service, environment, method, route, status_class, error_class};
+# every SLI keeps `by (domain, service, environment)` so it joins with other
+# services' SLIs. Both are still "proposed" in the Platform Observability
+# Registry: the alerts built on them carry metric_status: proposed until
+# governance ratifies the names (the pre-standard http_* names were removed
+# from the library and are no longer emitted).
+#
 # Recording rules pre-compute the SLI numerator/denominator so alert rules
 # can key off a scalar. Alerts follow the multi-window multi-burn-rate
 # pattern (SRE book Ch. 5): a slow burn signals an ongoing degradation,
@@ -47,45 +56,45 @@ groups:
     interval: 30s
     rules:
       # TS-1 issue/rotate latency histogram → error budget window.
-      # Assumes the gincommon middleware exposes http_request_duration_seconds
-      # bucketed histogram with a "path" label matching the route pattern.
+      # platform_http_request_duration_seconds' `route` label is the Gin route
+      # template (never the raw path), so it matches the TS-1 route below.
       - record: iam_token_service:ts1_latency_sli:ratio_rate_5m
         expr: |
-          sum(rate(http_request_duration_seconds_bucket{
+          sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
             job="iam-token-service-server",
-            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
             le="0.5"
           }[5m]))
           /
-          clamp_min(sum(rate(http_request_duration_seconds_count{
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
             job="iam-token-service-server",
-            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
           }[5m])), 0.001)
 
       - record: iam_token_service:ts1_latency_sli:ratio_rate_1h
         expr: |
-          sum(rate(http_request_duration_seconds_bucket{
+          sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
             job="iam-token-service-server",
-            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
             le="0.5"
           }[1h]))
           /
-          clamp_min(sum(rate(http_request_duration_seconds_count{
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
             job="iam-token-service-server",
-            path="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
           }[1h])), 0.001)
 
       # Write-path error rate (5xx only — 4xx like credential_replay_revoked
       # 409 or optimistic_lock_conflict are intentional, §17).
       - record: iam_token_service:write_error_rate:ratio_rate_5m
         expr: |
-          sum(rate(http_requests_total{
+          sum by (domain, service, environment) (rate(platform_http_requests_total{
             job="iam-token-service-server",
             method=~"POST|PUT|PATCH|DELETE",
-            status=~"5.."
+            status_class="5xx"
           }[5m]))
           /
-          clamp_min(sum(rate(http_requests_total{
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_requests_total{
             job="iam-token-service-server",
             method=~"POST|PUT|PATCH|DELETE"
           }[5m])), 0.001)
@@ -94,12 +103,12 @@ groups:
       # IAMTokenServiceRotationSweepFailures' iam_token_service_rotation_sweep_total.
       - record: iam_token_service:sweep_success_rate:ratio_rate_1h
         expr: |
-          sum(rate(iam_token_service_rotation_sweep_total{
+          sum by (domain, service, environment) (rate(iam_token_service_rotation_sweep_total{
             job="iam-token-service-rotator",
             result!="error"
           }[1h]))
           /
-          clamp_min(sum(rate(iam_token_service_rotation_sweep_total{
+          clamp_min(sum by (domain, service, environment) (rate(iam_token_service_rotation_sweep_total{
             job="iam-token-service-rotator"
           }[1h])), 0.001)
 
@@ -118,6 +127,7 @@ groups:
           severity: page
           slo: SLO-1
           team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
           summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 latency degraded (placeholder target — see file header)"
           description: |
@@ -136,6 +146,7 @@ groups:
           severity: ticket
           slo: SLO-1
           team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
           summary: "SLO-1 slow-burn: TS-1 latency below placeholder target for 15m+"
 
@@ -147,6 +158,7 @@ groups:
           severity: page
           slo: SLO-2
           team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
           summary: "SLO-2 fast-burn: write-path 5xx rate above placeholder target"
           description: |

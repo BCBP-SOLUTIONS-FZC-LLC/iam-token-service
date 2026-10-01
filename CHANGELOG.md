@@ -6,6 +6,14 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed
+
+- **Platform libraries' metrics contract (platform-gincommon / platform-events / platform-pgcommon, unreleased versions).** The libraries now emit only `platform_*` metrics with a mandatory `{domain, service, environment}` identity; their pre-standard names were removed with no compatibility period.
+  - Every binary (`server`, `consumer`, `rotator`, `scheduler`) sets `gincommon.Config.Domain` (`"iam"`, `OBSERVABILITY_DOMAIN` overrides) and `Environment` (`APP_ENV`). New `metrics.InitLibraryMetrics` calls `events.InitMetrics` and `pgmetrics.InitWithIdentity` with gincommon's identity and registerer, logs their `RegistrationWarning`s and fails startup on an invalid identity. It runs before the first `pgcommon.NewPool`, which now registers each pool's `platform_db_pool_*` gauges itself — the hand-registered pool-stats collectors are gone. The BYPASSRLS pool gets its own `pool="reconciler"` label (`SystemPoolConfig`) instead of a suffixed `service` label.
+  - `platform_dependency_request_seconds` and `platform_duplicate_messages_total` now use the registry shapes (`{dependency, operation, outcome}`, `{queue, event_type}`) and record into platform-events' own collectors. The previous `{dependency, operation}` / `{queue}` shapes made platform-events' SNS/SQS/codec series fail to register. Tier 1/2 `service` is now gincommon's `"iam-token-service"`, not `"token-service"`.
+  - Alerts (`deploy/monitoring/app-alerts.yml`, Helm `prometheusrule.yaml`), SLO rules, the prometheus-adapter rule, the HPA (`platform_http_requests_per_second`), the release health gate and the docs query the `platform_*` successors. Rules on successors still `proposed` in the registry carry `metric_status: proposed`. The 5xx queries now select `status_class="5xx"` (the HTTP metrics have no `status` label), and the TS-1 latency SLI selects `route` instead of `path`.
+  - Helm `appEnv` is `prod` (was `production`, which platform-gincommon rejects). The docs surfaces treat `prod` and `production` alike, so they stay gated in production. New Helm value `observabilityDomain` sets `OBSERVABILITY_DOMAIN`, which is also in `docker-compose.yml`, `.env-example` and the Makefile.
+
 ### Added
 
 - **TS-6 `GET /api/v1/internal/tenants/:id/service-accounts/platform-automation` (TS-D17).** Reads the tenant's automation principal, including `principal_sub`, from the tenant id alone. The Workflow Service's connector workers use it to name the acting principal on step callbacks; TS-5 answers only the reverse question.

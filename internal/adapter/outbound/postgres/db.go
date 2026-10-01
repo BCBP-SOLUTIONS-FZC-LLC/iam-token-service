@@ -10,7 +10,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/puddle/v2"
 )
@@ -77,6 +77,11 @@ func ReconcilerDSNFromEnv() string {
 	return DSNFromEnv()
 }
 
+// SystemPoolName is the "pool" label of the BYPASSRLS reconciler pool on
+// platform-pgcommon's platform_db_* metrics; the app pool keeps
+// ConfigFromEnv's PG_POOL_NAME (default "default").
+const SystemPoolName = "reconciler"
+
 // SystemPoolConfig returns pgcommon.Config for the BYPASSRLS reconciler
 // pool (§4.3/RLS-7), matching iam-user-profile / iam-org-membership.
 // The pool deliberately has no GUCProvider — cross-tenant rotator /
@@ -97,6 +102,10 @@ func SystemPoolConfig(dsn string, log port.Logger) pgcommon.Config {
 	cfg.GUCProvider = nil
 	cfg.PGBouncerMode = true
 	cfg.Tracer = nil
+	// Its own "pool" label on the platform_db_* metrics: NewPool sums the
+	// connection gauges of live pools sharing a PoolName, which would blend
+	// this BYPASSRLS pool into the app pool's utilisation.
+	cfg.PoolName = SystemPoolName
 	if log != nil {
 		cfg.Logger = NewLoggerAdapter(log)
 	} else {

@@ -9,40 +9,58 @@
 //     values, aggregation expectations) this package's proposed metrics
 //     require before they may be treated as ratified.
 //   - Tier 2 (iam_*) — semantics shared across IAM services, not meaningful
-//     outside the domain. Required labels: service, environment.
+//     outside the domain. Required labels: service, environment. An iam_*
+//     name must be a ratified Platform Observability Registry entry before
+//     it is emitted, so this package emits none today (the proposed
+//     iam_offboarding_cascade_total waits on ratification).
 //   - Tier 3 (iam_token_service_*, frozen §25) — this service only. No
 //     cross-service label contract; kept exactly as the LLD froze them.
 //
-// Migration posture (per the Standard's Backward Compatibility section):
-// every Tier-1/Tier-2 metric below is emitted IN PARALLEL with its
-// pre-existing Tier-3 equivalent, not as a replacement — dashboards/alerts
-// keep working against the legacy name during the compatibility period,
-// and only migrate + the legacy metric is removed after governance
-// ratifies the new name and a sunset period elapses (see CHANGELOG.md).
+// Every collector carries gincommon's centrally injected {domain, service,
+// environment} const labels (gincommon.MetricsConstLabels) — the same values
+// platform-gincommon, platform-events and platform-pgcommon put on their
+// platform_* series, so one scrape joins cleanly on them.
+//
+// The two Tier 1 names this service records into
+// (platform_dependency_request_seconds, platform_duplicate_messages_total)
+// are owned by platform-events, which registers them with the registry
+// shape in InitLibraryMetrics. Register therefore reuses platform-events'
+// collector (same descriptor ⇒ prometheus.AlreadyRegisteredError) instead
+// of registering a second, differently-shaped one — which would disable
+// platform-events' own SNS/SQS/codec series (fail-soft RegistrationWarning).
+//
+// The service's own Tier-3 names (iam_token_service_*) predate the platform
+// libraries' migration and are unchanged; each Tier-1 metric below is still
+// emitted in parallel with its Tier-3 equivalent until governance ratifies
+// the new name (see CHANGELOG.md).
 package metrics
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/obsregistry"
 )
 
 const (
 	tier3Prefix = "iam_token_service_" // frozen, §25 — Tier 3 naming: <domain>_<service>_<metric>.
-	tier2Prefix = "iam_"               // Tier 2 naming: <domain>_<metric>.
-	tier1Prefix = "platform_"          // Tier 1 naming: platform_<metric>.
 
-	// domainName and serviceName are this package's own copies of the
-	// Tier-1/Tier-2 `domain`/`service` label values — deliberately NOT
-	// reusing gincommon's {service} const label (which is
-	// "iam-token-service", the pre-Standard domain+service-combined name):
-	// the Standard's `service` label is domain-less ("token-service") with
-	// `domain` carried as its own separate label, so a Tier-1/2 consumer
-	// can group by domain without string-splitting a label value.
-	domainName  = "iam"
-	serviceName = "token-service"
+	// domainName and serviceName are the identity fallbacks used only
+	// before gincommon.ObservabilityMiddlewares has run (unit tests that
+	// never bootstrap gincommon). In every binary the labels come from
+	// gincommon.MetricsConstLabels, so this package's `service` value is
+	// exactly the one gincommon, platform-events and platform-pgcommon emit
+	// (APP_NAME, "iam-token-service").
+	domainName  = ObservabilityDomain
+	serviceName = "iam-token-service"
+
+	// Tier 1 names owned by platform-events (see package doc).
+	dependencyRequestSecondsName = "platform_dependency_request_seconds"
+	duplicateMessagesTotalName   = "platform_duplicate_messages_total"
 )
 
 var (
@@ -70,9 +88,11 @@ var (
 	OpenBaoCallDuration *prometheus.HistogramVec
 
 	// OffboardingCascadeTotal counts offboarding-cascade outcomes
-	// (§8.4) by result (ok|error). Legacy Tier-3 name kept for the
-	// compatibility period — see IAMOffboardingCascadeTotal (Tier 2,
-	// dual-emitted alongside this).
+	// (§8.4) by result (ok|error). Authoritative: the proposed Tier-2
+	// iam_offboarding_cascade_total (docs/observability-registry-proposals.md,
+	// Proposal 3) is not emitted until it is ratified in the Platform
+	// Observability Registry — the platform libraries' contract rejects an
+	// unregistered iam_* name (only iam_token_service_* is service-owned).
 	OffboardingCascadeTotal *prometheus.CounterVec
 
 	// RotationSweepTotal counts overlap-expiry sweep outcomes (§8.3) by
@@ -133,32 +153,19 @@ var (
 
 	// ── Tier 1: platform_* (REGISTRY-PROPOSED — see package doc) ─────────
 
-	// DependencyRequestDuration is the proposed platform_dependency_request_seconds:
-	// latency of an outbound call to a named external dependency, labeled
-	// {domain, service, environment, dependency, operation}. This
-	// package's only current dependency label value is "openbao"
-	// (write|delete operations) — dual-emitted alongside the legacy
-	// OpenBaoCallDuration.
+	// DependencyRequestDuration is the registry-proposed
+	// platform_dependency_request_seconds{dependency, operation, outcome}
+	// (owned by platform-events, which records sns/sqs/codec into the same
+	// collector). This service adds dependency="openbao", operation
+	// write|delete, outcome success|error — dual-emitted alongside the
+	// legacy OpenBaoCallDuration.
 	DependencyRequestDuration *prometheus.HistogramVec
 
-	// DuplicateMessagesTotal is the proposed platform_duplicate_messages_total:
-	// inbound messages recognized as redeliveries and skipped, labeled
-	// {domain, service, environment, queue}. Dual-emitted alongside the
-	// legacy ProcessedEventsDuplicates.
+	// DuplicateMessagesTotal is the registry-proposed
+	// platform_duplicate_messages_total{queue, event_type} (owned by
+	// platform-events): inbound messages recognized as redeliveries and
+	// skipped. Dual-emitted alongside the legacy ProcessedEventsDuplicates.
 	DuplicateMessagesTotal *prometheus.CounterVec
-
-	// ── Tier 2: iam_* (proposed for the IAM Domain Metric Registry) ──────
-
-	// IAMOffboardingCascadeTotal is the proposed iam_offboarding_cascade_total:
-	// outcomes of a service's own tenant-offboarding cascade, labeled
-	// {service, environment, outcome} — semantically identical wherever an
-	// IAM service reacts to TenantMembershipsPurged by cleaning up its own
-	// domain data (this service's credential/OpenBao-material cleanup,
-	// org-membership's membership-row cleanup, etc. — Standard §"Domain
-	// metrics must have identical semantic definitions across all services
-	// within the domain"). Dual-emitted alongside the legacy
-	// OffboardingCascadeTotal.
-	IAMOffboardingCascadeTotal *prometheus.CounterVec
 )
 
 var (
@@ -166,9 +173,9 @@ var (
 	environment  string // set once by Register; read-only thereafter.
 )
 
-// gincommonLabels returns a copy of gincommon's {service, version} const
-// labels so Tier-3 collectors scrape on the same registry and labels as
-// HTTP metrics. Returns nil when ObservabilityMiddlewares has not run yet,
+// gincommonLabels returns a copy of gincommon's {domain, service,
+// environment} const labels so Tier-3 collectors scrape on the same registry
+// and labels as HTTP metrics. Returns nil when ObservabilityMiddlewares has not run yet,
 // matching prometheus's "no const labels" zero value so unit tests that
 // never bootstrap gincommon still register cleanly.
 func gincommonLabels() prometheus.Labels {
@@ -179,24 +186,25 @@ func gincommonLabels() prometheus.Labels {
 	return labels
 }
 
-// tier3Labels merges gincommon's {service, version} with `environment` —
+// tier3Labels is gincommon's {domain, service, environment} (environment
+// added explicitly so it is present even before gincommon is initialised) —
 // the const-label set for this service's own iam_token_service_* metrics.
 func tier3Labels() prometheus.Labels {
 	return withEnvironment(gincommonLabels())
 }
 
-// tier2Labels is the Standard's Tier-2 required label set: {service,
-// environment} — domain is not repeated as a label because it is already
-// the iam_ name prefix. `service` here is deliberately the domain-less
-// name ("token-service"), per this package's doc comment.
-func tier2Labels() prometheus.Labels {
-	return prometheus.Labels{"service": serviceName, "environment": environment}
-}
-
 // tier1Labels is the Standard's Tier-1 required label set: {domain,
-// service, environment}.
+// service, environment} — gincommon's values (identical to
+// platform-events' and platform-pgcommon's, see InitLibraryMetrics), or the
+// package fallbacks before gincommon is initialised.
 func tier1Labels() prometheus.Labels {
-	return prometheus.Labels{"domain": domainName, "service": serviceName, "environment": environment}
+	labels := prometheus.Labels{"domain": domainName, "service": serviceName, "environment": environment}
+	for k, v := range gincommonLabels() {
+		if _, ok := labels[k]; ok && v != "" {
+			labels[k] = v
+		}
+	}
+	return labels
 }
 
 // withEnvironment returns a copy of base with "environment" added — nil
@@ -214,8 +222,9 @@ func withEnvironment(base prometheus.Labels) prometheus.Labels {
 
 // Register wires this service's business metrics onto gincommon's
 // Prometheus registerer (same registry as HTTP metrics). Call once at
-// startup AFTER ObservabilityMiddlewares has run and BEFORE /metrics is
-// served, passing the resolved APP_ENV value (the Standard's centrally-
+// startup AFTER ObservabilityMiddlewares and InitLibraryMetrics have run and
+// BEFORE /metrics is served, passing the resolved APP_ENV value (gincommon's
+// normalised environment label wins when it is set) (the Standard's centrally-
 // injected `environment` label — instrumentation call sites never set it
 // themselves, per requirement #8: labels must be injected centrally so
 // they cannot be omitted or misspelled). Idempotent. Every one of
@@ -226,13 +235,15 @@ func withEnvironment(base prometheus.Labels) prometheus.Labels {
 func Register(env string) {
 	registerOnce.Do(func() {
 		environment = env
+		if e := gincommonLabels()["environment"]; e != "" {
+			environment = e
+		}
 		registerMetrics()
 	})
 }
 
 func registerMetrics() {
 	t3 := tier3Labels()
-	t2 := tier2Labels()
 	t1 := tier1Labels()
 
 	// ── Tier 3 ────────────────────────────────────────────────────────
@@ -257,7 +268,7 @@ func registerMetrics() {
 
 	OffboardingCascadeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name:        tier3Prefix + "offboarding_cascade_total",
-		Help:        "[Legacy — see iam_offboarding_cascade_total] Offboarding-cascade outcomes (§8.4) by result (ok|error).",
+		Help:        "Offboarding-cascade outcomes (§8.4) by result (ok|error).",
 		ConstLabels: t3,
 	}, []string{"result"})
 
@@ -297,26 +308,22 @@ func registerMetrics() {
 		ConstLabels: t3,
 	}, []string{"consumer", "event_type"})
 
-	// ── Tier 1 (registry-proposed) ───────────────────────────────────────
-	DependencyRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        tier1Prefix + "dependency_request_seconds",
-		Help:        "[REGISTRY-PROPOSED, pending Platform Observability Registry ratification — see docs/observability-registry-proposals.md] Outbound dependency call latency by dependency and operation.",
-		Buckets:     prometheus.DefBuckets,
+	// ── Tier 1 (registry-proposed, owned by platform-events) ─────────────
+	// Built from the Platform Observability Registry entry (name, help,
+	// labels, buckets) so the descriptor is identical to platform-events'
+	// and registerShared can adopt its collector.
+	DependencyRequestDuration = registerShared(prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        dependencyRequestSecondsName,
+		Help:        registryEntry(dependencyRequestSecondsName).Help,
+		Buckets:     obsregistry.Default().Buckets(registryEntry(dependencyRequestSecondsName).Buckets),
 		ConstLabels: t1,
-	}, []string{"dependency", "operation"})
+	}, registryEntry(dependencyRequestSecondsName).Labels))
 
-	DuplicateMessagesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name:        tier1Prefix + "duplicate_messages_total",
-		Help:        "[REGISTRY-PROPOSED, pending Platform Observability Registry ratification — see docs/observability-registry-proposals.md] Inbound messages recognized as redeliveries and skipped, by queue.",
+	DuplicateMessagesTotal = registerShared(prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        duplicateMessagesTotalName,
+		Help:        registryEntry(duplicateMessagesTotalName).Help,
 		ConstLabels: t1,
-	}, []string{"queue"})
-
-	// ── Tier 2 (proposed for the IAM Domain Metric Registry) ─────────────
-	IAMOffboardingCascadeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name:        tier2Prefix + "offboarding_cascade_total",
-		Help:        "[PROPOSED for the IAM Domain Metric Registry — see docs/observability-registry-proposals.md] Per-service tenant-offboarding cascade outcomes by outcome (ok|error).",
-		ConstLabels: t2,
-	}, []string{"outcome"})
+	}, registryEntry(duplicateMessagesTotalName).Labels))
 
 	JWKSKeyErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name:        tier3Prefix + "jwks_key_errors_total",
@@ -341,9 +348,6 @@ func registerMetrics() {
 		ProcessedEventsDuplicates,
 		UnknownEventAcknowledged,
 		ConsumedSchemaViolationsTotal,
-		DependencyRequestDuration,
-		DuplicateMessagesTotal,
-		IAMOffboardingCascadeTotal,
 	)
 
 	// Pre-initialize labels so dashboards show 0 rather than "no data".
@@ -352,17 +356,54 @@ func registerMetrics() {
 	}
 	for _, op := range []string{"write", "delete"} {
 		OpenBaoCallDuration.WithLabelValues(op)
-		DependencyRequestDuration.WithLabelValues("openbao", op)
+		for _, outcome := range []string{OutcomeSuccess, OutcomeError} {
+			DependencyRequestDuration.WithLabelValues(DependencyOpenBao, op, outcome)
+		}
 	}
 	ConsumedSchemaViolationsTotal.WithLabelValues("tenant_offboarding", "TenantMembershipsPurged")
 	for _, result := range []string{"ok", "error"} {
 		OffboardingCascadeTotal.WithLabelValues(result)
-		IAMOffboardingCascadeTotal.WithLabelValues(result)
 		RotationSweepTotal.WithLabelValues(result)
 	}
 	for _, result := range []string{"orphan_deleted", "missing_material", "ok", "error"} {
 		MaterialReconcileTotal.WithLabelValues(result)
 	}
 	ProcessedEventsDuplicates.WithLabelValues("tenant_offboarding")
-	DuplicateMessagesTotal.WithLabelValues("tenant-lifecycle-tokensvc-q")
+	DuplicateMessagesTotal.WithLabelValues("tenant-lifecycle-tokensvc-q", "TenantMembershipsPurged")
+}
+
+// Label values this service records on the shared Tier 1 metrics.
+const (
+	DependencyOpenBao = "openbao"
+	OutcomeSuccess    = "success"
+	OutcomeError      = "error"
+)
+
+// registryEntry returns name's Platform Observability Registry entry; a
+// missing entry is a build-time contract break, so it panics at startup.
+func registryEntry(name string) *obsregistry.Metric {
+	m, ok := obsregistry.Default().Lookup(name)
+	if !ok {
+		panic(fmt.Sprintf("metrics: %s is not in the Platform Observability Registry", name))
+	}
+	return m
+}
+
+// registerShared registers c on gincommon's registerer, or — when a
+// collector with the identical descriptor is already registered (platform-
+// events' own, via InitLibraryMetrics) — returns that collector, so both
+// libraries record into one series set. Any other registration error (a
+// conflicting shape) panics at startup, like MustRegister.
+func registerShared[C prometheus.Collector](c C) C {
+	err := gincommon.MetricsRegisterer().Register(c)
+	if err == nil {
+		return c
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(C); ok {
+			return existing
+		}
+	}
+	panic(fmt.Sprintf("metrics: register shared collector: %v", err))
 }

@@ -15,8 +15,8 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // tenantMembershipsPurgedEventType is the wire-format `type` field on a
@@ -89,7 +89,7 @@ func (c *OffboardingConsumer) Handle(ctx context.Context, env events.Envelope[js
 
 	// Idempotency short-circuit (§9.2, §17 'duplicate' disposition) —
 	// processed_events is RLS-exempt, no tenant GUC needed for this read.
-	seen, err := skipDuplicate(ctx, c.processed, port.ProcessedEventsConsumerTenantOffboarding, env.ID)
+	seen, err := skipDuplicate(ctx, c.processed, port.ProcessedEventsConsumerTenantOffboarding, env.ID, env.Type)
 	if err != nil {
 		return err
 	}

@@ -37,7 +37,9 @@ spec:
     - type: Pods
       pods:
         metric:
-          name: http_requests_per_second
+          # Exposed by the prometheus-adapter rule from
+          # platform_http_requests_total (platform-gincommon).
+          name: platform_http_requests_per_second
         target:
           type: AverageValue
           averageValue: {{ .Values.autoscaling.targetRPSPerReplica }}
