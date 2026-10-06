@@ -88,6 +88,7 @@ This service has never been deployed to any environment — there is no released
 
 ### Security
 
+- **Trivy exception for DLA-4792-1 (`tzdata` 2026b in the distroless base), expiring 2026-11-07** (`.trivyignore`). A timezone-data update rated UNKNOWN, which the PR image scan treats as blocking; the newest upstream `static-debian12:nonroot` image still ships 2026b, so there is no base image to move to yet. Remove the entry once distroless ships 2026c.
 - **GO-2026-6443 (gRPC server panic on a missing authority/Host header) — tracked, not yet upgradable.** govulncheck lists it as an imported package, but no code path here reaches it: the service runs no gRPC server, and gRPC is only the OTLP trace exporter's client transport (`otlptracegrpc`, via platform-gincommon). The fix exists only in an unreleased `v1.85.0-dev` build, so we stay on the released `google.golang.org/grpc v1.84.0` and bump to v1.85.0 once it is tagged; Dependabot's gomod updates will raise it. (GO-2026-5932, `golang.org/x/crypto/openpgp`, is in a required module but in a package this service never imports.)
 
 ### Fixed
