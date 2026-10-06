@@ -2,7 +2,7 @@
 //
 // @title           IAM Token Service API
 // @version         1.0
-// @description     Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-4).
+// @description     Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-6 plus the EXT-6 JWKS route).
 // @description
 // @description     **Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).
 // @description     **Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).
@@ -16,11 +16,6 @@
 // @host      localhost:8080
 // @BasePath  /api/v1/internal
 //
-// @securityDefinitions.apikey SystemRole
-// @in                         header
-// @name                       x-tenant-roles
-// @description                Must contain "iam-system". Injected by the API gateway / mesh; never set by callers directly.
-//
 // @securityDefinitions.apikey TenantID
 // @in                         header
 // @name                       x-tenant-id
@@ -29,7 +24,7 @@
 // @securityDefinitions.apikey UserID
 // @in                         header
 // @name                       x-user-id
-// @description                Caller identity injected by the API gateway — recorded as the actor on any mutation.
+// @description                Must be the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID); anything else is 401 missing_identity_headers.
 //
 // @tag.name         ServiceAccounts
 // @tag.description  Service-account principal registration and metadata read (TS-3, TS-4)

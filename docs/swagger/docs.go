@@ -25,16 +25,11 @@ const docTemplate = `{
             "get": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer \"does this subject resolve to a service_account-typed Keycloak principal\" without ever generating principal_sub itself (TS-INV-1).",
+                "description": "Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer \"does this subject resolve to a service_account-typed Keycloak principal\" without ever generating principal_sub itself (TS-INV-1). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "produces": [
                     "application/json"
                 ],
@@ -79,6 +74,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
@@ -90,22 +91,23 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
+                    },
+                    "503": {
+                        "description": "db_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
                     }
                 }
             },
             "post": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Registers the per-tenant platform-automation service-account principal. Idempotent on (tenant_id, keycloak_client_id) — repeating an already-registered request returns 200 with the existing record instead of erroring.",
+                "description": "Registers the per-tenant platform-automation service-account principal. Idempotent on (tenant_id, principal_type) — repeating an already-registered request returns 200 with the existing record, and a re-mint (new principal_sub/keycloak_client_id) updates it in place, keeping principal_id. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "consumes": [
                     "application/json"
                 ],
@@ -160,6 +162,24 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "rotation_in_flight (retryable; the principal row is locked by a concurrent credential write)",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "415": {
+                        "description": "unsupported_media_type",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -179,16 +199,11 @@ const docTemplate = `{
             "get": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material.",
+                "description": "Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "produces": [
                     "application/json"
                 ],
@@ -225,6 +240,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
@@ -248,7 +269,7 @@ const docTemplate = `{
         },
         "/tenants/{id}/service-accounts/platform-automation/jwks.json": {
             "get": {
-                "description": "Public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches to verify that principal's client_assertion (§2.5). Always 200 with a (possibly empty) keys array; an unknown tenant or absent principal is never distinguished from a principal with zero live keys, since this route has no caller identity to authorize a 404 against.",
+                "description": "Public JWK Set for the tenant's platform-automation principal — the keys Keycloak's client-jwt authenticator fetches to verify that principal's client_assertion (§2.5). 200 with a (possibly empty) keys array; an unknown tenant or absent principal is never distinguished from a principal with zero live keys, since this route has no caller identity to authorize a 404 against. 503 jwks_keys_unavailable when the ACTIVE key, or every live key, failed to read from OpenBao (so Keycloak keeps its cached keys rather than caching a set without the current key); a set missing only overlap (rotating) keys is served as 200. No identity headers; rate-limited per tenant, and tenant ids with no live credential share a small separate bucket.",
                 "produces": [
                     "application/json"
                 ],
@@ -290,6 +311,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
+                    },
+                    "503": {
+                        "description": "jwks_keys_unavailable (active key, or every live key, unreadable) | db_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
                     }
                 }
             }
@@ -298,16 +325,11 @@ const docTemplate = `{
             "get": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Returns principal metadata and a summary of every credential version (status, OpenBao path, issued/expires timestamps) — never the credential plaintext itself (§5.6).",
+                "description": "Returns principal metadata and a summary of every credential version (status, OpenBao path, issued/expires timestamps) — never the credential plaintext itself (§5.6). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "produces": [
                     "application/json"
                 ],
@@ -352,6 +374,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
@@ -363,6 +391,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
+                    },
+                    "503": {
+                        "description": "db_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
                     }
                 }
             }
@@ -371,16 +405,11 @@ const docTemplate = `{
             "post": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache.",
+                "description": "Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2) — only within ROTATION_REPLAY_WINDOW (default 15m) of the credential's issue; later it is 409 credential_replay_expired, and 409 credential_replay_revoked once that version is revoked. Success responses carry Cache-Control: no-store and Pragma: no-cache. Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "consumes": [
                     "application/json"
                 ],
@@ -443,6 +472,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
@@ -450,7 +485,13 @@ const docTemplate = `{
                         }
                     },
                     "409": {
-                        "description": "rotation_in_flight OR optimistic_lock_conflict",
+                        "description": "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "415": {
+                        "description": "unsupported_media_type",
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
@@ -461,8 +502,20 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "502": {
                         "description": "secret_store_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "db_unavailable",
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
@@ -474,16 +527,11 @@ const docTemplate = `{
             "post": {
                 "security": [
                     {
-                        "SystemRole": []
-                    },
-                    {
-                        "TenantID": []
-                    },
-                    {
+                        "TenantID": [],
                         "UserID": []
                     }
                 ],
-                "description": "Revokes one credential version — deletes its OpenBao material and marks it revoked. keycloak_invalidation is always \"caller_responsibility\": this service never invalidates the token at Keycloak itself (two-halves invariant, TS-INV-7).",
+                "description": "Revokes one credential version — deletes its OpenBao material and marks it revoked. keycloak_invalidation is always \"caller_responsibility\": this service never invalidates the token at Keycloak itself (two-halves invariant, TS-INV-7). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
                 "produces": [
                     "application/json"
                 ],
@@ -535,6 +583,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
+                    "403": {
+                        "description": "tenant_path_mismatch",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
@@ -542,13 +596,31 @@ const docTemplate = `{
                         }
                     },
                     "409": {
-                        "description": "optimistic_lock_conflict",
+                        "description": "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "415": {
+                        "description": "unsupported_media_type (only when a body is sent)",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
                     },
                     "502": {
                         "description": "secret_store_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/http.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "db_unavailable",
                         "schema": {
                             "$ref": "#/definitions/http.ErrorResponse"
                         }
@@ -753,12 +825,6 @@ const docTemplate = `{
         }
     },
     "securityDefinitions": {
-        "SystemRole": {
-            "description": "Must contain \"iam-system\". Injected by the API gateway / mesh; never set by callers directly.",
-            "type": "apiKey",
-            "name": "x-tenant-roles",
-            "in": "header"
-        },
         "TenantID": {
             "description": "Tenant UUID injected by the API gateway. Must match the :id path segment (§5.1).",
             "type": "apiKey",
@@ -766,7 +832,7 @@ const docTemplate = `{
             "in": "header"
         },
         "UserID": {
-            "description": "Caller identity injected by the API gateway — recorded as the actor on any mutation.",
+            "description": "Must be the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID); anything else is 401 missing_identity_headers.",
             "type": "apiKey",
             "name": "x-user-id",
             "in": "header"
@@ -781,7 +847,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/api/v1/internal",
 	Schemes:          []string{},
 	Title:            "IAM Token Service API",
-	Description:      "Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-4).\n\n**Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).\n**Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).\n**No Keycloak dependency:** This service manages its own credential material independently — it never calls the Keycloak Admin API (TS-INV-1).",
+	Description:      "Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-6 plus the EXT-6 JWKS route).\n\n**Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).\n**Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).\n**No Keycloak dependency:** This service manages its own credential material independently — it never calls the Keycloak Admin API (TS-INV-1).",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

@@ -1,49 +1,40 @@
 # SLO recording + burn-rate alerts for iam-token-service.
 #
-# ⚠ DRAFT — UNREVIEWED. Ported from iam-org-membership's slo-rules.yml
-# shape (recording rules + multi-window multi-burn-rate alerts, SRE book
-# Ch. 5) at the user's request, but the three targets below (30ms/99.9%/
-# 2-cycle-style numbers) are illustrative placeholders, not agreed product
-# or SRE commitments — nobody has reviewed or signed off on them. Treat
-# every percentage/duration/threshold here as "adjust before relying on
-# this," not as an established target. The metric names and job labels ARE
-# real (cross-checked against deploy/monitoring/app-alerts.yml, this
-# service's existing threshold-alert file, which remains the reviewed
-# source of truth until this file is).
+# Targets come from the signed-off LLD (docs/lld/iam-lld-token-service.md
+# §11, "SLOs"): internal API availability 99.9% monthly (HLD §3.4); TS-1
+# issue/rotate p99 ≤ 500 ms excluding the OpenBao round-trip; TS-3 read
+# p99 ≤ 100 ms; the rotation-overlap sweep is availability-first, with the
+# objective that no `rotating` version outlives expires_at by more than one
+# cron interval. Shape follows iam-org-membership's slo-rules.yml
+# (recording rules + multi-window multi-burn-rate alerts, SRE book Ch. 5).
 #
-# Three SLOs are declared:
+#  SLO-1  TS-1 issue/rotate latency — 99% of requests ≤ 500 ms (= p99).
+#         The SLI is measured at the HTTP layer, so it INCLUDES the OpenBao
+#         write the LLD target excludes: it is conservative. When it burns,
+#         check iam_token_service_openbao_call_duration_seconds first — a
+#         burn explained by OpenBao alone is an OpenBao problem
+#         (IAMTokenServiceOpenBaoCallLatencyHigh), not a breach of SLO-1.
 #
-#  SLO-1  TS-1 issue/rotate hot-path latency
-#         Target (placeholder): 99% of credential issue/rotate requests
-#         complete within 500ms. This path does a material-first OpenBao
-#         write before the Postgres commit (§6.2) — compare against
-#         IAMTokenServiceOpenBaoCallLatencyHigh's existing 5s p99 bar in
-#         app-alerts.yml, which is deliberately looser (that alert exists
-#         to catch OpenBao itself being slow, not to define the
-#         end-to-end SLO).
+#  SLO-2  Write-path availability — 99.9% of mutating requests (TS-1, TS-2,
+#         TS-4) return a non-5xx status. The LLD's 99.9% monthly
+#         availability target, as an error budget.
 #
-#  SLO-2  Write-path error rate
-#         Target (placeholder): 99.9% of mutating requests (TS-1 issue/
-#         rotate, TS-2 revoke, TS-4 register) return a non-5xx status.
-#         Mirrors IAMTokenServiceHighErrorRate's flat 5%-over-5m alert in
-#         app-alerts.yml, expressed as an error-budget burn instead.
+#  SLO-3  Rotation sweep convergence — operational PROXY for the LLD's
+#         sweep objective, which no metric measures directly (it would
+#         need the age of the oldest expired `rotating` row). Tracks the
+#         share of §8.3 sweep runs without an error result; the 99% target
+#         is this file's, not the LLD's.
 #
-#  SLO-3  Rotation sweep convergence
-#         Target (placeholder): 99% of §8.3 overlap-expiry sweep CronJob
-#         runs (schedule: rotator.schedule, default */5 * * * *, §8.3)
-#         complete without an error result. Distinct from
-#         IAMTokenServiceRotationSweepFailures (app-alerts.yml), which
-#         fires on ANY error in 1h — this tracks the success ratio as a
-#         budget instead of a raw count.
+#  SLO-4  TS-3 read latency — 99% of requests ≤ 100 ms (= p99).
 #
 # Metrics: platform_http_request_duration_seconds / platform_http_requests_total
 # (platform-gincommon, Enterprise Platform Observability Standard). They carry
 # {domain, service, environment, method, route, status_class, error_class};
 # every SLI keeps `by (domain, service, environment)` so it joins with other
-# services' SLIs. Both are still "proposed" in the Platform Observability
-# Registry: the alerts built on them carry metric_status: proposed until
-# governance ratifies the names (the pre-standard http_* names were removed
-# from the library and are no longer emitted).
+# services' SLIs. The registry's request_duration buckets include 0.1 and
+# 0.5, so both latency targets are measured exactly. Both metrics are still
+# "proposed" in the Platform Observability Registry: the alerts built on them
+# carry metric_status: proposed until governance ratifies the names.
 #
 # Recording rules pre-compute the SLI numerator/denominator so alert rules
 # can key off a scalar. Alerts follow the multi-window multi-burn-rate
@@ -84,6 +75,37 @@ groups:
             route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
           }[1h])), 0.001)
 
+      # TS-3 read latency (LLD §11: p99 ≤ 100 ms).
+      - record: iam_token_service:ts3_latency_sli:ratio_rate_5m
+        expr: |
+          sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+            job="iam-token-service-server",
+            method="GET",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id",
+            le="0.1"
+          }[5m]))
+          /
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+            job="iam-token-service-server",
+            method="GET",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id"
+          }[5m])), 0.001)
+
+      - record: iam_token_service:ts3_latency_sli:ratio_rate_1h
+        expr: |
+          sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+            job="iam-token-service-server",
+            method="GET",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id",
+            le="0.1"
+          }[1h]))
+          /
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+            job="iam-token-service-server",
+            method="GET",
+            route="/api/v1/internal/tenants/:id/service-accounts/:principal_id"
+          }[1h])), 0.001)
+
       # Write-path error rate (5xx only — 4xx like credential_replay_revoked
       # 409 or optimistic_lock_conflict are intentional, §17).
       - record: iam_token_service:write_error_rate:ratio_rate_5m
@@ -101,16 +123,22 @@ groups:
 
       # Rotation sweep success ratio (§8.3) — result label matches
       # IAMTokenServiceRotationSweepFailures' iam_token_service_rotation_sweep_total.
+      # Counts RUNS, not a rate: every rotator run is its own short-lived pod
+      # whose counter is incremented once (result ok|error) and stays constant
+      # while scrapeable, so rate() over it is always 0 and the old rate ratio
+      # read 0 → the SLO fired permanently. max_over_time per pod series is 1
+      # for that run's result; summing over pods counts runs in the hour. The
+      # record name is kept for dashboard compatibility.
       - record: iam_token_service:sweep_success_rate:ratio_rate_1h
         expr: |
-          sum by (domain, service, environment) (rate(iam_token_service_rotation_sweep_total{
+          sum by (domain, service, environment) (max_over_time(iam_token_service_rotation_sweep_total{
             job="iam-token-service-rotator",
-            result!="error"
+            result="ok"
           }[1h]))
           /
-          clamp_min(sum by (domain, service, environment) (rate(iam_token_service_rotation_sweep_total{
+          clamp_min(sum by (domain, service, environment) (max_over_time(iam_token_service_rotation_sweep_total{
             job="iam-token-service-rotator"
-          }[1h])), 0.001)
+          }[1h])), 1)
 
   # ── SLO burn-rate alerts (multi-window) ─────────────────────────────────
   - name: iam-token-service.slo.burn
@@ -129,9 +157,9 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
-          summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 latency degraded (placeholder target — see file header)"
+          summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 above 500 ms (LLD §11)"
           description: |
-            TS-1 (issue/rotate) is missing the placeholder 500ms target for
+            TS-1 (issue/rotate) is missing the 500 ms target (LLD §11) for
             {{ $value | humanizePercentage }} of requests over the last
             5m + 1h windows. Check
             iam_token_service_openbao_call_duration_seconds{op} first (§6.2
@@ -148,7 +176,7 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
-          summary: "SLO-1 slow-burn: TS-1 latency below placeholder target for 15m+"
+          summary: "SLO-1 slow-burn: TS-1 p99 above 500 ms for 15m+ (LLD §11)"
 
       # SLO-2: write-path 5xx spike.
       - alert: IAMTokenServiceSLO2_WriteErrorRateFastBurn
@@ -160,7 +188,7 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
-          summary: "SLO-2 fast-burn: write-path 5xx rate above placeholder target"
+          summary: "SLO-2 fast-burn: write-path 5xx burning the 99.9% budget (LLD §11)"
           description: |
             {{ $value | humanizePercentage }} of mutating requests are
             returning 5xx. Likely Postgres or OpenBao failure — cross-reference
@@ -175,9 +203,43 @@ groups:
           slo: SLO-3
           team: platform
         annotations:
-          summary: "SLO-3: §8.3 overlap-expiry sweep success ratio below placeholder target"
+          summary: "SLO-3: §8.3 overlap-expiry sweep success ratio below 99% (operational proxy)"
           description: |
             Sweep success ratio = {{ $value | humanizePercentage }} over the
             last hour (for 20m+). Check the rotator CronJob logs — this
             complements IAMTokenServiceRotationSweepFailures (app-alerts.yml),
             which fires on any single error rather than a sustained ratio.
+
+      # SLO-4: fast burn on TS-3 read latency (2% budget in 1h → page).
+      - alert: IAMTokenServiceSLO4_TS3LatencyFastBurn
+        expr: |
+          (1 - iam_token_service:ts3_latency_sli:ratio_rate_5m) > (14.4 * (1 - 0.99))
+          and
+          (1 - iam_token_service:ts3_latency_sli:ratio_rate_1h) > (14.4 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-4
+          team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
+        annotations:
+          summary: "SLO-4 fast-burn: TS-3 read p99 above 100 ms (LLD §11)"
+          description: |
+            TS-3 (read principal + credential metadata) is missing the 100 ms
+            target for {{ $value | humanizePercentage }} of requests over the
+            last 5m + 1h windows. TS-3 never calls OpenBao: check
+            platform_db_query_duration_seconds and
+            platform_db_pool_acquire_duration_seconds{pool="default"}.
+
+      # SLO-4: slow burn (5% budget in 24h → ticket).
+      - alert: IAMTokenServiceSLO4_TS3LatencySlowBurn
+        expr: |
+          (1 - iam_token_service:ts3_latency_sli:ratio_rate_1h) > (6 * (1 - 0.99))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-4
+          team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
+        annotations:
+          summary: "SLO-4 slow-burn: TS-3 p99 above 100 ms for 15m+ (LLD §11)"

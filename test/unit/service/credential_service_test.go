@@ -628,3 +628,83 @@ func TestCredentialService_Revoke_NoEventPublisherOnContextStillSucceeds(t *test
 	assert.Equal(t, domain.CredentialStatusRevoked, res.Status)
 	assert.Len(t, events.events, 1, "no event publisher on context means no event enqueued, not a failure")
 }
+
+// Regression (production-readiness review): revoking the ACTIVE version left
+// no active row, so the next issue restarted at v1 and collided with the
+// existing rows (uq_sac_version) on every retry — an unrecoverable outage on
+// the documented hard-cutover path (revoke, then rotate).
+func TestCredentialService_IssueAfterRevokingActiveUsesMaxPlusOne(t *testing.T) {
+	svc, principals, credentials, _, _ := newTestCredentialService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+	actor := domain.SystemPrincipalID
+
+	_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, actor)
+	require.NoError(t, err)
+	_, err = svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, actor)
+	require.NoError(t, err)
+	_, err = svc.Revoke(ctx, tenantID, p.ID, 2, actor)
+	require.NoError(t, err)
+
+	active, err := credentials.FindActive(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	require.Nil(t, active, "precondition: no active credential after revoking it")
+
+	res, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, actor)
+	require.NoError(t, err)
+	assert.Equal(t, 3, res.Version)
+}
+
+func TestCredentialService_ExpectActiveVersionMismatchWritesNothing(t *testing.T) {
+	svc, principals, credentials, secrets, _ := newTestCredentialService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+	actor := domain.SystemPrincipalID
+
+	_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, actor)
+	require.NoError(t, err)
+	_, err = svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New()}, actor)
+	require.NoError(t, err) // an operator rotation committed since the scheduler enumerated v1
+
+	_, err = svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), ExpectActiveVersion: 1}, actor)
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrOptimisticLockConflict, de.Code)
+
+	maxVersion, err := credentials.MaxVersion(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, maxVersion, "nothing rotated")
+	_, err = secrets.Read(ctx, domain.OpenBaoPathFor(tenantID, p.KeycloakClientID, 3))
+	assert.Error(t, err, "no material written for a refused rotation")
+}
+
+// TS-INV-3: at most one additional rotating version. A second rotate inside
+// the overlap window ends the earlier overlap, so at most two keys stay live.
+func TestCredentialService_SecondRotateWithinOverlapEndsEarlierOverlap(t *testing.T) {
+	svc, principals, credentials, _, _ := newTestCredentialService(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	p := seedPrincipal(t, principals, tenantID)
+	actor := domain.SystemPrincipalID
+
+	for range 3 {
+		_, err := svc.IssueOrRotate(ctx, tenantID, p.ID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 900}, actor)
+		require.NoError(t, err)
+	}
+
+	creds, err := credentials.ListByPrincipal(ctx, tenantID, p.ID)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	live := 0
+	for _, c := range creds {
+		if c.Status == domain.CredentialStatusActive || (c.Status == domain.CredentialStatusRotating && !c.IsExpiredOverlap(now)) {
+			live++
+		}
+	}
+	assert.Equal(t, 2, live, "the new active plus at most one open overlap")
+	v1, err := credentials.FindByVersion(ctx, tenantID, p.ID, 1)
+	require.NoError(t, err)
+	assert.NotEqual(t, domain.CredentialStatusActive, v1.Status)
+}

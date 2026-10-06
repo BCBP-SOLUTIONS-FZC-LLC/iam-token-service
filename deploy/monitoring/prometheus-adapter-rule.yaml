@@ -1,41 +1,34 @@
-# Prometheus Adapter ConfigMap — maps Prometheus metrics to the Custom Metrics API
-# so the HPA can scale on platform_http_requests_per_second.
+# prometheus-adapter rule — a MERGE SNIPPET, not a manifest. Do not
+# `kubectl apply` it: prometheus-adapter reads one ConfigMap for the whole
+# cluster, so applying a ConfigMap here would replace every other service's
+# rules.
 #
-# Deploy into the namespace where prometheus-adapter runs (typically kube-system
-# or monitoring). Merge with any existing prometheus-adapter ConfigMap rather
-# than replacing it.
+# Add the rule below to the prometheus-adapter Helm release's values under
+# `rules.custom` (prometheus-community/prometheus-adapter chart). The rule is
+# service-agnostic: every service on platform-gincommon exposes
+# platform_http_requests_total, so it only needs to exist ONCE per cluster.
+# If another service's chart docs already added it, there is nothing to do.
+#
+# It exposes per-pod RPS as platform_http_requests_per_second for the HPA's
+# `type: Pods` metric (deploy/helm/templates/hpa.yaml, enabled by
+# autoscaling.targetRPSPerReplica). The HPA scopes the metric to its own
+# target's pods, so no service label is needed here.
 #
 # Reference:
 #   https://github.com/kubernetes-sigs/prometheus-adapter/blob/master/docs/config.md
 #
-# After applying, verify the metric is visible:
+# After the adapter reloads, verify the metric is visible:
 #   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name' | grep platform_http_requests_per_second
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: prometheus-adapter-config
-  namespace: monitoring   # adjust to match your prometheus-adapter deployment namespace
-  labels:
-    app.kubernetes.io/name: prometheus-adapter
-    app.kubernetes.io/component: metrics
-data:
-  config.yaml: |
-    rules:
-      # Expose per-pod RPS as platform_http_requests_per_second so the HPA can
-      # use type: Pods / metric: platform_http_requests_per_second.
-      # Computed from platform-gincommon's counter platform_http_requests_total
-      # (metric_status: proposed in the Platform Observability Registry)
-      # scraped by the ServiceMonitor (serviceMonitor.enabled: true in Helm
-      # values). Each pod's series carry {domain, service, environment}; the
-      # adapter's <<.GroupBy>> (pod) aggregation sums them away.
-      - seriesQuery: 'platform_http_requests_total{namespace!="",pod!=""}'
-        resources:
-          overrides:
-            namespace:
-              resource: namespace
-            pod:
-              resource: pod
-        name:
-          matches: "^(.*)_total$"
-          as: "${1}_per_second"
-        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+rules:
+  custom:
+    - seriesQuery: 'platform_http_requests_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "^(.*)_total$"
+        as: "${1}_per_second"
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'

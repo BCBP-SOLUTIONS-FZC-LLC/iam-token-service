@@ -49,7 +49,6 @@ func TestBuildGlueCodec_PrefetchFailurePropagates(t *testing.T) {
 
 func TestBuildSNSPublisher_EmptyTopicARNReturnsNoop(t *testing.T) {
 	t.Setenv("SNS_TOPIC_ARN", "")
-	t.Setenv("SNS_TOPIC_SERVICEACCOUNT_ARN", "")
 	pub, err := buildSNSPublisher(events.NoopCodec{}, nil)
 	require.NoError(t, err)
 	_, ok := pub.(noopPublisher)
@@ -65,13 +64,6 @@ func TestBuildSNSPublisher_ConstructsRealPublisherWithoutDialing(t *testing.T) {
 	pub, err := buildSNSPublisher(events.NoopCodec{}, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, pub)
-}
-
-func TestLoadSNSEnv_FallsBackToServiceAccountAlias(t *testing.T) {
-	t.Setenv("SNS_TOPIC_ARN", "")
-	t.Setenv("SNS_TOPIC_SERVICEACCOUNT_ARN", "arn:aws:sns:us-east-1:1:alias")
-	env := loadSNSEnv()
-	assert.Equal(t, "arn:aws:sns:us-east-1:1:alias", env.TopicARN)
 }
 
 func TestLoadOutboxEnv_AppliesServiceDefaultsWhenUnset(t *testing.T) {

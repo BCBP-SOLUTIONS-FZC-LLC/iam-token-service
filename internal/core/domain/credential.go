@@ -88,6 +88,18 @@ func OpenBaoPathFor(tenantID uuid.UUID, keycloakClientID string, version int) st
 	return fmt.Sprintf("iam/serviceaccount/%s/%s/v%d", tenantID, keycloakClientID, version)
 }
 
+// OpenBaoPathPrefixFor is the parent of every version's OpenBao path for one
+// client id — the prefix the §8.6 reconciler lists.
+func OpenBaoPathPrefixFor(tenantID uuid.UUID, keycloakClientID string) string {
+	return fmt.Sprintf("iam/serviceaccount/%s/%s", tenantID, keycloakClientID)
+}
+
+// OpenBaoTenantPrefix is the parent of every OpenBao path for one tenant —
+// the subtree the offboarding cascade erases (§8.4/§15.2).
+func OpenBaoTenantPrefix(tenantID uuid.UUID) string {
+	return fmt.Sprintf("iam/serviceaccount/%s", tenantID)
+}
+
 // IsExpiredOverlap reports whether a 'rotating' credential's overlap window
 // has closed as of now (§6.2/§8.3 — the sweep's revoke condition).
 func (c *Credential) IsExpiredOverlap(now time.Time) bool {

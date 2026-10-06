@@ -3,8 +3,11 @@ package http
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -127,6 +130,31 @@ func TestRouter_DocsSurface_Gating(t *testing.T) {
 		assert.Equal(t, http.StatusOK, rec.Code)
 	})
 
+	t.Run("staging, not enabled — docs routes absent (TS-D23)", func(t *testing.T) {
+		r := newFullTestRouter(t, DocsConfig{Environment: "staging"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	})
+
+	t.Run("staging + AuthToken — requires bearer token (TS-D23)", func(t *testing.T) {
+		r := newFullTestRouter(t, DocsConfig{Environment: "staging", Enabled: true, AuthToken: "s3cr3t"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		rec = doRequest(t, r.Handler(), http.MethodGet, "/swagger/index.html", nil, nil)
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		rec = doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", map[string]string{"Authorization": "Bearer s3cr3t"}, nil)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("unknown or empty environment is restricted", func(t *testing.T) {
+		for _, env := range []string{"", "qa", "Staging "} {
+			assert.True(t, DocsConfig{Environment: env}.Restricted(), "%q", env)
+		}
+		for _, env := range []string{"local", "dev", "TEST"} {
+			assert.False(t, DocsConfig{Environment: env}.Restricted(), "%q", env)
+		}
+	})
+
 	t.Run("swagger routes reachable via all three switch branches without panicking", func(t *testing.T) {
 		r := newFullTestRouter(t, DocsConfig{Environment: "dev"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
 
@@ -196,4 +224,66 @@ func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 			assert.Equal(t, tc.want, rec.Code, "body=%s", rec.Body.String())
 		})
 	}
+}
+
+// Every way an identity header can be missing or unusable is answered with
+// the frozen §17 code — never gincommon RequireAuth's generic body.
+func TestRouter_MissingIdentityHeaders_FrozenCode(t *testing.T) {
+	r := newFullTestRouter(t, DocsConfig{Environment: "dev"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+	tenantID := uuid.New()
+	path := "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/platform-automation"
+
+	cases := map[string]map[string]string{
+		"no headers":         nil,
+		"tenant header only": {"x-tenant-id": tenantID.String()},
+		"user header only":   {"x-user-id": domain.SystemPrincipalID.String()},
+		"blank user header":  {"x-user-id": "  ", "x-tenant-id": tenantID.String()},
+		"non-UUID tenant":    {"x-user-id": domain.SystemPrincipalID.String(), "x-tenant-id": "acme"},
+		"non-system user":    {"x-user-id": uuid.NewString(), "x-tenant-id": tenantID.String()},
+	}
+	for name, headers := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := doRequest(t, r.Handler(), http.MethodGet, path, headers, nil)
+			require.Equal(t, http.StatusUnauthorized, rec.Code)
+			er := decodeErrorBody(t, rec)
+			assert.Equal(t, "missing_identity_headers", er.Error)
+			assert.Nil(t, er.Details, "§17: no details on missing_identity_headers")
+		})
+	}
+}
+
+// x-tenant-roles is unused here; garbage in it must not turn a valid request
+// into gincommon's generic 401.
+func TestRouter_GarbageTenantRolesHeaderIsIgnored(t *testing.T) {
+	tenantID, principalID := uuid.New(), uuid.New()
+	principalSvc := &fakePrincipalService{
+		automationResult: &service.AutomationPrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive},
+	}
+	r := newFullTestRouter(t, DocsConfig{Environment: "dev"}, principalSvc, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+	headers := sysHeaders(tenantID)
+	headers["x-tenant-roles"] = strings.Repeat("\x00not,a;valid role!", 2000)
+
+	rec := doRequest(t, r.Handler(), http.MethodGet, "/api/v1/internal/tenants/"+tenantID.String()+"/service-accounts/platform-automation", headers, nil)
+	assert.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+}
+
+func TestRequireIdentityHeaders_RepeatedHeaderIsMissingIdentity(t *testing.T) {
+	r := gin.New()
+	r.GET("/probe", RequireIdentityHeaders(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Add("x-user-id", domain.SystemPrincipalID.String())
+	req.Header.Add("x-tenant-id", uuid.NewString())
+	req.Header.Add("x-tenant-id", uuid.NewString())
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+
+	req = httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("x-user-id", domain.SystemPrincipalID.String())
+	req.Header.Set("x-tenant-id", uuid.NewString())
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
 }

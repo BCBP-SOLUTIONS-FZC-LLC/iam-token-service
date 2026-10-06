@@ -1,0 +1,81 @@
+{{/*
+Optional L7 restriction (Istio AuthorizationPolicy). NetworkPolicy has no
+path-level granularity, so the namespaces it admits only for one route —
+Keycloak (EXT-6 JWKS fetch) and Workflow (TS-6, TS-D17) — could otherwise
+call every route on the HTTP port, protected only by the reserved
+x-user-id header (LLD §5.2). With a mesh, this policy narrows each source to
+its one route; the mesh callers (RP, O&M, operator gateway) keep every route.
+The x-user-id header is not a boundary on its own (any caller can set it), so
+this policy is required outside local/dev/test whenever networkPolicy is on
+(templates/validate.yaml). source.namespaces matches only mTLS-authenticated
+peers: every caller, Keycloak included, must be in the mesh.
+*/}}
+{{- if .Values.authorizationPolicy.enabled }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-server
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  action: ALLOW
+  rules:
+    # In-mesh callers (Realm Provisioner, O&M, operator gateway): every route.
+    - from:
+        - source:
+            namespaces: {{ required "authorizationPolicy.meshNamespaces is required when authorizationPolicy.enabled" .Values.authorizationPolicy.meshNamespaces | toJson }}
+    # Keycloak: the JWKS route only.
+    {{- with .Values.authorizationPolicy.keycloakNamespaces }}
+    - from:
+        - source:
+            namespaces: {{ . | toJson }}
+      to:
+        - operation:
+            methods: ["GET"]
+            # Istio allows "*" only as a prefix or suffix, so the route is
+            # matched by its suffix (the tenant id is the variable segment).
+            paths: ["*/service-accounts/platform-automation/jwks.json"]
+    {{- end }}
+    # Workflow connector workers: TS-6 only.
+    {{- with .Values.authorizationPolicy.workflowNamespaces }}
+    - from:
+        - source:
+            namespaces: {{ . | toJson }}
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["*/service-accounts/platform-automation"]
+    {{- end }}
+    # Probes and scraping (kubelet / Prometheus) on the non-API paths.
+    - to:
+        - operation:
+            paths: ["/healthz", "/readyz", "/metrics"]
+{{- if .Values.authorizationPolicy.strictMTLS }}
+---
+# STRICT mTLS on the server (authorizationPolicy.strictMTLS): a plaintext,
+# non-mesh caller is rejected at the TLS layer on every port but metrics, so
+# the policy above cannot be bypassed by a pod that simply never joined the
+# mesh. The metrics port stays PERMISSIVE for a non-mesh Prometheus
+# (NetworkPolicy already limits that port to the monitoring namespace).
+# Kubelet probes are rewritten by Istio to the sidecar's own port, so they are
+# unaffected.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-server
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    {{ .Values.service.metricsPort | quote }}:
+      mode: PERMISSIVE
+{{- end }}
+{{- end }}

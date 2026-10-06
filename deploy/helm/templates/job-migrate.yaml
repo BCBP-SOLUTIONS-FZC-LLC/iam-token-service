@@ -1,0 +1,81 @@
+{{/*
+Schema migrations, once per release (pre-install / pre-upgrade hook). The
+server binary with MIGRATE_ONLY=true applies platform-events' outbox schema
+then the domain migrations and exits (LLD §4.4, MIG-2). Every Deployment and
+CronJob runs with RUN_MIGRATIONS=false, so:
+  - only this short-lived Job holds the migrator DSN (table owner, BYPASSRLS);
+  - a rollback (`helm rollback`, release.yml's --atomic) never has an older
+    binary try to migrate a newer schema — the binaries tolerate a schema
+    newer than their own migrations (pgadapter.Migrate).
+*/}}
+{{- if .Values.migrations.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-migrate
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit | default 1 }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds | default 300 }}
+  template:
+    metadata:
+      labels:
+        {{- include "iam-token-service.componentSelectorLabels" (dict "component" "migrate" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+      annotations:
+        # Never mesh-injected: the Job reaches only Postgres, and a classic
+        # sidecar would keep it from ever completing (the hook would hang
+        # until activeDeadlineSeconds and fail the release).
+        sidecar.istio.io/inject: "false"
+    spec:
+      # A hook ServiceAccount (serviceaccount.yaml, weight -10), so it exists
+      # before this Job on a first install.
+      serviceAccountName: {{ include "iam-token-service.migrateServiceAccountName" . }}
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "iam-token-service.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/iam-token-service-server"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: MIGRATE_ONLY
+              value: "true"
+            - name: APP_NAME
+              value: {{ include "iam-token-service.name" . }}
+            - name: APP_ENV
+              value: {{ .Values.appEnv | quote }}
+            - name: OBSERVABILITY_DOMAIN
+              value: {{ .Values.observabilityDomain | default "iam" | quote }}
+            - name: BUILD_VERSION
+              value: {{ include "iam-token-service.imageTag" . | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.exporterEndpoint | default "none" | quote }}
+            - name: PG_BOUNCER_MODE
+              value: {{ .Values.database.pgBouncerMode | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecretName | default (include "iam-token-service.secretName" .) }}
+                  key: DATABASE_URL
+            {{- include "iam-token-service.migrationDBEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

@@ -187,7 +187,7 @@ consistent the moment a second IAM service adopts this metric.
 | Legacy (Tier 3) | Proposed | Dual-emitted? | Alerts migrated? | Dashboards migrated? |
 |---|---|---|---|---|
 | `iam_token_service_openbao_call_duration_seconds` | `platform_dependency_request_seconds` | Yes | No — `IAMTokenServiceOpenBaoCallLatencyHigh` (`deploy/monitoring/app-alerts.yml`) still reads the legacy metric until ratified | No — out of this repo's scope; no cross-service dashboard repo is available to this service |
-| `iam_token_service_processed_events_duplicates_total` | `platform_duplicate_messages_total` | Yes | No | No |
+| `iam_token_service_processed_events_duplicates_total` | `platform_duplicate_messages_total` | Yes — the Tier 1 series is counted by platform-events' inbox, the Tier 3 by the service | No | No |
 | `iam_token_service_offboarding_cascade_total` | `iam_offboarding_cascade_total` | No — withheld until ratified in the registry | No | No |
 
 Per the Standard's Backward Compatibility process, steps 2–8 (migrate

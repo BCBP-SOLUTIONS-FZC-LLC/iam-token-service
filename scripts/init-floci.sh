@@ -20,7 +20,7 @@
 #   5 Glue schemas  — this service's 5 produced events, registered from the
 #                     same JSON Schema Draft-07 files eventbus.GlueCodec
 #                     ships (internal/adapter/outbound/eventbus/schemas/*.json), so
-#                     GLUE_REGISTRY_NAME/SNS_TOPIC_SERVICEACCOUNT_ARN can be
+#                     GLUE_REGISTRY_NAME/SNS_TOPIC_ARN can be
 #                     set in the app service's environment and it runs with
 #                     the real Glue wire-format codec locally — Floci
 #                     includes Glue Schema Registry in its free tier (unlike

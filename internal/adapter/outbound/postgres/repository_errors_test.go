@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -286,6 +287,49 @@ func TestPrincipalRepository_ListByTenant_ScanErrorPropagates(t *testing.T) {
 	assert.Nil(t, got)
 }
 
+// rowsErrRows is a pgx.Rows that yields no rows and reports err from Err()
+// — how pgx v5 surfaces a FOR UPDATE lock wait that exceeded lock_timeout
+// (Query only sends the statement; the 55P03 arrives with the result).
+type rowsErrRows struct {
+	pgx.Rows
+	err error
+}
+
+func (r *rowsErrRows) Next() bool { return false }
+func (r *rowsErrRows) Err() error { return r.err }
+func (r *rowsErrRows) Close()     {}
+
+func TestPrincipalRepository_LockByTenant_LockTimeoutFromRowsErrIsRotationInFlight(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+	tx := &fakeRepoTx{queryRows: &rowsErrRows{err: &pgconn.PgError{Code: "55P03"}}}
+
+	got, err := r.LockByTenant(ctxWithFakeTx(tx), uuid.New())
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrRotationInFlight, de.Code)
+	assert.Nil(t, got)
+}
+
+func TestPrincipalRepository_LockForUpdate_LockTimeoutIsRotationInFlight(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: &pgconn.PgError{Code: "55P03"}}}}
+
+	_, err := r.LockForUpdate(ctxWithFakeTx(tx), uuid.New(), uuid.New())
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrRotationInFlight, de.Code)
+}
+
+func TestPrincipalRepository_Register_LockTimeoutIsRotationInFlight(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: &pgconn.PgError{Code: "55P03"}}}}
+
+	_, _, _, err := r.Register(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{TenantID: uuid.New()})
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrRotationInFlight, de.Code)
+}
+
 // ── reconciler_repository.go ──────────────────────────────────────────
 
 func TestReconcilerRepository_ListExpiredRotating_QueryErrorPropagates(t *testing.T) {
@@ -293,7 +337,7 @@ func TestReconcilerRepository_ListExpiredRotating_QueryErrorPropagates(t *testin
 	wantErr := errors.New("query boom")
 	tx := &fakeRepoTx{queryErr: wantErr}
 
-	got, err := r.ListExpiredRotating(ctxWithFakeTx(tx))
+	got, err := r.ListExpiredRotating(ctxWithFakeTx(tx), 100)
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 }
@@ -303,7 +347,7 @@ func TestReconcilerRepository_ListExpiredRotating_ScanErrorPropagates(t *testing
 	wantErr := errors.New("scan boom")
 	tx := &fakeRepoTx{queryRows: &oneRowThenScanErrRows{scanErr: wantErr}}
 
-	got, err := r.ListExpiredRotating(ctxWithFakeTx(tx))
+	got, err := r.ListExpiredRotating(ctxWithFakeTx(tx), 100)
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 }
@@ -313,7 +357,7 @@ func TestReconcilerRepository_ListDueForRotation_QueryErrorPropagates(t *testing
 	wantErr := errors.New("query boom")
 	tx := &fakeRepoTx{queryErr: wantErr}
 
-	got, err := r.ListDueForRotation(ctxWithFakeTx(tx))
+	got, err := r.ListDueForRotation(ctxWithFakeTx(tx), 100)
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 }
@@ -323,7 +367,7 @@ func TestReconcilerRepository_ListDueForRotation_ScanErrorPropagates(t *testing.
 	wantErr := errors.New("scan boom")
 	tx := &fakeRepoTx{queryRows: &oneRowThenScanErrRows{scanErr: wantErr}}
 
-	got, err := r.ListDueForRotation(ctxWithFakeTx(tx))
+	got, err := r.ListDueForRotation(ctxWithFakeTx(tx), 100)
 	require.ErrorIs(t, err, wantErr)
 	assert.Nil(t, got)
 }
@@ -348,24 +392,23 @@ func TestReconcilerRepository_ListPrincipalMaterialStates_ScanErrorPropagates(t 
 	assert.Nil(t, got)
 }
 
-// ── processed_events_repository.go ────────────────────────────────────
+// ── inbox_repository.go ───────────────────────────────────────────────
+// The inbox.Store opens its own transaction on the pool (it does not join a
+// ctx-bound pgx.Tx), so the happy and duplicate paths are covered against a
+// real Postgres in test/postgres/consumer_test.go; here only the
+// store-construction error is reachable without one.
 
-func TestProcessedEventsRepository_IsProcessed_ScanErrorPropagates(t *testing.T) {
-	r := NewProcessedEventsRepository(nil)
-	wantErr := errors.New("scan boom")
-	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: wantErr}}}
+func TestInboxRepository_NilPoolFailsBeforeRunningFn(t *testing.T) {
+	r := NewInboxRepository(nil, nil)
+	ran := false
 
-	got, err := r.IsProcessed(ctxWithFakeTx(tx), port.ProcessedEventsConsumerTenantOffboarding, "evt-1")
-	require.ErrorIs(t, err, wantErr)
-	assert.False(t, got)
-}
+	dup, err := r.ProcessOnce(context.Background(), port.ProcessedEventsConsumerTenantOffboarding, "0b5b6c3e-6f1e-4c55-9d6f-6b8f0c2b1a11", "TenantMembershipsPurged",
+		func(context.Context) error { ran = true; return nil })
+	require.Error(t, err)
+	assert.False(t, dup)
+	assert.False(t, ran, "fn must not run when the claim cannot be made")
 
-func TestProcessedEventsRepository_Prune_ExecErrorPropagates(t *testing.T) {
-	r := NewProcessedEventsRepository(nil)
-	wantErr := errors.New("exec boom")
-	tx := &fakeRepoTx{execErrFor: func(string) error { return wantErr }}
-
-	n, err := r.Prune(ctxWithFakeTx(tx), 8, 500)
-	require.ErrorIs(t, err, wantErr)
+	n, err := r.Prune(context.Background(), port.ProcessedEventsConsumerTenantOffboarding, time.Hour, 10)
+	require.Error(t, err)
 	assert.Zero(t, n)
 }

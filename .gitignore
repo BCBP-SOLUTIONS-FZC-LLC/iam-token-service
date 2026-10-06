@@ -55,3 +55,4 @@ bin/
 # Staged PascalCase Glue schema copies (from make schema-register / CI —
 # see .github/scripts/stage-produced-event-schemas.sh)
 .tmp/
+__pycache__/

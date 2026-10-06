@@ -1,6 +1,6 @@
 {{- if and .Values.ingress.enabled (eq (.Values.ingress.type | default "Ingress") "Ingress") }}
 # Disabled by default (ingress.enabled: false) — this service has no public
-# surface today (all 4 routes are under /api/v1/internal/*, §5); kept as
+# surface today (all 7 routes are under /api/v1/internal/*, §5); kept as
 # dormant scaffolding for if that ever changes, matching the sibling IAM
 # services' chart shape.
 #

@@ -256,13 +256,14 @@ func TestReconcilerRoleIsEnumerationOnly(t *testing.T) {
 	assert.Contains(t, err.Error(), "permission denied")
 }
 
-// outbox_events / processed_events are RLS-exempt (§4.3).
+// The operational tables (outbox_events, processed_events, rls_violation_log,
+// keys_refresh_pending) are RLS-exempt (§4.3).
 func TestRLS_OperationalTablesExempt(t *testing.T) {
 	t.Parallel()
 	_, _, rawPool := setupTestDB(t)
 	ctx := context.Background()
 
-	for _, tbl := range []string{"outbox_events", "processed_events"} {
+	for _, tbl := range []string{"outbox_events", "processed_events", "rls_violation_log", "keys_refresh_pending"} {
 		var rls, force bool
 		err := rawPool.QueryRow(ctx, `
 			SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, tbl).Scan(&rls, &force)

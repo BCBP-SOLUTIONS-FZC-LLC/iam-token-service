@@ -12,7 +12,7 @@ import (
 
 // tracer names every span this package starts. OpenTelemetry via
 // platform-gincommon middleware installs the TracerProvider (cmd/*'s
-// gincommon.InitTracingFromEnv) — this package only needs a Tracer handle,
+// gincommon.InitTracingWithConfig) — this package only needs a Tracer handle,
 // obtained lazily via otel.Tracer so unit tests that never install a
 // provider still get a valid no-op tracer rather than a panic.
 var tracer = otel.Tracer("iam-token-service/credential")

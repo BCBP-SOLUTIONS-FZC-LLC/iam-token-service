@@ -28,15 +28,10 @@ func buildGlueCodec(ctx context.Context, glueClient *glue.Client, registryName s
 }
 
 // loadSNSEnv reads SNS publisher config through platform-events
-// (SNS_TOPIC_ARN / AWS_REGION / AWS_ENDPOINT_URL), matching iam-user-profile.
-// SNS_TOPIC_SERVICEACCOUNT_ARN is accepted as an alias so existing Helm
-// values keep working until they also set the library's canonical name.
+// (SNS_TOPIC_ARN / AWS_REGION / AWS_ENDPOINT_URL), matching
+// iam-org-membership.
 func loadSNSEnv() eventcfg.SNSConfigEnv {
-	env := eventcfg.LoadSNS()
-	if env.TopicARN == "" {
-		env.TopicARN = os.Getenv("SNS_TOPIC_SERVICEACCOUNT_ARN")
-	}
-	return env
+	return eventcfg.LoadSNS()
 }
 
 // buildSNSPublisher constructs the SNS publisher from platform-events

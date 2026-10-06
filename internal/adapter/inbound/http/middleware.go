@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -16,6 +17,40 @@ import (
 // 401 — no `details` field per the taxonomy.
 func writeMissingIdentityHeaders(c *gin.Context) {
 	writeError(c, string(domain.ErrMissingIdentityHeaders), http.StatusUnauthorized, nil)
+}
+
+// RequireIdentityHeaders runs BEFORE gincommon.ProtectedMiddlewares and
+// answers the frozen §17 401 missing_identity_headers itself whenever
+// x-user-id or x-tenant-id is absent, repeated, or not a UUID. gincommon's
+// RequireAuth would otherwise reject those requests first with its own
+// generic body ("missing or invalid authentication headers"), so the
+// caller never saw this service's documented code. Anything passing this
+// check also passes RequireAuth (a single UUID is always a valid header
+// value), so RequireAuth never answers on this service's routes;
+// GUCBridgeMiddleware still enforces the iam-system principal.
+//
+// It also drops x-tenant-roles before gincommon sees it: gincommon's
+// ContextMiddleware answers an invalid or oversized roles header with its
+// generic 401, but this service never reads roles (the automation
+// principal carries none, O&M AUTH-9; authorization is the fixed system
+// principal alone), so a header it does not use must not be able to fail
+// an otherwise valid request.
+func RequireIdentityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Header.Del(gincommon.HeaderTenantRoles)
+		for _, h := range []string{gincommon.HeaderUserID, gincommon.HeaderTenantID} {
+			values := c.Request.Header.Values(h)
+			if len(values) != 1 {
+				writeMissingIdentityHeaders(c)
+				return
+			}
+			if _, err := uuid.Parse(strings.TrimSpace(values[0])); err != nil {
+				writeMissingIdentityHeaders(c)
+				return
+			}
+		}
+		c.Next()
+	}
 }
 
 // GUCBridgeMiddleware runs after gincommon.ProtectedMiddlewares (which

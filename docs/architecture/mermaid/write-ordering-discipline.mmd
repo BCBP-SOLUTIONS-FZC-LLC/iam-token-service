@@ -1,39 +1,44 @@
 %% The one write-ordering discipline this service uses, generalized across
 %% TS-1 (issue/rotate), TS-2 (revoke), the overlap sweep, and offboarding —
-%% material-first, then Postgres commit, then (since TS-D14/15) RP-17
-%% AFTER the commit. Two external systems, two different positions
-%% relative to the transaction, for two different reasons.
+%% principal row lock, then the OpenBao effect (5s bound) before any row
+%% write, then the Postgres commit, then (CronJobs / operators) RP-17 AFTER
+%% the commit, with keys_refresh_pending making a failed RP-17 retryable.
 sequenceDiagram
     participant CALLER as Caller (RP / operator / cmd/scheduler)
     participant SVC as CredentialService
-    participant BAO as OpenBao (material)
     participant TX as Postgres RunInTx
+    participant BAO as OpenBao (material)
     participant OUT as outbox_events
     participant RP as Realm Provisioner (RP-17)
 
-    Note over SVC,BAO: Phase 1 — material effect, BEFORE any Postgres transaction opens.<br/>A row must never reference material that doesn't exist; the inverse<br/>(material with no row) is the recoverable case, §8.6.
     CALLER->>SVC: IssueOrRotate / Revoke
-    SVC->>BAO: Write v(n+1) — or — Delete v(n)
-    alt OpenBao unavailable
-        BAO-->>SVC: error
-        SVC-->>CALLER: 502 secret_store_unavailable — NOTHING committed,<br/>fail-closed (no "pending, reconcile later" discipline)
-    else material effect succeeds
-        BAO-->>SVC: ok
+    Note over SVC: TS-1 only: RSA-2048 keygen runs here,<br/>BEFORE the transaction opens
+    SVC->>TX: RunInTx — BEGIN, SET LOCAL app.tenant_id
+    TX->>TX: LockForUpdate(principal) — SELECT ... FOR UPDATE<br/>(55P03 after PG_LOCK_TIMEOUT → 409 rotation_in_flight)
 
-        Note over SVC,OUT: Phase 2 — local commit, only after the material effect succeeded
-        SVC->>TX: RunInTx(ctx, func(txCtx))
+    Note over TX,BAO: Phase 1 — material effect, inside the locked tx but BEFORE any row write<br/>or the commit. A row must never reference material that doesn't exist<br/>the inverse (material with no row) is the recoverable case, §8.6.
+    TX->>BAO: Write v(MaxVersion+1) — or — Delete v(n), bounded at 5s
+    alt OpenBao unavailable
+        BAO-->>TX: error
+        TX-->>SVC: ROLLBACK — nothing committed
+        SVC-->>CALLER: 502 secret_store_unavailable,<br/>fail-closed (no "pending, reconcile later" state)
+    else material effect succeeds
+        BAO-->>TX: ok
+
+        Note over TX,OUT: Phase 2 — row writes and commit, only after the material effect succeeded
         TX->>TX: UPDATE/INSERT service_account_credentials (RLS-scoped)
         TX->>OUT: Enqueue — same transaction (EVT-1)
-        TX-->>SVC: commit — row + event durable together
+        TX-->>SVC: COMMIT — row + event durable together, lock released
 
         SVC-->>CALLER: 200/201 (plaintext once, on issue/rotate)
 
-        Note over CALLER,RP: Phase 3 — RP-17, AFTER the commit, and only for the callers<br/>that drive it themselves (an operator by hand; cmd/rotator's sweep and<br/>cmd/scheduler's scan automatically, TS-D14/15). Ordered last because it<br/>is the one step this service cannot roll back if it fails — the row is<br/>already durably committed either way.
+        Note over CALLER,RP: Phase 3 — RP-17, AFTER the commit, and only for the callers<br/>that drive it themselves (an operator by hand, cmd/rotator's sweep and<br/>cmd/scheduler's scan automatically). The CronJobs record the owed refresh<br/>in keys_refresh_pending first (sweep: in the revoke tx, scheduler: an<br/>intent marker before IssueOrRotate, re-marked committed after it).
         CALLER->>RP: ClearServiceAccountKeysCache
         alt RP-17 fails
             RP-->>CALLER: error
-            Note over CALLER: Two-halves gap (TS-INV-7): the row is already committed,<br/>so this is surfaced as a page-worthy Failed outcome, never<br/>silently retried into a possible double-rotation.
+            Note over CALLER: Two-halves gap (TS-INV-7): the row is already committed.<br/>Counted Failed (pages), the marker stays and the next run's<br/>retry pass repeats RP-17 — never a second rotation.
         else RP-17 succeeds
             RP-->>CALLER: 204 — Keycloak re-fetches this service's JWKS
+            Note over CALLER: CronJobs clear the marker, only up to<br/>the requested_at value they observed
         end
     end

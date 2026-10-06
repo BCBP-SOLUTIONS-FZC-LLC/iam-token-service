@@ -34,6 +34,27 @@ const (
 	// stale idempotency key.
 	// #nosec G101 -- error code name, not a credential value
 	ErrCredentialReplayRevoked ErrorCode = "credential_replay_revoked" // 409
+
+	// ErrCredentialReplayExpired is additive to the frozen §17 taxonomy
+	// (TS-D22, same pattern as ErrCredentialReplayRevoked): a TS-1
+	// rotation_id replay (§9.2) arrived after the replay window
+	// (ROTATION_REPLAY_WINDOW) measured from the credential's issued_at.
+	// The credential may still be live, but its private key is not returned
+	// again — a rotation_id is a retry key, not a standing read handle.
+	// Distinct from credential_replay_revoked so a caller can tell "too
+	// late" from "gone"; details.version names the credential.
+	// #nosec G101 -- error code name, not a credential value
+	ErrCredentialReplayExpired ErrorCode = "credential_replay_expired" // 409
+
+	// ErrJWKSKeysUnavailable is additive to the frozen §17 taxonomy (TS-D23,
+	// same pattern as ErrDBUnavailable): the EXT-6 JWKS route could not read
+	// the tenant's ACTIVE key, or could not read any live key. A 200 then
+	// would hand Keycloak a set without the key the automation principal is
+	// signing with today, and Keycloak would cache it and reject every
+	// client_assertion; a 503 makes it keep its previous keys. Replaces the
+	// route's earlier use of secret_store_unavailable, whose frozen status is
+	// 502, not 503 — that code keeps its 502 on every other route.
+	ErrJWKSKeysUnavailable ErrorCode = "jwks_keys_unavailable" // 503
 )
 
 // httpStatus maps every ErrorCode to its frozen HTTP status (§5.5/§17).
@@ -47,6 +68,8 @@ var httpStatus = map[ErrorCode]int{
 	ErrInvalidRequest:          400,
 	ErrDBUnavailable:           503,
 	ErrCredentialReplayRevoked: 409,
+	ErrCredentialReplayExpired: 409,
+	ErrJWKSKeysUnavailable:     503,
 }
 
 // Error is this service's domain error type: a stable code, an HTTP status

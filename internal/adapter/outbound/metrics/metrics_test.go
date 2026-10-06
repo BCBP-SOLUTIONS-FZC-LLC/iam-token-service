@@ -78,6 +78,8 @@ func TestRegister_IsIdempotentAndRegistersAllCollectors(t *testing.T) {
 		OffboardingCascadeTotal, RotationSweepTotal, MaterialReconcileTotal,
 		CadenceRotationTotal, JWKSKeyErrorsTotal, ProcessedEventsDuplicates,
 		UnknownEventAcknowledged, DependencyRequestDuration, DuplicateMessagesTotal,
+		JWKSRateLimitedByBucketTotal, CredentialReplaysTotal, KeysRefreshPending,
+		KeysRefreshOldestAgeSeconds, ConsumerDLQRejectsTotal,
 	} {
 		assert.Panics(t, func() { gincommon.MetricsRegisterer().MustRegister(c) },
 			"%T was constructed but never actually passed to MustRegister in registerMetrics", c)
@@ -152,4 +154,67 @@ func TestRegister_EmitsNoUnregisteredDomainMetric(t *testing.T) {
 			assert.True(t, ok, "%s is an iam_* domain metric missing from the registry", name)
 		}
 	}
+}
+
+// TestTSD23Helpers_PreInitialisedAndBounded pins the TS-D23 counters'
+// label vocabularies: every known value is pre-initialised (a dashboard
+// shows 0, not "no data"), unknown values are folded or dropped so
+// cardinality never grows, and the gauge pair reports 0 age when empty.
+func TestTSD23Helpers_PreInitialisedAndBounded(t *testing.T) {
+	Register("test")
+
+	for _, b := range []string{"tenant", "global", "unknown"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_jwks_rate_limited_by_bucket_total", "bucket"), b)
+	}
+	for _, r := range []string{"served", "expired", "revoked"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_credential_replays_total", "result"), r)
+	}
+	for _, r := range []string{"schema_violation", "invalid_envelope_id"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_consumer_dlq_rejects_total", "reason"), r)
+	}
+
+	before := testutil.ToFloat64(JWKSRateLimitedByBucketTotal.WithLabelValues(JWKSBucketUnknown))
+	IncJWKSRateLimited(JWKSBucketUnknown)
+	IncJWKSRateLimited("bogus")
+	assert.InDelta(t, before+1, testutil.ToFloat64(JWKSRateLimitedByBucketTotal.WithLabelValues(JWKSBucketUnknown)), 0)
+	assert.NotContains(t, gatherLabelValues(t, "iam_token_service_jwks_rate_limited_by_bucket_total", "bucket"), "bogus")
+
+	before = testutil.ToFloat64(CredentialReplaysTotal.WithLabelValues(ReplayServed))
+	IncCredentialReplay(ReplayServed)
+	IncCredentialReplay("bogus")
+	assert.InDelta(t, before+1, testutil.ToFloat64(CredentialReplaysTotal.WithLabelValues(ReplayServed)), 0)
+
+	before = testutil.ToFloat64(ConsumerDLQRejectsTotal.WithLabelValues("other"))
+	IncConsumerDLQReject("something_new")
+	assert.InDelta(t, before+1, testutil.ToFloat64(ConsumerDLQRejectsTotal.WithLabelValues("other")), 0)
+	assert.NotContains(t, gatherLabelValues(t, "iam_token_service_consumer_dlq_rejects_total", "reason"), "something_new")
+
+	SetKeysRefreshPending(3, 125.5)
+	assert.InDelta(t, 3, testutil.ToFloat64(KeysRefreshPending), 0)
+	assert.InDelta(t, 125.5, testutil.ToFloat64(KeysRefreshOldestAgeSeconds), 0)
+	SetKeysRefreshPending(0, 99)
+	assert.InDelta(t, 0, testutil.ToFloat64(KeysRefreshPending), 0)
+	assert.InDelta(t, 0, testutil.ToFloat64(KeysRefreshOldestAgeSeconds), 0, "an empty table reports age 0")
+}
+
+// gatherLabelValues returns every value label takes on metric name in the
+// gincommon registry.
+func gatherLabelValues(t *testing.T, name, label string) []string {
+	t.Helper()
+	mfs, err := gincommon.MetricsGatherer().Gather()
+	require.NoError(t, err)
+	var out []string
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == label {
+					out = append(out, lp.GetValue())
+				}
+			}
+		}
+	}
+	return out
 }

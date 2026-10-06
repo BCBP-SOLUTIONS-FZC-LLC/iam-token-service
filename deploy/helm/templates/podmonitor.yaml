@@ -1,0 +1,41 @@
+{{/*
+Scrapes the rotator and scheduler CronJob pods, which have no Service (so
+the ServiceMonitor never sees them) and serve /metrics only during their
+short post-run grace window. The job label is rewritten to
+<fullname>-<component> to match the alert selectors (job="…-rotator").
+*/}}
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-cronjobs
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [{{ include "iam-token-service.name" . }}]
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name }}]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [rotator, scheduler]
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      # Same as the ServiceMonitor: the series' own {domain, service,
+      # environment} const labels win over any colliding target label.
+      honorLabels: true
+      interval: {{ .Values.serviceMonitor.podMonitorInterval | default "5s" }}
+      scrapeTimeout: {{ .Values.serviceMonitor.podMonitorInterval | default "5s" }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: job
+          replacement: {{ printf "%s-$1" (include "iam-token-service.fullname" .) }}
+{{- end }}

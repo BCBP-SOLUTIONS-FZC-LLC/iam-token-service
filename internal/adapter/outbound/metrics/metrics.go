@@ -9,10 +9,11 @@
 //     values, aggregation expectations) this package's proposed metrics
 //     require before they may be treated as ratified.
 //   - Tier 2 (iam_*) — semantics shared across IAM services, not meaningful
-//     outside the domain. Required labels: service, environment. An iam_*
-//     name must be a ratified Platform Observability Registry entry before
-//     it is emitted, so this package emits none today (the proposed
-//     iam_offboarding_cascade_total waits on ratification).
+//     outside the domain. An iam_* name must be a Platform Observability
+//     Registry entry before it is emitted: this package emits
+//     iam_rls_violations_total (shared with iam-org-membership,
+//     iam-user-profile and iam-audit-log); the proposed
+//     iam_offboarding_cascade_total waits on ratification.
 //   - Tier 3 (iam_token_service_*, frozen §25) — this service only. No
 //     cross-service label contract; kept exactly as the LLD froze them.
 //
@@ -38,6 +39,7 @@ package metrics
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,6 +63,9 @@ const (
 	// Tier 1 names owned by platform-events (see package doc).
 	dependencyRequestSecondsName = "platform_dependency_request_seconds"
 	duplicateMessagesTotalName   = "platform_duplicate_messages_total"
+
+	// Tier 2 registry name this service emits.
+	rlsViolationsTotalName = "iam_rls_violations_total"
 )
 
 var (
@@ -126,11 +131,49 @@ var (
 	// Service-specific: JWKS custody is unique to this service.
 	JWKSKeyErrorsTotal prometheus.Counter
 
-	// ProcessedEventsDuplicates counts SQS redeliveries filtered by the
-	// processed_events composite PK, matching iam-user-profile /
-	// iam-org-membership. Legacy Tier-3 name kept for the compatibility
-	// period — see DuplicateMessagesTotal (Tier 1, dual-emitted alongside
-	// this).
+	// JWKSRateLimitedTotal counts JWKS requests answered 429 by the
+	// per-tenant or process-wide limiter. Alerted: a rate-limited Keycloak
+	// fetch right after RP-17 is an auth outage for that tenant.
+	JWKSRateLimitedTotal prometheus.Counter
+
+	// JWKSRateLimitedByBucketTotal is JWKSRateLimitedTotal split by the
+	// bucket that denied the request (tenant|global|unknown, TS-D23): a
+	// `tenant` 429 is one caller hammering one URL, a `global` 429 means
+	// known tenants together exceed the process-wide budget, and an
+	// `unknown` 429 is a random-tenant-id flood (harmless to known tenants).
+	// Incremented alongside the unlabelled counter, which stays unchanged.
+	// Use IncJWKSRateLimited.
+	JWKSRateLimitedByBucketTotal *prometheus.CounterVec
+
+	// CredentialReplaysTotal counts TS-1 rotation_id replays (§9.2) by
+	// result: served (the private key was handed out again), expired
+	// (refused, past ROTATION_REPLAY_WINDOW) or revoked (refused, the
+	// credential is gone). A replay re-reads a live private key, so each
+	// one is also an audit log line (TS-D23). Use IncCredentialReplay.
+	CredentialReplaysTotal *prometheus.CounterVec
+
+	// KeysRefreshPending is the number of rows in keys_refresh_pending —
+	// tenants owed an RP-17 Keycloak key-cache refresh (TS-D22). Nonzero is
+	// normal for a few minutes after an RP-17 failure; a value that does not
+	// drain means Keycloak still trusts a revoked key or lacks a new one.
+	// Use SetKeysRefreshPending.
+	KeysRefreshPending prometheus.Gauge
+
+	// KeysRefreshOldestAgeSeconds is the age of the oldest
+	// keys_refresh_pending row (0 when the table is empty) — the alertable
+	// signal: how long Keycloak has been out of sync for the worst tenant.
+	KeysRefreshOldestAgeSeconds prometheus.Gauge
+
+	// ConsumerDLQRejectsTotal counts inbound messages the consumer sent
+	// straight to the -dlq as permanent rejects, by reason
+	// (schema_violation|invalid_envelope_id|other, TS-D22/TS-D23). Each one
+	// is an offboarding cascade that did not run. Use IncConsumerDLQReject.
+	ConsumerDLQRejectsTotal *prometheus.CounterVec
+
+	// ProcessedEventsDuplicates counts SQS redeliveries the platform-events
+	// inbox found already claimed in processed_events, matching
+	// iam-org-membership. Authoritative until the Tier 1
+	// platform_duplicate_messages_total (counted by the inbox) is ratified.
 	ProcessedEventsDuplicates *prometheus.CounterVec
 
 	// UnknownEventAcknowledged counts inbound events with no registered
@@ -151,6 +194,14 @@ var (
 	// bounded by this service's one consumer and its one consumed type.
 	ConsumedSchemaViolationsTotal *prometheus.CounterVec
 
+	// ── Tier 2: iam_* (registry entries, shared across IAM services) ─────
+
+	// RLSViolations is iam_rls_violations_total{violation_type}: RLS checks
+	// that failed (cross_tenant_access, missing_or_invalid_guc), sampled into
+	// rls_violation_log by rls_check_tenant() (migration 000003) and counted
+	// by cmd/server's exporter. Use AddRLSViolations.
+	RLSViolations *prometheus.CounterVec
+
 	// ── Tier 1: platform_* (REGISTRY-PROPOSED — see package doc) ─────────
 
 	// DependencyRequestDuration is the registry-proposed
@@ -164,7 +215,10 @@ var (
 	// DuplicateMessagesTotal is the registry-proposed
 	// platform_duplicate_messages_total{queue, event_type} (owned by
 	// platform-events): inbound messages recognized as redeliveries and
-	// skipped. Dual-emitted alongside the legacy ProcessedEventsDuplicates.
+	// skipped. Recorded by platform-events' inbox itself (the consumer's
+	// dedup runs on pkg/inbox); this handle exists so Register adopts the
+	// library's collector and pre-warms its series. The service records only
+	// the Tier 3 ProcessedEventsDuplicates.
 	DuplicateMessagesTotal *prometheus.CounterVec
 )
 
@@ -292,7 +346,7 @@ func registerMetrics() {
 
 	ProcessedEventsDuplicates = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name:        tier3Prefix + "processed_events_duplicates_total",
-		Help:        "[Legacy — see platform_duplicate_messages_total] Inbound SQS messages skipped because event_id was already in processed_events.",
+		Help:        "Inbound SQS redeliveries the platform-events inbox found already claimed in processed_events, by consumer. Authoritative until platform_duplicate_messages_total (counted by the inbox) is ratified.",
 		ConstLabels: t3,
 	}, []string{"consumer"})
 
@@ -325,11 +379,54 @@ func registerMetrics() {
 		ConstLabels: t1,
 	}, registryEntry(duplicateMessagesTotalName).Labels))
 
+	// ── Tier 2 (registry entry: name, help and labels are the registry's) ─
+	RLSViolations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        rlsViolationsTotalName,
+		Help:        registryEntry(rlsViolationsTotalName).Help,
+		ConstLabels: t1,
+	}, registryEntry(rlsViolationsTotalName).Labels)
+
 	JWKSKeyErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name:        tier3Prefix + "jwks_key_errors_total",
 		Help:        "Live credentials the JWKS route (EXT-6) could not serve — OpenBao material unreadable/unparseable. Page-worthy: a real per-credential Keycloak auth outage.",
 		ConstLabels: t3,
 	})
+
+	JWKSRateLimitedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        tier3Prefix + "jwks_rate_limited_total",
+		Help:        "JWKS route requests rejected with 429 by the per-tenant or process-wide rate limiter. Sustained increase means a caller is flooding the route and Keycloak's key fetches may be starved.",
+		ConstLabels: t3,
+	})
+
+	JWKSRateLimitedByBucketTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "jwks_rate_limited_by_bucket_total",
+		Help:        "JWKS route 429s by the token bucket that denied them (tenant|global|unknown). unknown alone is a random-tenant-id flood that cannot affect known tenants.",
+		ConstLabels: t3,
+	}, []string{"bucket"})
+
+	CredentialReplaysTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "credential_replays_total",
+		Help:        "TS-1 rotation_id replays by result (served|expired|revoked). served re-handed out a live private key.",
+		ConstLabels: t3,
+	}, []string{"result"})
+
+	KeysRefreshPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        tier3Prefix + "keys_refresh_pending",
+		Help:        "Tenants owed an RP-17 Keycloak key-cache refresh (rows in keys_refresh_pending).",
+		ConstLabels: t3,
+	})
+
+	KeysRefreshOldestAgeSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        tier3Prefix + "keys_refresh_oldest_age_seconds",
+		Help:        "Age of the oldest keys_refresh_pending row in seconds (0 when none is owed).",
+		ConstLabels: t3,
+	})
+
+	ConsumerDLQRejectsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "consumer_dlq_rejects_total",
+		Help:        "Inbound messages sent straight to the -dlq as permanent rejects, by reason (schema_violation|invalid_envelope_id|other).",
+		ConstLabels: t3,
+	}, []string{"reason"})
 
 	gincommon.MetricsRegisterer().MustRegister(
 		CredentialsIssuedTotal,
@@ -345,9 +442,16 @@ func registerMetrics() {
 		// could never have fired.
 		CadenceRotationTotal,
 		JWKSKeyErrorsTotal,
+		JWKSRateLimitedTotal,
+		JWKSRateLimitedByBucketTotal,
+		CredentialReplaysTotal,
+		KeysRefreshPending,
+		KeysRefreshOldestAgeSeconds,
+		ConsumerDLQRejectsTotal,
 		ProcessedEventsDuplicates,
 		UnknownEventAcknowledged,
 		ConsumedSchemaViolationsTotal,
+		RLSViolations,
 	)
 
 	// Pre-initialize labels so dashboards show 0 rather than "no data".
@@ -356,9 +460,14 @@ func registerMetrics() {
 	}
 	for _, op := range []string{"write", "delete"} {
 		OpenBaoCallDuration.WithLabelValues(op)
+	}
+	for _, op := range []string{"write", "delete", "read", "list"} {
 		for _, outcome := range []string{OutcomeSuccess, OutcomeError} {
 			DependencyRequestDuration.WithLabelValues(DependencyOpenBao, op, outcome)
 		}
+	}
+	for _, outcome := range []string{OutcomeSuccess, OutcomeError} {
+		DependencyRequestDuration.WithLabelValues(DependencyRealmProvisioner, OperationRefreshKeys, outcome)
 	}
 	ConsumedSchemaViolationsTotal.WithLabelValues("tenant_offboarding", "TenantMembershipsPurged")
 	for _, result := range []string{"ok", "error"} {
@@ -369,15 +478,117 @@ func registerMetrics() {
 		MaterialReconcileTotal.WithLabelValues(result)
 	}
 	ProcessedEventsDuplicates.WithLabelValues("tenant_offboarding")
+	for _, vType := range rlsViolationTypes {
+		RLSViolations.WithLabelValues(vType)
+	}
 	DuplicateMessagesTotal.WithLabelValues("tenant-lifecycle-tokensvc-q", "TenantMembershipsPurged")
+	for _, b := range jwksBuckets {
+		JWKSRateLimitedByBucketTotal.WithLabelValues(b)
+	}
+	for _, r := range replayResults {
+		CredentialReplaysTotal.WithLabelValues(r)
+	}
+	for _, r := range dlqRejectReasons {
+		ConsumerDLQRejectsTotal.WithLabelValues(r)
+	}
+}
+
+// Label vocabularies of the TS-D23 counters. Helpers fold anything else to
+// "other" (DLQ reasons) or drop it (bucket/replay result — a programming
+// error, never a caller-controlled value), so cardinality stays fixed.
+const (
+	JWKSBucketTenant  = "tenant"
+	JWKSBucketGlobal  = "global"
+	JWKSBucketUnknown = "unknown"
+
+	ReplayServed  = "served"
+	ReplayExpired = "expired"
+	ReplayRevoked = "revoked"
+
+	DLQReasonSchemaViolation   = "schema_violation"
+	DLQReasonInvalidEnvelopeID = "invalid_envelope_id"
+	dlqReasonOther             = "other"
+)
+
+var (
+	jwksBuckets      = []string{JWKSBucketTenant, JWKSBucketGlobal, JWKSBucketUnknown}
+	replayResults    = []string{ReplayServed, ReplayExpired, ReplayRevoked}
+	dlqRejectReasons = []string{DLQReasonSchemaViolation, DLQReasonInvalidEnvelopeID}
+)
+
+// IncJWKSRateLimited increments jwks_rate_limited_by_bucket_total{bucket}.
+// It does NOT touch the unlabelled JWKSRateLimitedTotal; the handler keeps
+// incrementing that one itself. Nil-safe; an unknown bucket is ignored.
+func IncJWKSRateLimited(bucket string) {
+	if JWKSRateLimitedByBucketTotal == nil || !slices.Contains(jwksBuckets, bucket) {
+		return
+	}
+	JWKSRateLimitedByBucketTotal.WithLabelValues(bucket).Inc()
+}
+
+// IncCredentialReplay increments credential_replays_total{result}.
+// Nil-safe; an unknown result is ignored.
+func IncCredentialReplay(result string) {
+	if CredentialReplaysTotal == nil || !slices.Contains(replayResults, result) {
+		return
+	}
+	CredentialReplaysTotal.WithLabelValues(result).Inc()
+}
+
+// SetKeysRefreshPending sets keys_refresh_pending to count and
+// keys_refresh_oldest_age_seconds to oldestAgeSeconds (clamped at 0, and
+// forced to 0 when count is 0 so an empty table never reports a stale
+// age). Nil-safe.
+func SetKeysRefreshPending(count int, oldestAgeSeconds float64) {
+	if KeysRefreshPending == nil || KeysRefreshOldestAgeSeconds == nil {
+		return
+	}
+	if count <= 0 || oldestAgeSeconds < 0 {
+		oldestAgeSeconds = 0
+	}
+	if count < 0 {
+		count = 0
+	}
+	KeysRefreshPending.Set(float64(count))
+	KeysRefreshOldestAgeSeconds.Set(oldestAgeSeconds)
+}
+
+// IncConsumerDLQReject increments consumer_dlq_rejects_total{reason},
+// folding any reason outside the known set to "other". Nil-safe.
+func IncConsumerDLQReject(reason string) {
+	if ConsumerDLQRejectsTotal == nil {
+		return
+	}
+	if !slices.Contains(dlqRejectReasons, reason) {
+		reason = dlqReasonOther
+	}
+	ConsumerDLQRejectsTotal.WithLabelValues(reason).Inc()
 }
 
 // Label values this service records on the shared Tier 1 metrics.
 const (
-	DependencyOpenBao = "openbao"
-	OutcomeSuccess    = "success"
-	OutcomeError      = "error"
+	DependencyOpenBao          = "openbao"
+	DependencyRealmProvisioner = "realm_provisioner"
+	OperationRefreshKeys       = "refresh_keys"
+	OutcomeSuccess             = "success"
+	OutcomeError               = "error"
 )
+
+// rlsViolationTypes is the violation_type set rls_check_tenant() writes
+// (migration 000003's CHECK constraint), plus the registry's catch-all.
+var rlsViolationTypes = []string{"cross_tenant_access", "missing_or_invalid_guc", "other"}
+
+// AddRLSViolations adds n to iam_rls_violations_total{violation_type},
+// mapping any value outside the registry vocabulary to "other". Nil-safe.
+func AddRLSViolations(violationType string, n float64) {
+	if RLSViolations == nil || n <= 0 {
+		return
+	}
+	if !slices.Contains(rlsViolationTypes, violationType) {
+		violationType = "other"
+	}
+	RLSViolations.WithLabelValues(violationType).Add(n)
+}
 
 // registryEntry returns name's Platform Observability Registry entry; a
 // missing entry is a build-time contract break, so it panics at startup.

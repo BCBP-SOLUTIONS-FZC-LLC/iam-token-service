@@ -10,15 +10,15 @@
 %% `reconciler_jobs`.
 graph TD
     subgraph cmd["cmd/* — composition roots"]
-        SERVER["cmd/server<br/>HTTP API + outbox runner"]
-        CONSUMER["cmd/consumer<br/>offboarding SQS subscriber"]
-        ROTATOR["cmd/rotator<br/>sweep + reconciler + prune CronJob"]
-        SCHEDULER["cmd/scheduler<br/>cadence scan + RP-17 key-refresh"]
+        SERVER["cmd/server<br/>HTTP API + outbox runner<br/>+ DB-state exporters + JWKS known-tenant refresher<br/>(MIGRATE_ONLY=true: Helm migrate hook Job)"]
+        CONSUMER["cmd/consumer<br/>offboarding SQS subscriber + DLQ router"]
+        ROTATOR["cmd/rotator<br/>RP-17 retry pass + sweep + reconciler + prune CronJob"]
+        SCHEDULER["cmd/scheduler<br/>RP-17 retry pass + cadence scan + RP-17 key-refresh"]
     end
 
     subgraph inbound["adapters_inbound"]
         HTTP["internal/adapter/inbound/http<br/>Gin handlers, GUC bridge middleware"]
-        CONS["internal/adapter/inbound/consumer<br/>OffboardingConsumer, dedup"]
+        CONS["internal/adapter/inbound/consumer<br/>OffboardingConsumer, dedup over port.Inbox"]
     end
 
     subgraph outbound["adapters_outbound"]
@@ -27,15 +27,15 @@ graph TD
     end
 
     subgraph isolated["single-purpose outbound components"]
-        POSTGRES["postgres<br/>repositories, RLS GUC binding, TxRunner"]
-        OPENBAO["openbao<br/>KV v2 client, Kubernetes auth"]
+        POSTGRES["postgres<br/>repositories, RLS GUC binding, TxRunner,<br/>InboxRepository, RLSViolationRepository,<br/>KeysRefreshRepository, JWKSTenantsRepository"]
+        OPENBAO["openbao<br/>KV v2 client, Kubernetes auth<br/>(single-flight login, per-call clone)"]
         HTTPX["httpx<br/>traceparent injection, client spans"]
         OBS["observability<br/>Prometheus metrics"]
     end
 
     subgraph core["internal/core"]
         SERVICE["service<br/>CredentialService, tracing"]
-        PORT["port<br/>repository + adapter interfaces"]
+        PORT["port<br/>repository + adapter interfaces,<br/>Inbox / InboxPruner"]
         DOMAIN["domain<br/>Credential, Principal, Event, errors"]
     end
 
@@ -49,20 +49,26 @@ graph TD
     SERVER --> EVENTBUS
     SERVER --> SWAGGERDOCS
     SERVER --> APISPEC
+    SERVER --> OBS
     CONSUMER --> CONS
     CONSUMER --> POSTGRES
     CONSUMER --> OPENBAO
+    CONSUMER --> EVENTBUS
+    CONSUMER --> OBS
     ROTATOR --> POSTGRES
     ROTATOR --> OPENBAO
     ROTATOR --> EVENTBUS
+    ROTATOR --> REALMPROV
     ROTATOR --> OBS
     SCHEDULER --> POSTGRES
     SCHEDULER --> OPENBAO
     SCHEDULER --> SERVICE
+    SCHEDULER --> EVENTBUS
     SCHEDULER --> REALMPROV
     SCHEDULER --> OBS
 
     HTTP --> SERVICE
+    HTTP --> OBS
     CONS --> PORT
     CONS --> OBS
     EVENTBUS --> SERVICE

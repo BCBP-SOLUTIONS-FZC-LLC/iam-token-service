@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -58,6 +59,10 @@ type fakePrincipalRepository struct {
 	// instead of its normal listing — exercises JWKSService.PublicKeys'
 	// repository-error branch.
 	forceListByTenantErr error
+
+	// forceLockErr, when non-nil, is returned by LockForUpdate — e.g. the
+	// principal-lock wait timeout (rotation_in_flight with no details).
+	forceLockErr error
 }
 
 func newFakePrincipalRepository() *fakePrincipalRepository {
@@ -78,6 +83,14 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 	}
 	cp := *p
 	return &cp, nil
+}
+
+// LockForUpdate behaves like FindByID in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	if f.forceLockErr != nil {
+		return nil, f.forceLockErr
+	}
+	return f.FindByID(ctx, tenantID, principalID)
 }
 
 func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
@@ -232,6 +245,17 @@ func (f *fakeCredentialRepository) FindActive(_ context.Context, tenantID, princ
 	return nil, nil
 }
 
+// MaxVersion returns the highest version stored for the principal (any status).
+func (f *fakeCredentialRepository) MaxVersion(_ context.Context, tenantID, principalID uuid.UUID) (int, error) {
+	maxVersion := 0
+	for _, c := range f.byID {
+		if c.TenantID == tenantID && c.PrincipalID == principalID && c.Version > maxVersion {
+			maxVersion = c.Version
+		}
+	}
+	return maxVersion, nil
+}
+
 func (f *fakeCredentialRepository) FindByRotationID(_ context.Context, tenantID, principalID, rotationID uuid.UUID) (*domain.Credential, error) {
 	if f.forceFindByRotationIDErr != nil {
 		return nil, f.forceFindByRotationIDErr
@@ -280,6 +304,11 @@ func (f *fakeCredentialRepository) Insert(_ context.Context, c *domain.Credentia
 		c.ID = uuid.New()
 	}
 	c.RecordVersion = 1
+	if c.IssuedAt.IsZero() {
+		// The real column defaults to now(); the replay window is measured
+		// from it.
+		c.IssuedAt = time.Now().UTC()
+	}
 	cp := *c
 	f.byID[cp.ID] = &cp
 	return nil
@@ -372,6 +401,7 @@ func (f *fakeSecretStore) List(_ context.Context, pathPrefix string) ([]string, 
 // than just not-crashing.
 type fakeLogger struct {
 	warnings []fakeLogCall
+	infos    []fakeLogCall
 }
 
 type fakeLogCall struct {
@@ -380,7 +410,9 @@ type fakeLogCall struct {
 }
 
 func (f *fakeLogger) Debug(string, map[string]any) {}
-func (f *fakeLogger) Info(string, map[string]any)  {}
+func (f *fakeLogger) Info(msg string, fields map[string]any) {
+	f.infos = append(f.infos, fakeLogCall{msg: msg, fields: fields})
+}
 func (f *fakeLogger) Warn(msg string, fields map[string]any) {
 	f.warnings = append(f.warnings, fakeLogCall{msg: msg, fields: fields})
 }
@@ -389,3 +421,8 @@ func (f *fakeLogger) Error(string, map[string]any) {}
 var _ port.Logger = (*fakeLogger)(nil)
 
 var _ port.SecretStore = (*fakeSecretStore)(nil)
+
+// LockByTenant behaves like ListByTenant in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	return f.ListByTenant(ctx, tenantID)
+}

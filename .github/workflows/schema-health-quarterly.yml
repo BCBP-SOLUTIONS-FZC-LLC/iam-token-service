@@ -54,22 +54,24 @@ jobs:
       id-token: write   # OIDC — AWS role assumption, no long-lived keys (§13.5)
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Set up Python (schema-gov)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
 
       - name: Install schema-gov (platform-schemagov v0.4.0)
+        env:
+          GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
         run: |
-          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
+          pip install --no-cache-dir "git+https://x-access-token:${GO_PRIVATE_TOKEN}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       # ── 1. Lifecycle lint ────────────────────────────────────────────────────
       # Runs schema-gov validate (all 8 passes, including Pass 4 lifecycle) —

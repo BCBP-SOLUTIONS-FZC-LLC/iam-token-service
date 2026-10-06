@@ -19,6 +19,7 @@ var testGinConfig = gincommon.Config{ServiceName: "iam-token-service-test", Doma
 // behavior is exercised through the real chain, not reimplemented.
 func newTenantScopedTestRouter(register func(g *gin.RouterGroup)) *gin.Engine {
 	r := gin.New()
+	r.Use(RequireIdentityHeaders())
 	r.Use(gincommon.ProtectedMiddlewares(testGinConfig)...)
 	r.Use(GUCBridgeMiddleware())
 	g := r.Group("/tenants/:id", RequireTenantPathMatch())

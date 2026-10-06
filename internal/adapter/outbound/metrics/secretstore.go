@@ -12,10 +12,11 @@ import (
 // — on both the legacy Tier-3 iam_token_service_openbao_call_duration_seconds{op}
 // and the registry-proposed Tier-1 platform_dependency_request_seconds{dependency="openbao",operation,outcome}
 // (Enterprise Platform Observability Standard, dual-emitted during the
-// compatibility period). Read and List pass through unmeasured (TS-1's
-// rotation_id-replay Read is rare and not part of the frozen op label set;
-// List is the §8.6 reconciler's own enumeration, already covered by
-// iam_token_service_material_reconcile_total).
+// compatibility period). Read and List are recorded on the Tier-1 metric
+// only: the Tier-3 op label set is frozen at write|delete (§11.2), but Read
+// is the JWKS route's hot path (one per live credential per Keycloak fetch)
+// and List is the reconciler's and the offboarding cascade's enumeration,
+// so their errors and latency must be visible.
 //
 // Defined in the metrics package (not on openbao.Client itself) because
 // the openbao adapter component may depend only on domain/port
@@ -40,9 +41,12 @@ func (s *InstrumentedSecretStore) Write(ctx context.Context, path string, secret
 	return err
 }
 
-// Read delegates to inner, unmeasured (see package doc).
+// Read delegates to inner, recording read call duration (Tier 1 only).
 func (s *InstrumentedSecretStore) Read(ctx context.Context, path string) (string, error) {
-	return s.inner.Read(ctx, path)
+	start := time.Now()
+	secret, err := s.inner.Read(ctx, path)
+	observeDependencyOnly("read", err, time.Since(start).Seconds())
+	return secret, err
 }
 
 // Delete delegates to inner, recording delete call duration.
@@ -53,9 +57,12 @@ func (s *InstrumentedSecretStore) Delete(ctx context.Context, path string) error
 	return err
 }
 
-// List delegates to inner, unmeasured (see package doc).
+// List delegates to inner, recording list call duration (Tier 1 only).
 func (s *InstrumentedSecretStore) List(ctx context.Context, pathPrefix string) ([]string, error) {
-	return s.inner.List(ctx, pathPrefix)
+	start := time.Now()
+	keys, err := s.inner.List(ctx, pathPrefix)
+	observeDependencyOnly("list", err, time.Since(start).Seconds())
+	return keys, err
 }
 
 // observeOpenBaoCall records elapsed seconds on both the legacy Tier-3
@@ -71,11 +78,24 @@ func observeOpenBaoCall(op string, err error, elapsedSeconds float64) {
 	if OpenBaoCallDuration != nil {
 		OpenBaoCallDuration.WithLabelValues(op).Observe(elapsedSeconds)
 	}
-	if DependencyRequestDuration != nil {
-		outcome := OutcomeSuccess
-		if err != nil {
-			outcome = OutcomeError
-		}
-		DependencyRequestDuration.WithLabelValues(DependencyOpenBao, op, outcome).Observe(elapsedSeconds)
+	observeDependencyOnly(op, err, elapsedSeconds)
+}
+
+// observeDependencyOnly records one OpenBao call on the Tier-1
+// platform_dependency_request_seconds only.
+func observeDependencyOnly(op string, err error, elapsedSeconds float64) {
+	observeDependency(DependencyOpenBao, op, err, elapsedSeconds)
+}
+
+// observeDependency records one call to dependency on
+// platform_dependency_request_seconds with the registry outcome vocabulary.
+func observeDependency(dependency, operation string, err error, elapsedSeconds float64) {
+	if DependencyRequestDuration == nil {
+		return
 	}
+	outcome := OutcomeSuccess
+	if err != nil {
+		outcome = OutcomeError
+	}
+	DependencyRequestDuration.WithLabelValues(dependency, operation, outcome).Observe(elapsedSeconds)
 }

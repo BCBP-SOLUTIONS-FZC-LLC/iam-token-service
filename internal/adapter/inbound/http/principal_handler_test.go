@@ -57,6 +57,7 @@ func TestPrincipalHandler_Register(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodPost, "/tenants/"+tenantID.String()+"/service-accounts", map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 
 	t.Run("400 malformed JSON body", func(t *testing.T) {
@@ -141,6 +142,7 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts/"+principalID.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -188,6 +190,7 @@ func TestPrincipalHandler_FindBySub(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 
 	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
@@ -262,5 +265,6 @@ func TestPrincipalHandler_ReadPlatformAutomation(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, path, nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 }

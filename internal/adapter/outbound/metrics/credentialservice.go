@@ -2,9 +2,11 @@ package metrics
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 )
 
@@ -30,16 +32,33 @@ func NewInstrumentedCredentialService(inner *service.CredentialService) *Instrum
 
 // IssueOrRotate delegates to inner, incrementing credentials_issued_total{op="issue"}
 // on a first-ever credential, {op="rotate"} on a rotation — skipped
-// entirely on a rotation_id replay or an error.
+// entirely on a rotation_id replay or an error. A replay is counted in
+// credential_replays_total{result} instead (TS-D23): served when the key
+// was handed out again (res.Replayed), expired/revoked when the replay was
+// refused (the two replay error codes).
 func (s *InstrumentedCredentialService) IssueOrRotate(ctx context.Context, tenantID, principalID uuid.UUID, req service.IssueOrRotateRequest, actor uuid.UUID) (*service.IssueOrRotateResult, error) {
 	res, err := s.inner.IssueOrRotate(ctx, tenantID, principalID, req, actor)
-	if err == nil && !res.Replayed {
-		op := "issue"
-		if res.ExpiresPriorAt != nil {
-			op = "rotate"
+	if err != nil {
+		var de *domain.Error
+		if errors.As(err, &de) {
+			switch de.Code {
+			case domain.ErrCredentialReplayExpired:
+				IncCredentialReplay(ReplayExpired)
+			case domain.ErrCredentialReplayRevoked:
+				IncCredentialReplay(ReplayRevoked)
+			}
 		}
-		CredentialsIssuedTotal.WithLabelValues(op).Inc()
+		return res, err
 	}
+	if res.Replayed {
+		IncCredentialReplay(ReplayServed)
+		return res, err
+	}
+	op := "issue"
+	if res.ExpiresPriorAt != nil {
+		op = "rotate"
+	}
+	CredentialsIssuedTotal.WithLabelValues(op).Inc()
 	return res, err
 }
 

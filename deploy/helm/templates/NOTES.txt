@@ -1,12 +1,19 @@
 {{ .Chart.Name }} {{ .Chart.AppVersion }} has been installed.
 
 Components deployed:
-  - {{ include "iam-token-service.fullname" . }}-server    (Deployment, {{ .Values.server.replicaCount }} replica(s)) — TS-1..TS-4 HTTP API
+  - {{ include "iam-token-service.fullname" . }}-server    (Deployment, {{ .Values.server.replicaCount }} replica(s)) — TS-1..TS-6 HTTP API + EXT-6 JWKS
   - {{ include "iam-token-service.fullname" . }}-consumer  (Deployment, {{ .Values.consumer.replicaCount }} replica(s)) — TenantMembershipsPurged offboarding cascade
   - {{ include "iam-token-service.fullname" . }}-rotator   (CronJob, schedule "{{ .Values.rotator.schedule }}") — overlap-expiry sweep, orphan-material reconciler, prune
+  - {{ include "iam-token-service.fullname" . }}-scheduler (CronJob, schedule "{{ .Values.scheduler.schedule }}") — cadence-based automatic rotation + RP-17
+{{- if .Values.migrations.enabled }}
+  - {{ include "iam-token-service.fullname" . }}-migrate   (pre-install/pre-upgrade hook Job) — schema migrations
+{{- end }}
 
-This service has no public/tenant-facing route (§5.6) — every endpoint sits
-under /api/v1/internal/*, reachable only from in-mesh callers.
+Every endpoint sits under /api/v1/internal/* and requires the reserved
+system principal, except the EXT-6 JWKS route
+(…/service-accounts/platform-automation/jwks.json), which is unauthenticated
+by design so Keycloak can fetch it (§5.6). Keep it reachable from Keycloak
+only (networkPolicy, authorizationPolicy).
 
 ━━ REQUIRED ACTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -26,6 +33,13 @@ under /api/v1/internal/*, reachable only from in-mesh callers.
      networkPolicy.enabled: true
 
 {{ end -}}
+{{ if not .Values.authorizationPolicy.enabled -}}
+⚠  authorizationPolicy.enabled is false. Any pod that can reach the HTTP
+   port (including the Keycloak/Workflow namespaces networkPolicy admits)
+   can call every route by setting the reserved x-user-id header. Required
+   outside local/dev/test.
+
+{{ end -}}
 ⚠  This service authenticates to OpenBao (§6.3, §10.5, TS-CONFIG-3) via
    every pod's ServiceAccount JWT against OpenBao's Kubernetes auth method
    — confirm an OpenBao role named .Values.openbao.authRole
@@ -39,9 +53,9 @@ Before this chart is usable in a real environment:
      roles must already exist (§4.4).
   2. Set values.events.topicArn and values.events.glueRegistryName once the
      iam-serviceaccount-events SNS topic and Glue registry are provisioned
-     (§25) — left empty, the server queues events in the outbox but never
-     publishes them (safe no-op, never crashes the pod).
-  3. Set values.sqs.offboardingQueueUrl once tenant-lifecycle-tokensvc-q
-     exists.
+     (§25). Required outside local/dev/test (the render fails); in
+     local/dev/test an empty topic means a no-op publisher.
+  3. Set values.sqs.queueUrl once tenant-lifecycle-tokensvc-q exists —
+     also required outside local/dev/test.
   4. Confirm values.openbao.addr / authRole match the OpenBao Kubernetes
      auth role bound to this chart's ServiceAccount (deploy/openbao/policy.hcl).

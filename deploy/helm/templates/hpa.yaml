@@ -30,8 +30,9 @@ spec:
     {{- end }}
     {{- if .Values.autoscaling.targetRPSPerReplica }}
     # RPS-based scaling: more accurate than CPU for this I/O-bound service.
-    # PREREQUISITE: the prometheus-adapter must be installed and configured with
-    # the rule at deploy/monitoring/prometheus-adapter-rule.yaml. Without it this
+    # PREREQUISITE: prometheus-adapter must be installed with the rule from
+    # deploy/monitoring/prometheus-adapter-rule.yaml merged into its
+    # `rules.custom` values (once per cluster). Without it this
     # metric is silently absent from the custom metrics API and HPA falls back to
     # CPU/memory only.
     - type: Pods

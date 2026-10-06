@@ -1,24 +1,26 @@
 %% Row-Level Security via a transaction-local GUC (LLD §4.3, RLS-6/RLS-7).
 %% Two distinct pool identities: the RLS-scoped app pool used by
-%% cmd/server and cmd/consumer, and the BYPASSRLS reconciler pool used
-%% only by cmd/rotator for cross-tenant enumeration.
+%% cmd/server and cmd/consumer (and by the CronJobs for their writes), and
+%% the BYPASSRLS, SELECT-only reconciler pool used for cross-tenant reads
+%% (cmd/rotator, cmd/scheduler, cmd/server's exporters and JWKS
+%% known-tenant refresher).
 sequenceDiagram
     participant REQ as Inbound request<br/>(x-user-id, x-tenant-id headers)
-    participant MW as GUCBridgeMiddleware
+    participant MW as RequireIdentityHeaders → gincommon auth<br/>→ GUCBridgeMiddleware → RequireTenantPathMatch
     participant TX as TxRunner.RunInTx
     participant POOL as pgcommon.Pool<br/>(serviceaccount_app, NOBYPASSRLS)
     participant PG as Postgres
 
     REQ->>MW: mesh-injected identity headers
-    MW->>MW: validate x-user-id == iam-system,<br/>:id path == x-tenant-id (RLS-5)
+    MW->>MW: exactly one UUID per header, else 401 missing_identity_headers<br/>(x-tenant-roles dropped). x-user-id must be the iam-system UUID<br/>00000000-0000-0000-0000-0000000000a1. :id path == x-tenant-id,<br/>else 403 tenant_path_mismatch (RLS-5)
     MW->>TX: ctx carries GUCSet{tenant_id, user_id}
     TX->>POOL: checkout connection
     POOL->>PG: BEGIN<br/>SET LOCAL app.tenant_id = '{tenant}'<br/>(transaction-local only — never SET, never session-wide)
-    PG->>PG: app_tenant_id() reads current_setting('app.tenant_id', true)<br/>STABLE, SECURITY DEFINER, fail-closed (NULL on any error)
-    PG->>PG: rls_check_tenant(row.tenant_id, table)<br/>USING + WITH CHECK on every policy
+    PG->>PG: app_tenant_id() reads current_setting('app.tenant_id', true)<br/>STABLE, SECURITY DEFINER, search_path pinned,<br/>fail-closed (NULL on any error)
+    PG->>PG: rls_check_tenant(row.tenant_id, table)<br/>USING + WITH CHECK on every policy<br/>on failure: log_rls_violation() → rls_violation_log<br/>(1% sampled, migration 000003), still returns false
     Note over PG: FORCE ROW LEVEL SECURITY — applies even to<br/>the table owner. No app.tenant_id set → 0 rows /<br/>write rejected (fail-closed), never "no restriction".
     PG-->>TX: query result (tenant-filtered)
     TX->>POOL: COMMIT — GUC is transaction-local, cleared automatically
     POOL-->>PG: connection returned to pool with no residual GUC
 
-    Note over TX,PG: Contrast: cmd/rotator's ReconcilerRepository uses a<br/>SEPARATE pool bound to serviceaccount_reconciler<br/>(BYPASSRLS, SELECT-only, no GUCProvider) — it never<br/>sets app.tenant_id and enumerates across all tenants<br/>by design, then opens a normal serviceaccount_app<br/>tx (GUC set) for each per-tenant write.
+    Note over TX,PG: Contrast: a SEPARATE pool bound to serviceaccount_reconciler<br/>(BYPASSRLS, SELECT-only, no GUCProvider) serves cmd/rotator's and<br/>cmd/scheduler's cross-tenant enumeration and cmd/server's exporters<br/>and JWKS known-tenant refresher. It never sets app.tenant_id. Every<br/>resulting write opens a normal serviceaccount_app tx with the row's<br/>own tenant GUC. The public JWKS route binds the GUC from the<br/>:id path parameter instead of a header (tenant only).

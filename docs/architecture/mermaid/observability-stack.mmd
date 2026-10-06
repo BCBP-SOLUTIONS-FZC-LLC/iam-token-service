@@ -1,28 +1,45 @@
-%% Middleware pipeline + emitted telemetry (LLD §11). Metrics served on a
-%% dedicated port, separate from the API port.
+%% Startup registration order, middleware pipeline and emitted telemetry
+%% (LLD §11). Metrics served on a dedicated port, separate from the API port;
+%% ServiceMonitor + PodMonitor (CronJob pods), both with honorLabels.
 graph LR
-    subgraph REQ["Inbound request"]
-        R1["PanicRecovery"] --> R2["RequestID"]
+    subgraph BOOT["Startup — all four binaries, in this order"]
+        B1["gincommon.InitTracingWithConfig<br/>(APP_NAME, version, domain, environment)"] --> B2["gincommon.ObservabilityMiddlewares(cfg)<br/>fixes the metric identity"]
+        B2 --> B3["metrics.InitLibraryMetrics<br/>(events.InitMetrics, pgmetrics.InitWithIdentity)"]
+        B3 --> B4["metrics.Register<br/>(adopts platform-events' shared collectors)"]
+        B4 --> B5["pgcommon.NewPool<br/>(Tracer = gincommon.NewSpanTracer)"]
+    end
+
+    subgraph REQ["Inbound request (cmd/server)"]
+        R0["1 MB body cap"] --> R1["PanicRecovery"]
+        R1 --> R2["RequestID"]
         R2 --> R3["Tracing<br/>(OTel span per request)"]
         R3 --> R4["CorrelationHeaders"]
         R4 --> R5["Metrics<br/>(platform_http_request_duration_seconds)"]
-        R5 --> R6["Logging<br/>(slog JSON)"]
-        R6 --> R7["RequireAuth<br/>(iam-system only)"]
-        R7 --> R8["ContextMiddleware"]
-        R8 --> R9["GUCBridgeMiddleware<br/>(SET LOCAL app.tenant_id)"]
-        R9 --> HANDLER["Handler"]
+        R5 --> R6["Logging<br/>(Zap JSON)"]
+        R6 --> RT["Timeout<br/>(Config.RequestTimeout 30s —<br/>innermost, so a 503 is recorded as 503)"]
+        RT --> RI["RequireIdentityHeaders<br/>(401 missing_identity_headers)"]
+        RI --> R7["gincommon ProtectedMiddlewares<br/>(RequireAuth, ContextMiddleware)"]
+        R7 --> R9["GUCBridgeMiddleware<br/>(iam-system only, GUC set for SET LOCAL)"]
+        R9 --> R10["RequireJSONContentType, RequireTenantPathMatch"]
+        R10 --> HANDLER["Handler"]
+        RT -.->|"JWKS route: no identity chain,<br/>rate limiters + GUC from path"| HANDLER
     end
 
-    HANDLER --> SPANS["Use-case spans:<br/>credential.issue_rotate<br/>credential.revoke<br/>consumer.offboarding"]
-    SPANS --> OTLP["OTel Collector<br/>(OTEL_EXPORTER_OTLP_ENDPOINT,<br/>unset in dev = no-op export)"]
+    BOOT --> REQ
 
-    HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(:METRICS_PORT/metrics, separate listener)"]
-    METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor / PrometheusRule)"]
-    PROM --> ALERTS["Alerts: OpenBao failure rate,<br/>stuck rotating versions,<br/>material_reconcile missing_material,<br/>offboarding DLQ depth,<br/>consumed_schema_violations (critical),<br/>platform_outbox_pending_events growth"]
+    HANDLER --> SPANS["Spans: HTTP, db.query (NewSpanTracer),<br/>credential.issue_rotate, credential.revoke,<br/>consumer.offboarding, rotator.* / scheduler.* / exporter.* (NewTracer)"]
+    SPANS --> OTLP["OTel Collector<br/>(OTEL_EXPORTER_OTLP_ENDPOINT;<br/>&quot;none&quot; = no export, trace IDs kept)"]
 
-    HANDLER --> LOGS["Structured logs (slog JSON)<br/>tenant_id, principal_id, version, op, result<br/>— never a credential field (CI secret-log gate)"]
+    HANDLER --> METRICS["Tier 1/2/3 Prometheus metrics<br/>(gincommon.MetricsHandler on<br/>:METRICS_PORT/metrics, separate listener)"]
+    EXPORTERS["cmd/server background loops (reconciler pool)<br/>rotation overlap, RLS violations,<br/>keys_refresh_pending backlog"] --> METRICS
+    JOBS["cmd/rotator / cmd/scheduler run counters<br/>(served for 15s after the run)"] --> METRICS
+    METRICS --> PROM["Prometheus scrape<br/>(ServiceMonitor: server, consumer;<br/>PodMonitor: CronJob pods; honorLabels)"]
+    PROM --> ALERTS["PrometheusRule (app-alerts) + prometheusrule-slo:<br/>OpenBao errors/latency, stuck rotating versions,<br/>missing_material, RLS violations, JWKS key errors / 429s,<br/>keys-refresh backlog, CronJob not running / failed,<br/>offboarding queue/DLQ, invalid envelope id (critical),<br/>consumed_schema_violations (critical), outbox,<br/>SLO-1..4 burn rates"]
+
+    HANDLER --> LOGS["Structured logs (Zap JSON)<br/>tenant_id, principal_id, version, op, result, trace_id<br/>— never a credential field (CI secret-log gate)"]
     LOGS --> AGG["Log aggregation<br/>(CloudWatch / equivalent)"]
 
     style R9 fill:#e8f4fc,stroke:#2980b9
+    style RT fill:#fdf2e3,stroke:#e67e22
     style METRICS fill:#eafaf1,stroke:#27ae60
     style LOGS fill:#fdf2e3,stroke:#e67e22

@@ -8,15 +8,18 @@
 #                       └────────────────┤──► push       (push events only, needs quality too)
 #   validate-quality ───────────────────┘
 #
-# This repo ships THREE binaries from ONE image (see Dockerfile's header
-# comment): /iam-token-service-server (HTTP API TS-1..TS-4 + the
+# This repo ships FOUR binaries from ONE image (see Dockerfile's header
+# comment): /iam-token-service-server (HTTP API TS-1..TS-6 + the
 # outbox.Runner SNS-publish loop) is the image's default ENTRYPOINT;
 # /iam-token-service-consumer (the offboarding-cascade consumer) and
 # /iam-token-service-rotator (the overlap-expiry sweep / orphan-material
-# reconciler / prune CronJob entrypoint) are invoked from the same image
+# reconciler / prune CronJob entrypoint) and /iam-token-service-scheduler
+# (the cadence-rotation CronJob entrypoint) are invoked from the same image
 # with an overridden entrypoint. build-image is therefore a single job, not
-# a matrix — it builds one image; smoke runs the smoke-tests script three
-# times against it (once per binary/entrypoint).
+# a matrix — it builds one image; smoke runs the smoke-tests script four
+# times against it (once per binary/entrypoint). push re-runs all four
+# against the digest it actually pushed (OCI labels make that digest differ
+# from build-image's) before signing it.
 #
 # build-image lints the Dockerfile (Hadolint + .dockerignore check) as its
 # first steps, before the expensive build — a lint failure never starts the
@@ -74,12 +77,17 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # trivy, smoke and push rebuild from this job's cache; they must pass the
+    # SAME build args, or a differing SOURCE_DATE_EPOCH yields a different
+    # image (different layer timestamps) from the one the gates tested.
+    outputs:
+      source_date_epoch: ${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008
@@ -97,18 +105,18 @@ jobs:
 
       # Log in so registry cache reads (and writes on non-fork runs) are authenticated.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # Build and write all layers to GHA + registry cache (no local load needed here).
       - name: Build image → cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -134,20 +142,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: [validate-test, build-image]
     timeout-minutes: 15
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.build-image.outputs.source_date_epoch }}
     permissions:
       contents: read
       security-events: write
       actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -156,12 +166,15 @@ jobs:
           load: true
           tags: iam-token-service-ci-test
           cache-from: type=gha
-          build-args: BUILD_VERSION=${{ github.sha }}
+          # Same build args as build-image, so this is the image it built.
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ needs.build-image.outputs.source_date_epoch }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
       - name: Cache Trivy DB
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/trivy-cache
           key: trivy-db-${{ runner.os }}
@@ -170,7 +183,7 @@ jobs:
 
       # Table format: human-readable in CI logs; fails on CRITICAL/HIGH/UNKNOWN.
       - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: table
@@ -181,7 +194,7 @@ jobs:
 
       # SARIF format: uploads to GitHub Security tab.
       - name: Trivy scan — SARIF upload
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: sarif
@@ -191,14 +204,14 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         continue-on-error: true
         with:
           sarif_file: trivy-results.sarif
 
       # CycloneDX SBOM — full component inventory for compliance / audit.
       - name: Trivy SBOM — CycloneDX
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: iam-token-service-ci-test
           format: cyclonedx
@@ -207,31 +220,33 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ github.sha }}
           path: sbom.cyclonedx.json
           retention-days: 90
 
   # ── gates on validate-test + build-image, runs in parallel with trivy ─────
-  # Smoke-tests ALL THREE binaries this one image carries — the server
-  # entrypoint (default), the consumer entrypoint, and the rotator
-  # entrypoint (both overridden).
+  # Smoke-tests ALL FOUR binaries this one image carries — the server
+  # entrypoint (default), and the consumer, rotator and scheduler
+  # entrypoints (overridden).
   smoke:
     name: Smoke tests
     runs-on: ubuntu-latest
     needs: [validate-test, build-image]
     timeout-minutes: 10
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.build-image.outputs.source_date_epoch }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -240,7 +255,10 @@ jobs:
           load: true
           tags: iam-token-service-ci-test
           cache-from: type=gha
-          build-args: BUILD_VERSION=${{ github.sha }}
+          # Same build args as build-image, so this is the image it built.
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ needs.build-image.outputs.source_date_epoch }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
@@ -264,6 +282,13 @@ jobs:
           ENTRYPOINT: /iam-token-service-rotator
         run: bash .github/scripts/smoke-tests.sh
 
+      - name: Smoke tests (scheduler)
+        env:
+          IMAGE_TAG: iam-token-service-ci-test
+          BINARY: scheduler
+          ENTRYPOINT: /iam-token-service-scheduler
+        run: bash .github/scripts/smoke-tests.sh
+
   # ── posts or updates a single comment on every PR push ───────────────────
   pr-summary:
     name: PR summary
@@ -276,10 +301,10 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Post or update summary comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         with:
@@ -294,7 +319,7 @@ jobs:
   push:
     name: Push image → GHCR
     runs-on: ubuntu-latest
-    needs: [validate-test, trivy, smoke, validate-quality]
+    needs: [validate-test, build-image, trivy, smoke, validate-quality]
     if: github.event_name == 'push'
     # amd64-only publish with provenance/SBOM attestations can exceed 10 minutes.
     timeout-minutes: 25
@@ -305,14 +330,20 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The value build-image used, so this rebuild is the image trivy/smoke
+      # tested (exported to the env too, as buildx reads it from there).
       - name: Set SOURCE_DATE_EPOCH
         id: sde
-        run: bash .github/scripts/set-source-date-epoch.sh
+        env:
+          SDE: ${{ needs.build-image.outputs.source_date_epoch }}
+        run: |
+          echo "SOURCE_DATE_EPOCH=${SDE}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=${SDE}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -320,7 +351,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -328,21 +359,29 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build and push
+      # Pushed ONLY under a candidate tag. The real tags (main, sha-<short>)
+      # are applied by "Publish tags" at the end of this job, after the
+      # digest is scanned and signed — mirrors release.yml, so nothing
+      # pulling :main can get an image that failed the scan.
+      - name: Build and push (candidate)
         id: pushed
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
           # amd64-only by design — release.yml's docker job is also amd64-only.
           platforms: linux/amd64
-          pull: true
+          # No pull: rebuild from the same GHA cache build-image wrote, so the
+          # pushed image is the one trivy/smoke tested — a fresh base-image
+          # pull here would publish layers no gate ever saw. The pushed
+          # digest is re-scanned below before it is signed anyway.
+          pull: false
           push: true
           provenance: true
           sbom: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.IMAGE_NAME }}:candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_VERSION=${{ github.sha }}
@@ -356,8 +395,55 @@ jobs:
             type=gha,mode=max
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
+      # Gate the signature on a scan AND a smoke run of the exact pushed
+      # digest: admission policies trust signed images, so nothing unscanned
+      # or unsmoked gets signed.
+      - name: Scan pushed digest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      # Smoke the exact pushed digest before it is signed or tagged. This
+      # build adds metadata-action OCI labels that the build-image/trivy/smoke
+      # loads do not, so its digest differs from the image the smoke job ran;
+      # the smoke job proved the code, this proves the artifact. Mirrors
+      # release.yml's docker job.
+      - name: Pull pushed digest for smoke tests
+        run: docker pull "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Smoke tests (server, pushed digest)
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          BINARY: server
+        run: bash .github/scripts/smoke-tests.sh
+
+      - name: Smoke tests (consumer, pushed digest)
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          BINARY: consumer
+          ENTRYPOINT: /iam-token-service-consumer
+        run: bash .github/scripts/smoke-tests.sh
+
+      - name: Smoke tests (rotator, pushed digest)
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          BINARY: rotator
+          ENTRYPOINT: /iam-token-service-rotator
+        run: bash .github/scripts/smoke-tests.sh
+
+      - name: Smoke tests (scheduler, pushed digest)
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          BINARY: scheduler
+          ENTRYPOINT: /iam-token-service-scheduler
+        run: bash .github/scripts/smoke-tests.sh
+
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       # Keyless signing via Sigstore OIDC — no long-lived key to rotate or leak.
       # Verifiable with: cosign verify --certificate-identity-regexp ACTOR \
@@ -374,6 +460,19 @@ jobs:
             --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/heads/main$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      # Scanned and signed: point the real tags at that digest. imagetools
+      # copies the manifest by digest, attestations included.
+      - name: Publish tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+        run: |
+          args=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=(--tag "$t")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$SOURCE"
 
       - name: Log image digest
         env:

@@ -188,3 +188,21 @@ func TestInstrumentedSecretStore_List_ErrorPassesThrough(t *testing.T) {
 func TestNewInstrumentedSecretStore_SatisfiesSecretStorePort(t *testing.T) {
 	var _ port.SecretStore = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{})
 }
+
+// Read (the JWKS hot path) and List are recorded on the Tier-1 dependency
+// metric only — the Tier-3 op label set stays frozen at write|delete.
+func TestInstrumentedSecretStore_ReadAndListRecordTier1Only(t *testing.T) {
+	Register("test")
+	readOK := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "read", OutcomeSuccess)
+	readErr := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "read", OutcomeError)
+	listOK := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "list", OutcomeSuccess)
+	beforeReadOK, beforeReadErr, beforeListOK := histogramSampleCount(t, readOK), histogramSampleCount(t, readErr), histogramSampleCount(t, listOK)
+
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{readVal: "k"}).Read(context.Background(), "p")
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{readErr: errors.New("403")}).Read(context.Background(), "p")
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{listVal: []string{"v1"}}).List(context.Background(), "p")
+
+	assert.Equal(t, beforeReadOK+1, histogramSampleCount(t, readOK))
+	assert.Equal(t, beforeReadErr+1, histogramSampleCount(t, readErr), "read errors are visible")
+	assert.Equal(t, beforeListOK+1, histogramSampleCount(t, listOK))
+}

@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -34,31 +35,53 @@ func NewJWKSService(principals port.PrincipalRepository, credentials port.Creden
 	return &JWKSService{principals: principals, credentials: credentials, secrets: secrets, log: log}
 }
 
+// JWKSResult is PublicKeys' outcome.
+type JWKSResult struct {
+	// Keys is the JWK Set entries served (never nil).
+	Keys []map[string]any
+	// Skipped counts live credentials whose OpenBao material could not be
+	// read/parsed (production-readiness review, TS-D15) — see PublicKeys.
+	Skipped int
+	// ActiveSkipped is true when the skipped credentials include the
+	// principal's `active` one (TS-D23) — the key the automation principal
+	// is signing with today. Serving the remaining (overlap) keys without
+	// it would make Keycloak cache a set that rejects every current
+	// client_assertion, so the handler answers 503 instead.
+	ActiveSkipped bool
+}
+
+// Unservable reports whether the set must not be served as a 200: the
+// active key is unreadable, or every live key is (TS-D23). Either way the
+// right answer is a 5xx, so Keycloak keeps the keys it already has.
+func (r *JWKSResult) Unservable() bool {
+	return r.ActiveSkipped || (r.Skipped > 0 && len(r.Keys) == 0)
+}
+
 // PublicKeys returns the JWK Set entries for every `active`/`rotating`
 // credential of tenantID's platform_automation principal — both statuses,
 // so a rotated-but-not-yet-swept prior key still verifies during its
 // overlap window (§6.2). A `revoked` credential is never included: that is
 // the enforcement point that makes RP-17's revoke path (§2.5,
 // ClearServiceAccountKeysCache) actually take effect at Keycloak once
-// called. Returns an empty (never nil) slice for an unknown tenant/absent
-// principal — this is a public, unauthenticated endpoint (Keycloak's own
-// outbound fetch carries no caller identity), so existence is never
-// signaled via an empty-vs-error distinction.
+// called. Returns an empty (never nil) key slice for an unknown
+// tenant/absent principal — this is a public, unauthenticated endpoint
+// (Keycloak's own outbound fetch carries no caller identity), so existence
+// is never signaled via an empty-vs-error distinction.
 //
-// skipped counts live credentials whose OpenBao material could not be
+// Skipped counts live credentials whose OpenBao material could not be
 // read/parsed (production-readiness review, TS-D15) — a credential this
-// service believes is live but cannot actually serve. This still degrades
-// gracefully (the tenant's OTHER live keys, if any, are still returned —
-// dropping the whole response over one bad row would be worse), but a
-// silently-partial 200 here means Keycloak cannot validate that specific
-// key, i.e. a real per-credential auth outage masquerading as success;
-// skipped lets the caller (JWKSHandler) make that observable
-// (iam_token_service_jwks_key_errors_total) instead of it only ever
-// reaching a log line.
-func (s *JWKSService) PublicKeys(ctx context.Context, tenantID uuid.UUID) (keys []map[string]any, skipped int, err error) {
+// service believes is live but cannot actually serve. Losing only an
+// overlap (`rotating`) key still degrades gracefully: the remaining keys
+// are returned (dropping the whole response over one old key would be
+// worse), and Skipped lets the caller (JWKSHandler) make that observable
+// (iam_token_service_jwks_key_errors_total). Losing the `active` key is
+// flagged in ActiveSkipped (TS-D23): see JWKSResult.Unservable. A read
+// that failed because ctx ended is not a key error: PublicKeys returns
+// ctx.Err() instead.
+func (s *JWKSService) PublicKeys(ctx context.Context, tenantID uuid.UUID) (*JWKSResult, error) {
 	principals, err := s.principals.ListByTenant(ctx, tenantID)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	var principal *domain.ServiceAccountPrincipal
@@ -69,33 +92,51 @@ func (s *JWKSService) PublicKeys(ctx context.Context, tenantID uuid.UUID) (keys 
 		}
 	}
 	if principal == nil {
-		return []map[string]any{}, 0, nil
+		return &JWKSResult{Keys: []map[string]any{}}, nil
 	}
 
 	creds, err := s.credentials.ListByPrincipal(ctx, tenantID, principal.ID)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
-	keys = make([]map[string]any, 0, len(creds))
+	res := &JWKSResult{Keys: make([]map[string]any, 0, len(creds))}
+	now := time.Now().UTC()
 	for _, c := range creds {
 		if c.Status != domain.CredentialStatusActive && c.Status != domain.CredentialStatusRotating {
 			continue
 		}
+		// A rotating key whose overlap has already closed is revoked by the
+		// next sweep; until then it must not be served, or a Keycloak
+		// unknown-kid re-fetch could re-learn a key that is meant to be gone.
+		if c.IsExpiredOverlap(now) {
+			continue
+		}
 		jwk, jwkErr := s.jwkFor(ctx, c)
 		if jwkErr != nil {
-			skipped++
+			// The caller went away (client disconnect, request deadline):
+			// the read failed because of that, not because the credential's
+			// material is unreadable — it is not a key error, and there is
+			// no one left to serve a partial set to.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			res.Skipped++
+			if c.Status == domain.CredentialStatusActive {
+				res.ActiveSkipped = true
+			}
 			if s.log != nil {
-				s.log.Warn("jwks: skipping unreadable credential", map[string]interface{}{
+				s.log.Warn("jwks: skipping unreadable credential", withTraceID(ctx, map[string]interface{}{
 					"tenant_id": tenantID.String(), "principal_id": principal.ID.String(),
-					"credential_id": c.ID.String(), "version": c.Version, "error": jwkErr.Error(),
-				})
+					"credential_id": c.ID.String(), "version": c.Version, "status": string(c.Status),
+					"error": jwkErr.Error(),
+				}))
 			}
 			continue
 		}
-		keys = append(keys, jwk)
+		res.Keys = append(res.Keys, jwk)
 	}
-	return keys, skipped, nil
+	return res, nil
 }
 
 // jwkFor reads c's PEM-encoded private key from OpenBao and derives its

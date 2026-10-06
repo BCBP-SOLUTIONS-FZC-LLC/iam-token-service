@@ -54,7 +54,7 @@ type principalResponseBody struct {
 // (§5.4). 201 on first creation, 200 on an idempotent repeat.
 //
 // @Summary      TS-4 — Register service-account principal
-// @Description  Registers the per-tenant platform-automation service-account principal. Idempotent on (tenant_id, keycloak_client_id) — repeating an already-registered request returns 200 with the existing record instead of erroring.
+// @Description  Registers the per-tenant platform-automation service-account principal. Idempotent on (tenant_id, principal_type) — repeating an already-registered request returns 200 with the existing record, and a re-mint (new principal_sub/keycloak_client_id) updates it in place, keeping principal_id. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         ServiceAccounts
 // @Accept       json
 // @Produce      json
@@ -62,13 +62,14 @@ type principalResponseBody struct {
 // @Param        request  body      registerRequestBody   true  "Principal registration"
 // @Success      200      {object}  principalResponseBody  "already registered — idempotent repeat"
 // @Success      201      {object}  principalResponseBody  "created"
-// @Failure      400      {object}  ErrorResponse  "invalid_request"
-// @Failure      401      {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      500      {object}  ErrorResponse
-// @Failure      503      {object}  ErrorResponse  "db_unavailable"
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
+// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; the principal row is locked by a concurrent credential write)"
+// @Failure      415  {object}  ErrorResponse  "unsupported_media_type"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts [post]
 func (h *PrincipalHandler) Register(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())
@@ -140,19 +141,19 @@ type readPrincipalResponseBody struct {
 // metadata only, never touches OpenBao, never returns a secret (§5.6).
 //
 // @Summary      TS-3 — Read service-account principal
-// @Description  Returns principal metadata and a summary of every credential version (status, OpenBao path, issued/expires timestamps) — never the credential plaintext itself (§5.6).
+// @Description  Returns principal metadata and a summary of every credential version (status, OpenBao path, issued/expires timestamps) — never the credential plaintext itself (§5.6). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         ServiceAccounts
 // @Produce      json
 // @Param        id            path      string  true  "Tenant UUID"     format(uuid)
 // @Param        principal_id  path      string  true  "Principal UUID"  format(uuid)
 // @Success      200           {object}  readPrincipalResponseBody
-// @Failure      400           {object}  ErrorResponse  "invalid_request"
-// @Failure      401           {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      404           {object}  ErrorResponse  "principal_not_found"
-// @Failure      500           {object}  ErrorResponse
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
+// @Failure      404  {object}  ErrorResponse  "principal_not_found"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id} [get]
 func (h *PrincipalHandler) Read(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())
@@ -210,19 +211,19 @@ func (h *PrincipalHandler) Read(c *gin.Context) {
 // callers checking "is this a service account" have no need for it.
 //
 // @Summary      TS-5 — Find service-account principal by Keycloak sub
-// @Description  Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer "does this subject resolve to a service_account-typed Keycloak principal" without ever generating principal_sub itself (TS-INV-1).
+// @Description  Looks up a principal by its Keycloak sub rather than this service's own internal id (AUTH-9) — the signal another service needs to answer "does this subject resolve to a service_account-typed Keycloak principal" without ever generating principal_sub itself (TS-INV-1). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         ServiceAccounts
 // @Produce      json
 // @Param        id             path      string  true  "Tenant UUID"          format(uuid)
 // @Param        principal_sub  query     string  true  "Keycloak sub UUID"    format(uuid)
 // @Success      200            {object}  principalResponseBody
-// @Failure      400            {object}  ErrorResponse  "invalid_request"
-// @Failure      401            {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      404            {object}  ErrorResponse  "principal_not_found"
-// @Failure      500            {object}  ErrorResponse
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
+// @Failure      404  {object}  ErrorResponse  "principal_not_found"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts [get]
 func (h *PrincipalHandler) FindBySub(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())
@@ -268,19 +269,18 @@ type automationPrincipalResponseBody struct {
 // credential metadata.
 //
 // @Summary      TS-6 — Read the tenant's platform-automation principal
-// @Description  Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material.
+// @Description  Returns the tenant's platform-automation principal, including its Keycloak sub (principal_sub) — the subject a caller names as the acting principal (e.g. Workflow's connector callbacks). principal_sub is stable across credential rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints the client in another realm; principal_id is stable across both. Never returns credential metadata or material. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         ServiceAccounts
 // @Produce      json
 // @Param        id   path      string  true  "Tenant UUID"  format(uuid)
 // @Success      200  {object}  automationPrincipalResponseBody
 // @Failure      400  {object}  ErrorResponse  "invalid_request"
 // @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
 // @Failure      404  {object}  ErrorResponse  "principal_not_found"
 // @Failure      500  {object}  ErrorResponse
 // @Failure      503  {object}  ErrorResponse  "db_unavailable"
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/platform-automation [get]
 func (h *PrincipalHandler) ReadPlatformAutomation(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())

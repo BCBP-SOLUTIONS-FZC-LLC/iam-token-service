@@ -26,6 +26,17 @@
 #   push → main  (schema files changed)           → staging   (validate + diff + register)
 #   release published                             → production
 #   workflow_dispatch                              → chosen environment
+#   workflow_call (release.yml, before deploy-gate) → inputs.environment
+#                                                    (production) at inputs.release_tag
+#
+# release.yml calls this workflow directly: a release created with
+# GITHUB_TOKEN never triggers `release: published`, and the image's GlueCodec
+# fails startup on an unregistered schema, so registration must finish before
+# the deploy. Inside a called workflow github.event_name is the CALLER's
+# event (a tag push), so every job keys off inputs.release_tag — set only by
+# workflow_call — to keep the push-triggered staging job from also running.
+# The calling job must grant contents: write and id-token: write and pass
+# `secrets: inherit` (GO_PRIVATE_TOKEN, PUSHGATEWAY_URL, ALARM_SNS_ARN).
 #
 # Step order — staging / production jobs (full pipeline):
 #   1. Validate schemas        — schema-gov validate (JSON syntax, draft-07 meta-schema, enum
@@ -81,6 +92,22 @@ name: Glue Schema Registry
       - 'api/asyncapi.yaml'
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment (staging | production)'
+        required: false
+        type: string
+        default: production
+      release_tag:
+        description: 'Git ref (release tag) whose schemas are registered'
+        required: true
+        type: string
+      force:
+        description: 'Force registration even if SCHEMA_FREEZE is set'
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       environment:
@@ -107,26 +134,29 @@ jobs:
     name: Register schemas → staging
     runs-on: ubuntu-latest
     if: |
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+      (inputs.release_tag && inputs.environment == 'staging') ||
+      (!inputs.release_tag && (github.event_name == 'push' ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')))
     environment: staging
     permissions:
       contents: write
       id-token: write   # OIDC — AWS role assumption, no long-lived keys (§13.5)
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2    # HEAD~1 needed for the enum semantic drift check
 
       - name: Set up Python (schema-gov)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
 
       - name: Install schema-gov (platform-schemagov v0.4.0)
+        env:
+          GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
         run: |
-          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
+          pip install --no-cache-dir "git+https://x-access-token:${GO_PRIVATE_TOKEN}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
@@ -150,7 +180,7 @@ jobs:
             echo "::warning title=Freeze Override::SCHEMA_FREEZE set on ${ENVIRONMENT} but force=true — proceeding."
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -334,13 +364,16 @@ jobs:
 
       - name: Emit metrics
         if: always()
+        env:
+          ALARM_SNS_ARN: ${{ secrets.ALARM_SNS_ARN }}
+          PUSHGATEWAY_URL: ${{ secrets.PUSHGATEWAY_URL }}
         run: |
           schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              staging \
             --job-status       "${{ job.status }}" \
-            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
-            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --pushgateway-url  "${PUSHGATEWAY_URL}" \
+            --alarm-sns-arn    "${ALARM_SNS_ARN}" \
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
@@ -351,27 +384,30 @@ jobs:
     name: Register schemas → production
     runs-on: ubuntu-latest
     if: |
-      github.event_name == 'release' ||
-      (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
+      (inputs.release_tag && inputs.environment == 'production') ||
+      (!inputs.release_tag && (github.event_name == 'release' ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')))
     environment: production
     permissions:
       contents: write
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || github.ref }}
+          ref: ${{ inputs.release_tag || github.event.release.tag_name || github.ref }}
           fetch-depth: 2
 
       - name: Set up Python (schema-gov)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
 
       - name: Install schema-gov (platform-schemagov v0.4.0)
+        env:
+          GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
         run: |
-          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
+          pip install --no-cache-dir "git+https://x-access-token:${GO_PRIVATE_TOKEN}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
@@ -393,7 +429,7 @@ jobs:
             echo "::warning title=Freeze Override::SCHEMA_FREEZE set on ${ENVIRONMENT} but force=true — proceeding."
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -553,13 +589,16 @@ jobs:
 
       - name: Emit metrics
         if: always()
+        env:
+          ALARM_SNS_ARN: ${{ secrets.ALARM_SNS_ARN }}
+          PUSHGATEWAY_URL: ${{ secrets.PUSHGATEWAY_URL }}
         run: |
           schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              production \
             --job-status       "${{ job.status }}" \
-            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
-            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --pushgateway-url  "${PUSHGATEWAY_URL}" \
+            --alarm-sns-arn    "${ALARM_SNS_ARN}" \
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \
@@ -578,25 +617,27 @@ jobs:
   pr-check:
     name: Schema diff check (PR → staging)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && !inputs.release_tag
     environment: staging
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
 
       - name: Set up Python (schema-gov)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
 
       - name: Install schema-gov (platform-schemagov v0.4.0)
+        env:
+          GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
         run: |
-          pip install --no-cache-dir "git+https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
+          pip install --no-cache-dir "git+https://x-access-token:${GO_PRIVATE_TOKEN}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-schemagov.git@v0.4.0"
 
       - name: Validate schemas
         run: |
@@ -618,7 +659,7 @@ jobs:
 
       - name: Configure AWS credentials (OIDC)
         if: steps.aws_check.outputs.configured == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -704,13 +745,16 @@ jobs:
 
       - name: Emit metrics
         if: always()
+        env:
+          ALARM_SNS_ARN: ${{ secrets.ALARM_SNS_ARN }}
+          PUSHGATEWAY_URL: ${{ secrets.PUSHGATEWAY_URL }}
         run: |
           schema-gov metrics \
             --registry         "${{ vars.GLUE_REGISTRY_SERVICEACCOUNT_NAME }}" \
             --env              staging \
             --job-status       "${{ job.status }}" \
-            --pushgateway-url  "${{ secrets.PUSHGATEWAY_URL }}" \
-            --alarm-sns-arn    "${{ secrets.ALARM_SNS_ARN }}" \
+            --pushgateway-url  "${PUSHGATEWAY_URL}" \
+            --alarm-sns-arn    "${ALARM_SNS_ARN}" \
             --orphan-threshold "${{ vars.ORPHAN_ALERT_THRESHOLD || '5' }}" \
             --spike-threshold  "${{ vars.REGISTRATIONS_SPIKE_THRESHOLD || '10' }}" \
             --unused-threshold "${{ vars.UNUSED_EVENTS_ALERT_THRESHOLD || '1' }}" \

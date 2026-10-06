@@ -5,6 +5,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -28,13 +29,15 @@ var _ port.ReconcilerRepository = (*ReconcilerRepository)(nil)
 // ListExpiredRotating enumerates every `rotating` credential across all
 // tenants whose expires_at has passed (§8.3) — the exact partial index
 // idx_sac_overlap exists for.
-func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context) ([]port.ExpiredRotatingCredential, error) {
+func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context, limit int) ([]port.ExpiredRotatingCredential, error) {
 	var out []port.ExpiredRotatingCredential
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT tenant_id, principal_id, version, openbao_path
 			FROM service_account_credentials
-			WHERE status = 'rotating' AND expires_at IS NOT NULL AND expires_at < now() AND deleted_at IS NULL`)
+			WHERE status = 'rotating' AND expires_at IS NOT NULL AND expires_at < now() AND deleted_at IS NULL
+			ORDER BY expires_at, id
+			LIMIT $1`, limit)
 		if err != nil {
 			return err
 		}
@@ -57,13 +60,15 @@ func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context) ([]port.
 // ListDueForRotation enumerates every `active` credential across all
 // tenants whose next_rotation_at has passed (§16 TSQ-6 Resolved) — the
 // exact partial index idx_sac_next_rotation exists for.
-func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context) ([]port.DueForRotation, error) {
+func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context, limit int) ([]port.DueForRotation, error) {
 	var out []port.DueForRotation
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT tenant_id, principal_id, version
 			FROM service_account_credentials
-			WHERE status = 'active' AND next_rotation_at IS NOT NULL AND next_rotation_at < now() AND deleted_at IS NULL`)
+			WHERE status = 'active' AND next_rotation_at IS NOT NULL AND next_rotation_at < now() AND deleted_at IS NULL
+			ORDER BY next_rotation_at, id
+			LIMIT $1`, limit)
 		if err != nil {
 			return err
 		}
@@ -84,33 +89,51 @@ func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context) ([]port.D
 }
 
 // ListPrincipalMaterialStates enumerates the principal registry across all
-// tenants with each principal's committed credential versions (§8.6). A
-// principal with no credential rows yet (freshly registered, TS-1 never
-// called) yields MaxVersion=0 and an empty CommittedVersions — the
-// reconciler then treats every OpenBao entry found under its prefix, if
-// any, as an orphan.
+// tenants with every credential row (§8.6). A principal with no credential
+// rows yet (freshly registered, TS-1 never called, or a TS-1 that crashed
+// between its OpenBao write and its commit) yields MaxVersion=0 and no
+// Credentials. This is a lock-free snapshot: cmd/rotator treats material no
+// row claims here only as an orphan CANDIDATE, and deletes it after taking
+// the principal's row lock (the lock TS-1 holds across its OpenBao write
+// and commit) and re-checking under it that still no row claims the
+// version — not by comparing against MaxVersion.
 func (r *ReconcilerRepository) ListPrincipalMaterialStates(ctx context.Context) ([]port.PrincipalMaterialState, error) {
 	var out []port.PrincipalMaterialState
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT p.tenant_id, p.id, p.keycloak_client_id,
-			       COALESCE(MAX(c.version), 0) AS max_version,
-			       COALESCE(array_agg(c.version) FILTER (WHERE c.version IS NOT NULL), '{}') AS committed_versions
+			       c.version, c.openbao_path, c.status IN ('active', 'rotating')
 			FROM service_account_principals p
 			LEFT JOIN service_account_credentials c
 			       ON c.principal_id = p.id AND c.deleted_at IS NULL
 			WHERE p.deleted_at IS NULL
-			GROUP BY p.tenant_id, p.id, p.keycloak_client_id`)
+			ORDER BY p.id, c.version`)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
+		var cur *port.PrincipalMaterialState
 		for rows.Next() {
-			var st port.PrincipalMaterialState
-			if err := rows.Scan(&st.TenantID, &st.PrincipalID, &st.KeycloakClientID, &st.MaxVersion, &st.CommittedVersions); err != nil {
+			var (
+				st      port.PrincipalMaterialState
+				version *int
+				path    *string
+				live    *bool
+			)
+			if err := rows.Scan(&st.TenantID, &st.PrincipalID, &st.KeycloakClientID, &version, &path, &live); err != nil {
 				return err
 			}
-			out = append(out, st)
+			if cur == nil || cur.PrincipalID != st.PrincipalID {
+				out = append(out, st)
+				cur = &out[len(out)-1]
+			}
+			if version == nil {
+				continue // principal with no credential rows (LEFT JOIN)
+			}
+			cur.Credentials = append(cur.Credentials, port.CredentialMaterial{
+				Version: *version, OpenBaoPath: deref(path), Live: live != nil && *live,
+			})
+			cur.MaxVersion = max(cur.MaxVersion, *version)
 		}
 		return rows.Err()
 	})
@@ -118,4 +141,25 @@ func (r *ReconcilerRepository) ListPrincipalMaterialStates(ctx context.Context) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// IsCredentialLive reports whether the credential is still `active` or
+// `rotating` right now (false when it was revoked or no longer exists).
+func (r *ReconcilerRepository) IsCredentialLive(ctx context.Context, principalID uuid.UUID, version int) (bool, error) {
+	var live bool
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM service_account_credentials
+			                WHERE principal_id = $1 AND version = $2
+			                  AND status IN ('active', 'rotating') AND deleted_at IS NULL)`,
+			principalID, version).Scan(&live)
+	})
+	return live, err
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

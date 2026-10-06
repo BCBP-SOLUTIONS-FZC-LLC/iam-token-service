@@ -75,6 +75,33 @@ func (r *PrincipalRepository) FindByID(ctx context.Context, tenantID, principalI
 	return out, nil
 }
 
+// LockForUpdate returns the (tenantID, principalID) principal with a row
+// lock held until the caller's transaction ends (port.PrincipalRepository).
+func (r *PrincipalRepository) LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	var out *domain.ServiceAccountPrincipal
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+principalColumns+` FROM service_account_principals
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			FOR UPDATE`, principalID, tenantID)
+		found, scanErr := scanPrincipal(row)
+		if scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				return domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+			}
+			// 55P03 (lock_timeout) is mapped to rotation_in_flight by
+			// withPool's wrapConnErrCtx.
+			return scanErr
+		}
+		out = found
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FindByPrincipalSub returns the (tenantID, principalSub) principal under
 // the caller's RLS-scoped tenant, or domain.ErrPrincipalNotFound — the
 // TS-5 lookup-by-Keycloak-sub (§5.5, AUTH-9).
@@ -181,13 +208,28 @@ func (r *PrincipalRepository) Register(ctx context.Context, p *domain.ServiceAcc
 	return out, created, updated, nil
 }
 
-// ListByTenant returns every principal row for tenantID (§8.4).
+// ListByTenant returns every principal row for tenantID (§8.4) — a plain
+// read without locks (the public JWKS route uses it).
 func (r *PrincipalRepository) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	return r.listByTenant(ctx, tenantID, "")
+}
+
+// LockByTenant is ListByTenant with the rows locked FOR UPDATE until the
+// caller's transaction ends (the offboarding cascade's read).
+func (r *PrincipalRepository) LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	return r.listByTenant(ctx, tenantID, " FOR UPDATE")
+}
+
+func (r *PrincipalRepository) listByTenant(ctx context.Context, tenantID uuid.UUID, lockClause string) ([]*domain.ServiceAccountPrincipal, error) {
 	var out []*domain.ServiceAccountPrincipal
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT `+principalColumns+` FROM service_account_principals
-			WHERE tenant_id = $1 AND deleted_at IS NULL`, tenantID)
+			WHERE tenant_id = $1 AND deleted_at IS NULL`+lockClause, tenantID)
+		// A FOR UPDATE lock wait that exceeds lock_timeout surfaces from
+		// rows.Next()/rows.Err() in pgx v5 (Query only sends the statement),
+		// so every error path returns through withPool's wrapConnErrCtx,
+		// which maps 55P03 to rotation_in_flight.
 		if err != nil {
 			return err
 		}

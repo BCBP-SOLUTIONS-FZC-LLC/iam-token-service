@@ -140,14 +140,16 @@ help:
 	@echo "  make build           - compile all four binaries to bin/"
 	@echo "  make cover           - coverage HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + gates + test-ci + build"
+	@echo "  make metrics-lint    - platform-gincommon metricslint on a real scrape + metric-registry.md drift"
+	@echo "  make metrics-inventory - regenerate docs/observability/metric-registry.md"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + gates + metrics-lint + test-ci + build"
 	@echo "  make docker-up       - start local infra (Postgres/PgBouncer/Floci/OpenBao) + floci-ui web console"
 	@echo "  make docker-down     - stop local containers"
 	@echo "  make docker-run-app  - build+run the containerized server+consumer (requires .go_private_token)"
 	@echo "  make docker-run-rotator - run the rotator once, then exit (requires .go_private_token)"
 	@echo "  make docker-run-scheduler - run the cadence scheduler once, then exit (requires .go_private_token)"
 	@echo "  make mod-verify      - go mod verify"
-	@echo "  make vuln-check      - govulncheck on internal + pkg"
+	@echo "  make vuln-check      - govulncheck on every package, cmd/ included"
 	@echo "  make sast            - gosec static-analysis scan (SAST)"
 	@echo "  make extract-schemas - derive internal/adapter/outbound/eventbus/schemas/*.json"
 	@echo "  make swag            - regenerate docs/swagger/ from handler annotations (mirrors sibling iam-org-membership)"
@@ -198,7 +200,7 @@ mod-verify:
 
 .PHONY: vuln-check
 vuln-check:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./internal/... ./pkg/...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
 # gosec is a Go-code SAST scanner — distinct from vuln-check (known-CVE Go
 # module versions) and the release pipeline's Trivy scan (OS/container
@@ -255,6 +257,19 @@ metrics-taxonomy:
 
 .PHONY: gates
 gates: no-gocloak no-secret-log set-local-only gincommon-obs metrics-taxonomy
+
+# metrics-lint: platform-gincommon's metricslint over a real /metrics scrape
+# and the alert/dashboard/runbook references, plus the
+# docs/observability/metric-registry.md drift check (same script CI runs).
+.PHONY: metrics-lint
+metrics-lint:
+	bash .github/scripts/metricslint.sh
+
+# metrics-inventory: regenerate docs/observability/metric-registry.md from the
+# pinned registry and a real scrape (metrics-lint fails when it is stale).
+.PHONY: metrics-inventory
+metrics-inventory:
+	METRICS_INVENTORY_WRITE=1 bash .github/scripts/metricslint.sh
 
 # -----------------------------
 # TESTS
@@ -346,7 +361,7 @@ test-e2e:
 
 .PHONY: test-smoke
 test-smoke:
-	@test -n "$(IMAGE_TAG)" || { echo "Usage: make test-smoke IMAGE_TAG=<tag> BINARY=server|consumer|rotator [ENTRYPOINT=/iam-token-service-<binary>]"; exit 1; }
+	@test -n "$(IMAGE_TAG)" || { echo "Usage: make test-smoke IMAGE_TAG=<tag> BINARY=server|consumer|rotator|scheduler [ENTRYPOINT=/iam-token-service-<binary>]"; exit 1; }
 	IMAGE_TAG=$(IMAGE_TAG) BINARY=$(BINARY) ENTRYPOINT=$(ENTRYPOINT) bash .github/scripts/smoke-tests.sh
 
 .PHONY: race
@@ -409,7 +424,7 @@ build:
 
 .PHONY: docker-up
 docker-up:
-	@echo "Starting local PostgreSQL + PgBouncer + floci (SNS/SQS/Glue) + floci-ui (http://localhost:4500) + OpenBao..."
+	@echo "Starting local PostgreSQL + PgBouncer + floci (SNS/SQS/Glue) + floci-ui (http://localhost:4502) + OpenBao..."
 	docker compose up -d postgres pgbouncer floci floci-ui openbao
 
 .PHONY: docker-run-app
@@ -437,7 +452,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint arch-lint gates test-ci build
+ci: tidy fmt-check vet lint arch-lint gates metrics-lint test-ci build
 
 # -----------------------------
 # COVERAGE

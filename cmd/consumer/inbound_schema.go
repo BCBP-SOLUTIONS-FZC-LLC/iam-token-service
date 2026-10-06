@@ -50,7 +50,7 @@ func validateConsumed(h events.Handler, v payloadValidator, log port.Logger) eve
 		}
 		if log != nil {
 			log.Warn("consumed event violates its embedded schema — rejecting to DLQ",
-				map[string]any{"event_id": env.ID, "event_type": env.Type, "source": env.Source, "error": err.Error()})
+				withTraceID(ctx, map[string]any{"event_id": env.ID, "event_type": env.Type, "source": env.Source, "error": err.Error()}))
 		}
 		return fmt.Errorf("%w: %w", errSchemaViolation, err)
 	}

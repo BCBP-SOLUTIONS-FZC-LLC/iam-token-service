@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -56,6 +57,11 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 	}
 	cp := *p
 	return &cp, nil
+}
+
+// LockForUpdate behaves like FindByID in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	return f.FindByID(ctx, tenantID, principalID)
 }
 
 func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
@@ -123,6 +129,17 @@ func (f *fakeCredentialRepository) FindActive(_ context.Context, tenantID, princ
 	return nil, nil
 }
 
+// MaxVersion returns the highest version stored for the principal (any status).
+func (f *fakeCredentialRepository) MaxVersion(_ context.Context, tenantID, principalID uuid.UUID) (int, error) {
+	maxVersion := 0
+	for _, c := range f.byID {
+		if c.TenantID == tenantID && c.PrincipalID == principalID && c.Version > maxVersion {
+			maxVersion = c.Version
+		}
+	}
+	return maxVersion, nil
+}
+
 func (f *fakeCredentialRepository) FindByRotationID(_ context.Context, tenantID, principalID, rotationID uuid.UUID) (*domain.Credential, error) {
 	for _, c := range f.byID {
 		if c.TenantID == tenantID && c.PrincipalID == principalID && c.RotationID != nil && *c.RotationID == rotationID {
@@ -149,6 +166,11 @@ func (f *fakeCredentialRepository) Insert(_ context.Context, c *domain.Credentia
 		c.ID = uuid.New()
 	}
 	c.RecordVersion = 1
+	if c.IssuedAt.IsZero() {
+		// The real column defaults to now(); the rotation_id replay window
+		// is measured from it.
+		c.IssuedAt = time.Now().UTC()
+	}
 	cp := *c
 	f.byID[cp.ID] = &cp
 	return nil
@@ -321,4 +343,61 @@ func TestInstrumentedCredentialService_Revoke_ErrorDoesNotIncrementCounter(t *te
 
 	after := testutilCounterValue(t, CredentialsIssuedTotal.WithLabelValues("revoke"))
 	assert.Equal(t, before, after)
+}
+
+// LockByTenant behaves like ListByTenant in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	return f.ListByTenant(ctx, tenantID)
+}
+
+// TS-D23: every rotation_id replay is counted by outcome — served (the key
+// was handed out again), revoked and expired (refused).
+func TestInstrumentedCredentialService_IssueOrRotate_CountsReplaysByResult(t *testing.T) {
+	Register("test")
+	ctx := context.Background()
+	actor := uuid.New()
+	replays := func(result string) float64 {
+		return testutilCounterValue(t, CredentialReplaysTotal.WithLabelValues(result))
+	}
+
+	t.Run("served", func(t *testing.T) {
+		inner, tenantID, principalID := newTestCredentialService(t)
+		decorated := NewInstrumentedCredentialService(inner)
+		rotationID := uuid.New()
+		_, err := decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.NoError(t, err)
+		before := replays(ReplayServed)
+		_, err = decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.NoError(t, err)
+		assert.InDelta(t, before+1, replays(ReplayServed), 0)
+	})
+
+	t.Run("revoked", func(t *testing.T) {
+		inner, tenantID, principalID := newTestCredentialService(t)
+		decorated := NewInstrumentedCredentialService(inner)
+		rotationID := uuid.New()
+		issued, err := decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.NoError(t, err)
+		_, err = decorated.Revoke(ctx, tenantID, principalID, issued.Version, actor)
+		require.NoError(t, err)
+		before, beforeServed := replays(ReplayRevoked), replays(ReplayServed)
+		_, err = decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.Error(t, err)
+		assert.InDelta(t, before+1, replays(ReplayRevoked), 0)
+		assert.InDelta(t, beforeServed, replays(ReplayServed), 0)
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		inner, tenantID, principalID := newTestCredentialService(t)
+		inner.WithReplayWindow(time.Nanosecond)
+		decorated := NewInstrumentedCredentialService(inner)
+		rotationID := uuid.New()
+		_, err := decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond) // past the 1ns window
+		before := replays(ReplayExpired)
+		_, err = decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: rotationID}, actor)
+		require.Error(t, err)
+		assert.InDelta(t, before+1, replays(ReplayExpired), 0)
+	})
 }

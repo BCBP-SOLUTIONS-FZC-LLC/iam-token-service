@@ -3,15 +3,14 @@ package postgres
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/puddle/v2"
 )
 
@@ -24,31 +23,7 @@ import (
 // instead of two drifting in parallel (§12).
 func DSNFromEnv() string {
 	cfg, _ := pgcommon.ConfigFromEnv()
-	if os.Getenv("DATABASE_URL") != "" {
-		return cfg.DSN
-	}
-	return ApplyStatementTimeout(cfg.DSN)
-}
-
-// ApplyStatementTimeout appends a server-side statement_timeout option to
-// dsn so hung queries release pool connections instead of holding them
-// indefinitely. PG_STATEMENT_TIMEOUT accepts a Go duration string (e.g.
-// "5s", "500ms"). Ignored when dsn is empty or PG_STATEMENT_TIMEOUT is
-// unset. Idempotent: a DSN that already carries statement_timeout is
-// returned unchanged.
-func ApplyStatementTimeout(dsn string) string {
-	if dsn == "" {
-		return dsn
-	}
-	if t := os.Getenv("PG_STATEMENT_TIMEOUT"); t != "" {
-		if d, err := time.ParseDuration(t); err == nil && d > 0 {
-			if strings.Contains(dsn, "statement_timeout") {
-				return dsn
-			}
-			dsn += fmt.Sprintf("&options=-c%%20statement_timeout%%3D%d", d.Milliseconds())
-		}
-	}
-	return dsn
+	return cfg.DSN
 }
 
 // MigrationDSNFromEnv returns the DSN for schema migrations. Migrations
@@ -58,7 +33,7 @@ func ApplyStatementTimeout(dsn string) string {
 // PG_BOUNCER_MODE=true.
 func MigrationDSNFromEnv() string {
 	if dsn := os.Getenv("MIGRATION_DATABASE_URL"); dsn != "" {
-		return ApplyStatementTimeout(dsn)
+		return dsn
 	}
 	return DSNFromEnv()
 }
@@ -72,7 +47,7 @@ func MigrationDSNFromEnv() string {
 // rather than failing to connect.
 func ReconcilerDSNFromEnv() string {
 	if dsn := os.Getenv("RECONCILER_DATABASE_URL"); dsn != "" {
-		return ApplyStatementTimeout(dsn)
+		return dsn
 	}
 	return DSNFromEnv()
 }
@@ -91,14 +66,15 @@ const SystemPoolName = "reconciler"
 // pgcommon.Config{DSN, Logger} literal would leave PGBouncerMode at the
 // Go zero-value false and drop ConfigFromEnv pool sizing.
 //
-// Pool sizing, lifetimes, and SlowQueryThreshold are copied from
-// ConfigFromEnv so the reconciler pool and the app pool share one
-// env-driven source of truth. Tracer is left unset — call sites wire
-// NewOTelTracer so db.query spans export through gincommon's
+// Pool sizing, lifetimes, SlowQueryThreshold and the per-transaction
+// StatementTimeout / LockTimeout (PG_STATEMENT_TIMEOUT / PG_LOCK_TIMEOUT,
+// applied by pgcommon with SET LOCAL) are copied from ConfigFromEnv so the
+// reconciler pool and the app pool share one env-driven source of truth. Tracer is left unset — call sites wire
+// gincommon.NewSpanTracer so db.query spans export through gincommon's
 // TracerProvider.
 func SystemPoolConfig(dsn string, log port.Logger) pgcommon.Config {
 	cfg, _ := pgcommon.ConfigFromEnv()
-	cfg.DSN = ApplyStatementTimeout(dsn)
+	cfg.DSN = dsn
 	cfg.GUCProvider = nil
 	cfg.PGBouncerMode = true
 	cfg.Tracer = nil
@@ -147,7 +123,7 @@ var writeRetryOpts = pgcommon.RetryOptions{
 // unchanged for service-layer classification (§9.1 optimistic-lock
 // conflict, §9.2 idempotency).
 func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	return wrapConnErr(pgcommon.RunInTxWithRetryOpts(ctx, r.pool, pgx.TxOptions{}, writeRetryOpts, func(ctx context.Context, tx pgx.Tx) error {
+	return wrapConnErrCtx(ctx, pgcommon.RunInTxWithRetryOpts(ctx, r.pool, pgx.TxOptions{}, writeRetryOpts, func(ctx context.Context, tx pgx.Tx) error {
 		txCtx := port.WithTx(ctx, tx)
 		if r.events != nil {
 			txCtx = port.WithEventPublisher(txCtx, r.events)
@@ -172,9 +148,9 @@ func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 // binds RLS via pgcommon.RunInTx's checkout hook.
 func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) error {
 	if tx, ok := port.TxFromContext(ctx); ok {
-		return wrapConnErr(fn(tx))
+		return wrapConnErrCtx(ctx, fn(tx))
 	}
-	return wrapConnErr(pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(_ context.Context, tx pgx.Tx) error {
+	return wrapConnErrCtx(ctx, pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(_ context.Context, tx pgx.Tx) error {
 		return fn(tx)
 	}))
 }
@@ -184,12 +160,13 @@ func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) e
 // connectivity/resource classes pass through so the service layer can
 // distinguish an integrity violation from a network outage.
 //
-// SQLSTATE class 08 (connection exception) and 53 (insufficient
-// resources) are classified via pgcommon helpers (v1.3.0, same as
-// iam-user-profile / iam-org-membership). Class 57 (operator
-// intervention) and 58 (system error) have no dedicated helper yet and
-// are matched on the pgconn Error() text. puddle.ErrClosedPool is the
-// other positively-identifiable connectivity failure.
+// isUnavailableSQLState classifies by the *pgconn.PgError's SQLSTATE class
+// (Code[:2]): 08 connection exception, 53 insufficient resources, 57
+// operator intervention (57014 query_canceled only while the request's own
+// context is still live — see wrapConnErrCtx), 58 system error.
+// puddle.ErrClosedPool is the other positively-identifiable connectivity
+// failure. 55P03 lock_not_available is mapped separately, to
+// domain.ErrRotationInFlight (TS-D22).
 //
 // Everything else — including a caller's own business error returned
 // from inside RunInTx/withPool, and a transport-level failure that never
@@ -199,8 +176,19 @@ func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) e
 // a misleading "database unavailable" 503 — the bug fixed in
 // iam-user-profile / iam-org-membership. HTTP HandleError independently
 // classifies a leaked PgError of these same connectivity/resource
-// classes into 503 via the same pgcommon helpers.
+// classes into 503 (and 55P03 into 409).
 func wrapConnErr(err error) error {
+	return wrapConnErrCtx(context.Background(), err)
+}
+
+// wrapConnErrCtx is wrapConnErr for a call made under ctx. It also maps
+// SQLSTATE 55P03 to domain.ErrRotationInFlight (errLockNotAvailable). SQLSTATE 57014
+// (query_canceled) covers both a server-side statement_timeout — a genuine
+// "database too slow" condition, classified db_unavailable — and pgx
+// cancelling the statement because ctx ended (client disconnect, request
+// deadline). The latter is not a database outage: the error is returned
+// unchanged so it is never counted as db_unavailable.
+func wrapConnErrCtx(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -208,21 +196,55 @@ func wrapConnErr(err error) error {
 	if errors.As(err, &de) {
 		return err
 	}
-	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
+	if isQueryCanceled(err) && ctx.Err() != nil {
+		return err
+	}
+	if isLockNotAvailable(err) {
+		return errLockNotAvailable()
+	}
+	if isUnavailableSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
 		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
 	}
 	return err
 }
 
-// isOperatorOrSystemErrorSQLState reports whether err is a Postgres error
-// in SQLSTATE class 57 or 58. pgcommon v1.3.0 has dedicated helpers for
-// 08/53 but not these two; we classify via the pgconn Error() text
-// ("… (SQLSTATE 57P01)") so this package never imports pgconn — same
-// pattern as iam-user-profile / iam-org-membership.
-func isOperatorOrSystemErrorSQLState(err error) bool {
-	if !pgcommon.IsPgError(err) {
+// errLockNotAvailable is the one mapping of SQLSTATE 55P03
+// (lock_not_available — a row-lock wait exceeded the transaction's
+// PG_LOCK_TIMEOUT) for the whole adapter: another credential write holds
+// the principal row (TS-1/TS-2 under LockForUpdate, the offboarding
+// cascade under LockByTenant), so the caller gets the retryable 409
+// rotation_in_flight (§17) rather than a raw PgError that becomes a 500.
+// Centralised here because a lock wait can surface from any statement that
+// touches a locked row (TS-4's ON CONFLICT DO UPDATE, a FOR UPDATE query)
+// and — with pgx v5 — from QueryRow.Scan or rows.Err(), not from Query.
+func errLockNotAvailable() error {
+	return domain.NewError(domain.ErrRotationInFlight, "another credential write for this principal is in progress; retry")
+}
+
+// isLockNotAvailable reports SQLSTATE 55P03 (lock_not_available).
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
+}
+
+// isUnavailableSQLState positively identifies a database-availability
+// failure by SQLSTATE class (never by a broad "looks like a network error"
+// heuristic, TS-D16): 08 connection exception, 53 insufficient resources,
+// 57 operator intervention (incl. 57014 statement_timeout), 58 system error.
+func isUnavailableSQLState(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
+	switch pgErr.Code[:2] {
+	case "08", "53", "57", "58":
+		return true
+	}
+	return false
+}
+
+// isQueryCanceled reports SQLSTATE 57014 (query_canceled).
+func isQueryCanceled(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "57014"
 }

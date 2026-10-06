@@ -15,9 +15,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 
+	consumeradapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/consumer"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
 const (
@@ -264,17 +268,190 @@ func TestBuildSQSConsumer_DecodesGlueEncodedUpstreamPayload(t *testing.T) {
 	}
 }
 
-// fakeLogger is a minimal port.Logger test double counting Warn calls.
+// fakeLogger is a minimal port.Logger test double recording Warn/Info/Error
+// calls (with their fields, for the trace_id assertions).
 type fakeLogger struct {
-	mu        sync.Mutex
-	warnCalls int32
+	mu          sync.Mutex
+	warnCalls   int32
+	warnFields  []map[string]any
+	infoCalls   []string
+	errorCalls  []string
+	errorFields []map[string]any
 }
 
 func (f *fakeLogger) Debug(string, map[string]any) {}
-func (f *fakeLogger) Info(string, map[string]any)  {}
-func (f *fakeLogger) Warn(string, map[string]any) {
+func (f *fakeLogger) Info(msg string, _ map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.infoCalls = append(f.infoCalls, msg)
+}
+func (f *fakeLogger) Warn(_ string, fields map[string]any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.warnCalls++
+	f.warnFields = append(f.warnFields, fields)
 }
-func (f *fakeLogger) Error(string, map[string]any) {}
+func (f *fakeLogger) Error(msg string, fields map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errorCalls = append(f.errorCalls, msg)
+	f.errorFields = append(f.errorFields, fields)
+}
+
+// spanCtx returns a context carrying a valid (sampled) span context.
+func spanCtx(t *testing.T) (context.Context, string) {
+	t.Helper()
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	require.NoError(t, err)
+	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled})
+	return trace.ContextWithSpanContext(context.Background(), sc), traceID.String()
+}
+
+// ── invalid_envelope_id ───────────────────────────────────────────────────
+
+func TestDLQReason_InvalidEnvelopeID(t *testing.T) {
+	reason, ok := dlqReason(fmt.Errorf("offboarding consumer: %w: %q", consumeradapter.ErrInvalidEnvelopeID, "x"))
+	require.True(t, ok)
+	assert.Equal(t, "invalid_envelope_id", reason)
+}
+
+// newRealOffboardingConsumer builds the production handler; the envelopes
+// these tests send are rejected/acked before any dependency is touched.
+func newRealOffboardingConsumer() *consumeradapter.OffboardingConsumer {
+	return consumeradapter.NewOffboardingConsumer(nil, nil, nil, nil, nil)
+}
+
+// The whole main.go pipeline: a TenantMembershipsPurged whose envelope id
+// can't key processed_events goes straight to the DLQ (and is acked),
+// instead of being acked with its GDPR erasure silently skipped.
+func TestPipeline_KnownTypeInvalidEnvelopeID_EndsUpInDLQ(t *testing.T) {
+	for _, id := range []string{"", "evt-not-a-uuid"} {
+		t.Run("id="+id, func(t *testing.T) {
+			client := &fakeDLQClient{attrs: redriveAttrs(flociDLQARN)}
+			h := withDLQRouting(context.Background(), client, flociQueueURL,
+				validateConsumed(newRealOffboardingConsumer().Handle, realValidator(t), &fakeLogger{}), &fakeLogger{})
+			env := envelopeOf("TenantMembershipsPurged", `{"tenant_id":"`+purgedTenant+`"}`)
+			env.ID = id
+
+			require.NoError(t, h(context.Background(), env), "DLQ'd, so the source message is acked")
+			require.Len(t, client.sent, 1)
+			assert.Equal(t, invalidEnvelopeIDReason, aws.ToString(client.sent[0].MessageAttributes["DLQReason"].StringValue))
+		})
+	}
+}
+
+func TestPipeline_KnownTypeInvalidEnvelopeID_DLQUnresolvable_FallsBackToRedrive(t *testing.T) {
+	client := &fakeDLQClient{getErr: errors.New("access denied")}
+	h := withDLQRouting(context.Background(), client, flociQueueURL,
+		validateConsumed(newRealOffboardingConsumer().Handle, realValidator(t), &fakeLogger{}), &fakeLogger{})
+	env := envelopeOf("TenantMembershipsPurged", `{"tenant_id":"`+purgedTenant+`"}`)
+	env.ID = "evt-not-a-uuid"
+
+	require.ErrorIs(t, h(context.Background(), env), consumeradapter.ErrInvalidEnvelopeID,
+		"an error leaves the message visible, so SQS redrive delivers it to the DLQ after maxReceiveCount")
+	assert.Empty(t, client.sent)
+}
+
+func TestPipeline_UnknownTypeInvalidEnvelopeID_StillAcked(t *testing.T) {
+	client := &fakeDLQClient{attrs: redriveAttrs(flociDLQARN)}
+	h := withDLQRouting(context.Background(), client, flociQueueURL,
+		validateConsumed(newRealOffboardingConsumer().Handle, realValidator(t), &fakeLogger{}), &fakeLogger{})
+	env := envelopeOf("SomeFutureEvent", `{}`)
+	env.ID = "evt-not-a-uuid"
+
+	require.NoError(t, h(context.Background(), env))
+	assert.Empty(t, client.sent, "a producer schema addition must never DLQ-storm")
+}
+
+// ── trace_id on the cmd/consumer log lines ────────────────────────────────
+
+func TestRouteRejects_SendFailedLog_CarriesTraceID(t *testing.T) {
+	ctx, traceID := spanCtx(t)
+	log := &fakeLogger{}
+	h := routeRejectsToDLQ(handlerReturning(errSchemaViolation), &fakeDLQClient{sendErr: errors.New("throttled")}, flociDLQURL, log)
+	require.Error(t, h(ctx, testEnvelope()))
+	require.Len(t, log.warnFields, 1)
+	assert.Equal(t, traceID, log.warnFields[0]["trace_id"])
+}
+
+func TestValidateConsumed_ViolationLog_CarriesTraceID(t *testing.T) {
+	ctx, traceID := spanCtx(t)
+	log := &fakeLogger{}
+	h := validateConsumed((&recordingHandler{}).handle, realValidator(t), log)
+	require.Error(t, h(ctx, envelopeOf("TenantMembershipsPurged", `{}`)))
+	require.Len(t, log.warnFields, 1)
+	assert.Equal(t, traceID, log.warnFields[0]["trace_id"])
+}
+
+func TestWithTraceID_NoSpanOmitsField(t *testing.T) {
+	assert.NotContains(t, withTraceID(context.Background(), map[string]any{}), "trace_id")
+}
+
+// ── successful DLQ send: metric + log ─────────────────────────────────────
+
+// dlqRejects reads iam_token_service_consumer_dlq_rejects_total{reason}
+// from gincommon's registry, the registerer metrics.Register writes to.
+func dlqRejects(t *testing.T, reason string) float64 {
+	t.Helper()
+	mfs, err := gincommon.MetricsGatherer().Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "iam_token_service_consumer_dlq_rejects_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "reason" && lp.GetValue() == reason {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func TestRouteRejects_SchemaViolation_CountsAndWarns(t *testing.T) {
+	metrics.Register("test")
+	ctx, traceID := spanCtx(t)
+	log := &fakeLogger{}
+	before := dlqRejects(t, schemaViolationReason)
+	env := testEnvelope()
+
+	h := routeRejectsToDLQ(handlerReturning(errSchemaViolation), &fakeDLQClient{}, flociDLQURL, log)
+	require.NoError(t, h(ctx, env))
+
+	assert.InDelta(t, 1, dlqRejects(t, schemaViolationReason)-before, 0)
+	require.Len(t, log.warnFields, 1)
+	assert.Empty(t, log.errorCalls)
+	assert.Equal(t, map[string]any{
+		"reason": schemaViolationReason, "event_type": env.Type, "event_id": env.ID, "trace_id": traceID,
+	}, log.warnFields[0])
+}
+
+func TestRouteRejects_InvalidEnvelopeID_CountsAndLogsError(t *testing.T) {
+	metrics.Register("test")
+	ctx, traceID := spanCtx(t)
+	log := &fakeLogger{}
+	before := dlqRejects(t, invalidEnvelopeIDReason)
+	env := testEnvelope()
+
+	h := routeRejectsToDLQ(handlerReturning(consumeradapter.ErrInvalidEnvelopeID), &fakeDLQClient{}, flociDLQURL, log)
+	require.NoError(t, h(ctx, env))
+
+	assert.InDelta(t, 1, dlqRejects(t, invalidEnvelopeIDReason)-before, 0)
+	assert.Empty(t, log.warnFields, "a pending erasure is an Error, not a Warn")
+	require.Len(t, log.errorFields, 1)
+	assert.Equal(t, map[string]any{
+		"reason": invalidEnvelopeIDReason, "event_type": env.Type, "event_id": env.ID, "trace_id": traceID,
+	}, log.errorFields[0])
+}
+
+func TestRouteRejects_SendFails_NotCounted(t *testing.T) {
+	metrics.Register("test")
+	before := dlqRejects(t, schemaViolationReason)
+	h := routeRejectsToDLQ(handlerReturning(errSchemaViolation), &fakeDLQClient{sendErr: errors.New("throttled")}, flociDLQURL, &fakeLogger{})
+	require.Error(t, h(context.Background(), testEnvelope()))
+	assert.InDelta(t, 0, dlqRejects(t, schemaViolationReason)-before, 0, "only a message that actually reached the DLQ counts")
+}

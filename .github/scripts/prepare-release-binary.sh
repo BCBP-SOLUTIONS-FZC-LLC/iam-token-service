@@ -7,13 +7,14 @@
 # Makefile's `build` target) — /iam-token-service-server (HTTP API TS-1..
 # TS-4 + outbox runner), /iam-token-service-consumer (offboarding cascade,
 # enqueue-only), and /iam-token-service-rotator (overlap-expiry sweep +
-# orphan-material reconciler + prune, run-to-completion CronJob). All three
+# orphan-material reconciler + prune, run-to-completion CronJob), and
+# /iam-token-service-scheduler (cadence rotation CronJob). All four
 # are cross-compiled here, per platform, mirroring the Makefile's own build
 # target's -ldflags convention.
 #
 # Produces for each platform x binary:
-#   iam-token-service-{server,consumer,rotator}_{version}_{os}_{arch}[.exe]
-#   iam-token-service-{server,consumer,rotator}_{version}_{os}_{arch}[.exe].sha256
+#   iam-token-service-{server,consumer,rotator,scheduler}_{version}_{os}_{arch}[.exe]
+#   iam-token-service-{server,consumer,rotator,scheduler}_{version}_{os}_{arch}[.exe].sha256
 #
 # The caller (create-github-release.sh) aggregates all the non-.sha256 files
 # into a single checksums.txt with
@@ -39,6 +40,7 @@ BINARIES=(
   "server   ./cmd/server"
   "consumer ./cmd/consumer"
   "rotator  ./cmd/rotator"
+  "scheduler ./cmd/scheduler"
 )
 
 echo "Building release binaries for tag ${RELEASE_TAG}"

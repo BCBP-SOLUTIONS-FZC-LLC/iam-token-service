@@ -29,12 +29,23 @@ type CredentialService interface {
 
 // CredentialHandler implements TS-1 (issue/rotate) and TS-2 (revoke) (§5.4).
 type CredentialHandler struct {
-	svc CredentialService
+	svc            CredentialService
+	defaultOverlap int
 }
 
-// NewCredentialHandler constructs a CredentialHandler.
+// NewCredentialHandler constructs a CredentialHandler. An omitted
+// overlap_seconds uses domain.DefaultOverlapSeconds unless
+// WithDefaultOverlapSeconds overrides it.
 func NewCredentialHandler(svc CredentialService) *CredentialHandler {
-	return &CredentialHandler{svc: svc}
+	return &CredentialHandler{svc: svc, defaultOverlap: domain.DefaultOverlapSeconds}
+}
+
+// WithDefaultOverlapSeconds sets the overlap applied when a TS-1 body omits
+// overlap_seconds (ROTATION_DEFAULT_OVERLAP_SECONDS, §12). The service
+// still clamps it to [0, 900] (TS-CONFIG-4).
+func (h *CredentialHandler) WithDefaultOverlapSeconds(seconds int) *CredentialHandler {
+	h.defaultOverlap = seconds
+	return h
 }
 
 type issueOrRotateRequestBody struct {
@@ -61,7 +72,7 @@ type issueOrRotateResponseBody struct {
 // private key itself never leaves this response.
 //
 // @Summary      TS-1 — Issue or rotate credential
-// @Description  Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2). Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache.
+// @Description  Issues the principal's first credential (version=1, 201) or rotates to a new version (201) when one already exists. A rotation_id replay of an already-committed request returns the stored result (200) instead of generating new material (§9.2) — only within ROTATION_REPLAY_WINDOW (default 15m) of the credential's issue; later it is 409 credential_replay_expired, and 409 credential_replay_revoked once that version is revoked. Success responses carry Cache-Control: no-store and Pragma: no-cache. Returns a PEM-encoded RSA private key exactly once — it is never retrievable again (TS-INV-2); the matching public key is served at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's keys cache. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         Credentials
 // @Accept       json
 // @Produce      json
@@ -70,15 +81,17 @@ type issueOrRotateResponseBody struct {
 // @Param        request       body      issueOrRotateRequestBody  true  "rotation_id required; overlap_seconds optional (defaults to the configured value, §12)"
 // @Success      200           {object}  issueOrRotateResponseBody  "rotation_id replay — already committed"
 // @Success      201           {object}  issueOrRotateResponseBody  "issued or rotated"
-// @Failure      400           {object}  ErrorResponse  "invalid_request"
-// @Failure      401           {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      404           {object}  ErrorResponse  "principal_not_found"
-// @Failure      409           {object}  ErrorResponse  "rotation_in_flight OR optimistic_lock_conflict"
-// @Failure      422           {object}  ErrorResponse  "principal_revoked"
-// @Failure      502           {object}  ErrorResponse  "secret_store_unavailable"
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
+// @Failure      404  {object}  ErrorResponse  "principal_not_found"
+// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes"
+// @Failure      415  {object}  ErrorResponse  "unsupported_media_type"
+// @Failure      422  {object}  ErrorResponse  "principal_revoked"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      502  {object}  ErrorResponse  "secret_store_unavailable"
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials [post]
 func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())
@@ -113,10 +126,11 @@ func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
 	}
 
 	// overlap_seconds: nil (omitted) means "use the configured default"
-	// (§12, 300s) — distinct from an explicit 0 (a hard cutover, §6.2).
+	// (ROTATION_DEFAULT_OVERLAP_SECONDS, §12, 300s) — distinct from an
+	// explicit 0 (a hard cutover, §6.2).
 	// domain.ClampOverlapSeconds still bounds whatever value reaches the
 	// service layer to [0, 900] regardless of source (TS-CONFIG-4).
-	overlap := domain.DefaultOverlapSeconds
+	overlap := h.defaultOverlap
 	if body.OverlapSeconds != nil {
 		overlap = *body.OverlapSeconds
 	}
@@ -142,6 +156,10 @@ func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
 	if res.Replayed {
 		status = http.StatusOK
 	}
+	// The body carries a private key: no browser, proxy or client cache may
+	// keep a copy of it (TS-INV-2 — returned exactly once).
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
 	c.JSON(status, issueOrRotateResponseBody{
 		Version: res.Version, Secret: res.Secret, OpenBaoPath: res.OpenBaoPath,
 		ExpiresPriorAt: expiresPriorAt, RecordVersion: res.RecordVersion,
@@ -161,21 +179,23 @@ type revokeResponseBody struct {
 // never invalidates the secret at Keycloak (two-halves, TS-INV-7, §6.1).
 //
 // @Summary      TS-2 — Revoke credential version
-// @Description  Revokes one credential version — deletes its OpenBao material and marks it revoked. keycloak_invalidation is always "caller_responsibility": this service never invalidates the token at Keycloak itself (two-halves invariant, TS-INV-7).
+// @Description  Revokes one credential version — deletes its OpenBao material and marks it revoked. keycloak_invalidation is always "caller_responsibility": this service never invalidates the token at Keycloak itself (two-halves invariant, TS-INV-7). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
 // @Tags         Credentials
 // @Produce      json
 // @Param        id            path      string  true  "Tenant UUID"      format(uuid)
 // @Param        principal_id  path      string  true  "Principal UUID"   format(uuid)
 // @Param        version       path      int     true  "Credential version"
 // @Success      200           {object}  revokeResponseBody
-// @Failure      400           {object}  ErrorResponse  "invalid_request"
-// @Failure      401           {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      404           {object}  ErrorResponse  "principal_not_found"
-// @Failure      409           {object}  ErrorResponse  "optimistic_lock_conflict"
-// @Failure      502           {object}  ErrorResponse  "secret_store_unavailable"
-// @Security     SystemRole
-// @Security     TenantID
-// @Security     UserID
+// @Failure      400  {object}  ErrorResponse  "invalid_request"
+// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
+// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
+// @Failure      404  {object}  ErrorResponse  "principal_not_found"
+// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict"
+// @Failure      415  {object}  ErrorResponse  "unsupported_media_type (only when a body is sent)"
+// @Failure      500  {object}  ErrorResponse
+// @Failure      502  {object}  ErrorResponse  "secret_store_unavailable"
+// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials/{version}/revoke [post]
 func (h *CredentialHandler) Revoke(c *gin.Context) {
 	rc, ok := requestctx.FromContext(c.Request.Context())

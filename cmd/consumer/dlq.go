@@ -13,29 +13,48 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
+	consumeradapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/consumer"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
-// schemaViolationReason is the DLQReason message-attribute value stamped on
-// consumed-schema rejects (inbound_schema.go).
-const schemaViolationReason = "schema_violation"
+// DLQReason message-attribute values, one per permanent-reject class.
+const (
+	// schemaViolationReason: consumed-schema rejects (inbound_schema.go).
+	schemaViolationReason = "schema_violation"
+	// invalidEnvelopeIDReason: a TenantMembershipsPurged with a missing or
+	// non-UUID envelope id (consumeradapter.ErrInvalidEnvelopeID) — it can
+	// never be deduplicated, and acking it would skip a GDPR erasure.
+	invalidEnvelopeIDReason = "invalid_envelope_id"
+)
 
 // dlqReason reports whether err is a permanent reject that belongs in the
 // DLQ now rather than after maxReceiveCount retries, and under which reason.
-// A schema violation is currently the only one — OffboardingConsumer has no
-// poison-pill sentinel of its own.
 func dlqReason(err error) (string, bool) {
-	if errors.Is(err, errSchemaViolation) {
+	switch {
+	case errors.Is(err, errSchemaViolation):
 		return schemaViolationReason, true
+	case errors.Is(err, consumeradapter.ErrInvalidEnvelopeID):
+		return invalidEnvelopeIDReason, true
 	}
 	return "", false
+}
+
+// withTraceID adds the active span's trace_id to log fields, matching the
+// consumer adapter's own log lines so a reject can be joined to its trace.
+func withTraceID(ctx context.Context, fields map[string]any) map[string]any {
+	if traceID := gincommon.SpanTraceID(ctx); traceID != "" {
+		fields["trace_id"] = traceID
+	}
+	return fields
 }
 
 // dlqSQSClient is the subset of *sqs.Client the DLQ router needs:
 // GetQueueAttributes on tenant-lifecycle-tokensvc-q (ConsumeOffboardingQueue)
 // and SendMessage on its DLQ (OffboardingDLQPermanentRejects), both granted
-// in deploy/iam/policy.json.
+// in deploy/iam/policy-consumer.json.
 type dlqSQSClient interface {
 	GetQueueAttributes(ctx context.Context, params *sqs.GetQueueAttributesInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error)
 	SendMessage(ctx context.Context, params *sqs.SendMessageInput, optFns ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
@@ -63,7 +82,8 @@ func withDLQRouting(ctx context.Context, client dlqSQSClient, queueURL string, h
 // reject (see dlqReason) straight to dlqURL and acks the source message.
 // platform-events has no "permanent failure" signal — any handler error
 // just leaves the message visible — so without this a schema violation
-// would burn the full retry budget on a payload that can never pass. If the
+// would burn the full retry budget on a payload that can never pass (or
+// an envelope id that can never dedup). If the
 // DLQ send fails the original error is returned, so the message
 // falls back to normal retry + redrive.
 func routeRejectsToDLQ(h events.Handler, client dlqSQSClient, dlqURL string, log port.Logger) events.Handler {
@@ -91,12 +111,33 @@ func routeRejectsToDLQ(h events.Handler, client dlqSQSClient, dlqURL string, log
 		if sErr != nil {
 			if log != nil {
 				log.Warn("DLQ send failed — falling back to SQS redrive",
-					map[string]any{"event_id": env.ID, "event_type": env.Type, "reason": reason, "dlq_url": dlqURL, "error": sErr.Error()})
+					withTraceID(ctx, map[string]any{"event_id": env.ID, "event_type": env.Type, "reason": reason, "dlq_url": dlqURL, "error": sErr.Error()}))
 			}
 			return err
 		}
+		metrics.IncConsumerDLQReject(reason)
+		logDLQReject(ctx, log, env, reason)
 		return nil
 	}
+}
+
+// logDLQReject records a successful straight-to-DLQ send. The message is
+// acked from the source queue at this point, so this line and
+// iam_token_service_consumer_dlq_rejects_total are the only in-service
+// trace that it left the normal path. An invalid_envelope_id reject is a
+// TenantMembershipsPurged whose credential erasure has NOT run and will
+// not until someone redrives it, so it logs at Error; a schema violation
+// is a producer-contract problem and logs at Warn.
+func logDLQReject(ctx context.Context, log port.Logger, env events.Envelope[json.RawMessage], reason string) {
+	if log == nil {
+		return
+	}
+	fields := withTraceID(ctx, map[string]any{"reason": reason, "event_type": env.Type, "event_id": env.ID})
+	if reason == invalidEnvelopeIDReason {
+		log.Error("permanent reject sent to DLQ — tenant credential erasure is pending until it is redriven", fields)
+		return
+	}
+	log.Warn("permanent reject sent to DLQ", fields)
 }
 
 // resolveDLQURL returns the URL of queueURL's RedrivePolicy

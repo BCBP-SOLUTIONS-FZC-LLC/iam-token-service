@@ -12,20 +12,9 @@ import (
 // ─────────────────────────────────────────────────────────────────────────
 // In-memory port fakes for the offboarding consumer's unit tests. Smaller
 // and scoped differently than test/unit/service's fakes (this consumer
-// needs ListByTenant + ProcessedEventsStore, not Insert/Update/rotation
+// needs ListByTenant + Inbox, not Insert/Update/rotation
 // semantics), so kept separate rather than shared.
 // ─────────────────────────────────────────────────────────────────────────
-
-type fakeTxRunner struct {
-	events port.EventPublisher
-}
-
-func (f *fakeTxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	if f.events != nil {
-		ctx = port.WithEventPublisher(ctx, f.events)
-	}
-	return fn(ctx)
-}
 
 type fakeEventPublisher struct {
 	events []*domain.Event
@@ -68,6 +57,11 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 		}
 	}
 	return nil, domain.NewError(domain.ErrPrincipalNotFound, "no principal for this tenant")
+}
+
+// LockForUpdate behaves like FindByID in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
+	return f.FindByID(ctx, tenantID, principalID)
 }
 
 func (f *fakePrincipalRepository) Register(_ context.Context, p *domain.ServiceAccountPrincipal) (*domain.ServiceAccountPrincipal, bool, bool, error) {
@@ -145,6 +139,17 @@ func (f *fakeCredentialRepository) FindActive(_ context.Context, _, principalID 
 	return nil, nil
 }
 
+// MaxVersion returns the highest version stored for the principal (any status).
+func (f *fakeCredentialRepository) MaxVersion(_ context.Context, _, principalID uuid.UUID) (int, error) {
+	maxVersion := 0
+	for _, c := range f.byPrincipal[principalID] {
+		if c.Version > maxVersion {
+			maxVersion = c.Version
+		}
+	}
+	return maxVersion, nil
+}
+
 func (f *fakeCredentialRepository) FindByRotationID(_ context.Context, _, _, _ uuid.UUID) (*domain.Credential, error) {
 	return nil, nil
 }
@@ -181,6 +186,9 @@ type fakeSecretStore struct {
 
 	// deleteErr, when set, is returned by Delete instead of succeeding.
 	deleteErr error
+
+	// children maps a List prefix to the keys it returns (folders end "/").
+	children map[string][]string
 }
 
 func newFakeSecretStore() *fakeSecretStore {
@@ -196,44 +204,71 @@ func (f *fakeSecretStore) Delete(_ context.Context, path string) error {
 	f.deleted = append(f.deleted, path)
 	return nil
 }
-func (f *fakeSecretStore) List(_ context.Context, _ string) ([]string, error) { return nil, nil }
+func (f *fakeSecretStore) List(_ context.Context, prefix string) ([]string, error) {
+	return f.children[prefix], nil
+}
 
 var _ port.SecretStore = (*fakeSecretStore)(nil)
 
-type fakeProcessedEventsStore struct {
+// fakeInbox is an in-memory port.Inbox with the platform-events inbox's
+// semantics: a recorded ID is a duplicate (fn not run); otherwise fn runs
+// with the tx-bound publisher in ctx, and the ID is recorded only when fn
+// and the commit succeed (the real claim rolls back with fn's writes).
+type fakeInbox struct {
+	events port.EventPublisher
 	marked map[string]bool
 
-	// markProcessedErr, when set, is returned by MarkProcessed instead of
-	// succeeding.
-	markProcessedErr error
+	// claimErr, when set, fails ProcessOnce before fn runs (the claim
+	// INSERT failed).
+	claimErr error
 
-	// isProcessedErr, when set, is returned by IsProcessed instead of
-	// succeeding.
-	isProcessedErr error
+	// commitErr, when set, fails ProcessOnce after fn ran (the transaction
+	// did not commit), leaving the ID unrecorded.
+	commitErr error
 }
 
-func newFakeProcessedEventsStore() *fakeProcessedEventsStore {
-	return &fakeProcessedEventsStore{marked: map[string]bool{}}
+func newFakeInbox() *fakeInbox {
+	return &fakeInbox{marked: map[string]bool{}}
 }
 
-func (f *fakeProcessedEventsStore) IsProcessed(_ context.Context, consumer port.ProcessedEventsConsumer, eventID string) (bool, error) {
-	if f.isProcessedErr != nil {
-		return false, f.isProcessedErr
+// publishing binds pub as the tx-bound publisher fn sees and returns f.
+func (f *fakeInbox) publishing(pub port.EventPublisher) *fakeInbox {
+	f.events = pub
+	return f
+}
+
+func (f *fakeInbox) ProcessOnce(ctx context.Context, consumer port.ProcessedEventsConsumer, eventID, _ string, fn func(context.Context) error) (bool, error) {
+	if f.claimErr != nil {
+		return false, f.claimErr
 	}
-	return f.marked[string(consumer)+"/"+eventID], nil
+	key := string(consumer) + "/" + eventID
+	if f.marked[key] {
+		return true, nil
+	}
+	if f.events != nil {
+		ctx = port.WithEventPublisher(ctx, f.events)
+	}
+	if err := fn(ctx); err != nil {
+		return false, err
+	}
+	if f.commitErr != nil {
+		return false, f.commitErr
+	}
+	f.marked[key] = true
+	return false, nil
 }
 
-func (f *fakeProcessedEventsStore) MarkProcessed(_ context.Context, consumer port.ProcessedEventsConsumer, eventID string) error {
-	if f.markProcessedErr != nil {
-		return f.markProcessedErr
-	}
+// IsProcessed / MarkProcessed are test helpers to seed and inspect the
+// ledger.
+func (f *fakeInbox) IsProcessed(consumer port.ProcessedEventsConsumer, eventID string) bool {
+	return f.marked[string(consumer)+"/"+eventID]
+}
+
+func (f *fakeInbox) MarkProcessed(consumer port.ProcessedEventsConsumer, eventID string) {
 	f.marked[string(consumer)+"/"+eventID] = true
-	return nil
 }
 
-func (f *fakeProcessedEventsStore) Prune(_ context.Context, _, _ int) (int, error) { return 0, nil }
-
-var _ port.ProcessedEventsStore = (*fakeProcessedEventsStore)(nil)
+var _ port.Inbox = (*fakeInbox)(nil)
 
 // fakeLogger records every Debug call for assertion — used to prove
 // OffboardingConsumer.debug's real logging branch fires (c.log non-nil),
@@ -242,6 +277,7 @@ type fakeLogger struct {
 	debugCalls  []string
 	debugFields []map[string]any
 	infoCalls   []string
+	infoFields  []map[string]any
 	errorCalls  []string
 	errorFields []map[string]any
 }
@@ -250,11 +286,19 @@ func (f *fakeLogger) Debug(msg string, fields map[string]any) {
 	f.debugCalls = append(f.debugCalls, msg)
 	f.debugFields = append(f.debugFields, fields)
 }
-func (f *fakeLogger) Info(msg string, _ map[string]any) { f.infoCalls = append(f.infoCalls, msg) }
-func (f *fakeLogger) Warn(string, map[string]any)       {}
+func (f *fakeLogger) Info(msg string, fields map[string]any) {
+	f.infoCalls = append(f.infoCalls, msg)
+	f.infoFields = append(f.infoFields, fields)
+}
+func (f *fakeLogger) Warn(string, map[string]any) {}
 func (f *fakeLogger) Error(msg string, fields map[string]any) {
 	f.errorCalls = append(f.errorCalls, msg)
 	f.errorFields = append(f.errorFields, fields)
 }
 
 var _ port.Logger = (*fakeLogger)(nil)
+
+// LockByTenant behaves like ListByTenant in the fake (no real row locks).
+func (f *fakePrincipalRepository) LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error) {
+	return f.ListByTenant(ctx, tenantID)
+}
