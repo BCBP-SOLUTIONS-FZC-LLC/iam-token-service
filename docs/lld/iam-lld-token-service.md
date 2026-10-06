@@ -268,7 +268,7 @@ As with the sibling services, the REST OpenAPI spec is **generated** by `swag` (
 ```
 require (
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon           v1.6.0
-    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2              v2.0.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2              v2.1.0
     github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2            v2.0.0
     github.com/openbao/openbao/api/v2                              v2.x.x  // OpenBao KV v2 client (Vault-API-compatible)
     github.com/aws/aws-sdk-go-v2/service/glue                      v1.x.x  // Glue Schema Registry client

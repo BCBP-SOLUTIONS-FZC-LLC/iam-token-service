@@ -6,6 +6,11 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Dependencies
+
+- platform-events/v2 v2.0.0 → v2.1.0 (additive: opt-in SQS consumer retry backoff, `SQS_RETRY_BACKOFF` / `SQS_MAX_RETRY_BACKOFF`; off by default, so consumer behaviour is unchanged).
+- github.com/moby/go-archive v0.2.0 → v0.3.0 (Dependabot high: crafted tar archive can write outside the extraction directory). Test-only dependency via testcontainers-go; no binary imports it.
+
 ### Fixed (third production-readiness pass, TS-D23)
 
 - **JWKS regression from TS-D22.** "Known tenant" meant served recently on this replica, so after a restart or 10 idle minutes Keycloak's real fetches shared the 2 rps unknown-tenant bucket with any attacker. Known tenants now come from the database (tenants with a live credential, reloaded every `JWKS_KNOWN_TENANTS_REFRESH`, 15s).
