@@ -9,12 +9,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// DefaultKeyGenerator's rand.Read failure branch is not exercised here:
-// in this Go toolchain, crypto/rand.Read treats a broken entropy source as
-// unrecoverable (runtime.fatal, not a normal returned error — confirmed
-// empirically; swapping the package-level rand.Reader var does not even
-// intercept it), so there is no safe, in-process way to drive that branch.
-// It remains defensive dead code from a testing standpoint.
+// DefaultKeyGenerator's entropy-failure branch is covered by
+// TestDefaultKeyGenerator_EntropyFailureIsReturned
+// (secret_generator_coverage_test.go), via GODEBUG=cryptocustomrand=1.
 
 func TestDefaultKeyGenerator_ReturnsPEMEncodedRSAPrivateKey(t *testing.T) {
 	s1, err := DefaultKeyGenerator()
