@@ -85,6 +85,10 @@ spec:
               value: {{ printf "%ds" (.Values.sqs.visibilityTimeoutSeconds | int) | quote }}
             - name: SQS_QUEUE_DEPTH_INTERVAL
               value: {{ .Values.sqs.queueDepthInterval | default "60s" | quote }}
+            - name: SQS_RETRY_BACKOFF
+              value: {{ .Values.sqs.retryBackoff | default "60s" | quote }}
+            - name: SQS_MAX_RETRY_BACKOFF
+              value: {{ .Values.sqs.maxRetryBackoff | default "15m" | quote }}
             - name: SQS_HANDLER_TIMEOUT
               value: {{ .Values.sqs.handlerTimeout | quote }}
             - name: SQS_DRAIN_TIMEOUT

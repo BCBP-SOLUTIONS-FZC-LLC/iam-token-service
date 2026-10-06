@@ -417,6 +417,7 @@ Canonical suites (do not break):
 | `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT` | server | `50`, `5`, `30s`, `10s` | platform-events defaults |
 | `SQS_QUEUE_URL` | consumer | dev: local Floci queue | Required (`sqs.queueUrl`) |
 | `SQS_CONCURRENCY`, `SQS_VISIBILITY_TIMEOUT`, `SQS_HANDLER_TIMEOUT`, `SQS_DRAIN_TIMEOUT`, `SQS_QUEUE_DEPTH_INTERVAL` | consumer | `2`, `60s`, `45s`, `15s`, `60s` | Handler timeout stays below the visibility timeout (the OpenBao deletes run inside the inbox transaction). `0s` disables depth sampling |
+| `SQS_RETRY_BACKOFF`, `SQS_MAX_RETRY_BACKOFF` | consumer | `60s`, `15m` | Exponential redelivery backoff for a failed message (1m, 2m, 4m, 8m…), so `maxReceiveCount=5` covers ~15 minutes of outage before the DLQ. `0s` turns it off |
 | `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS` | consumer | `10`, `20` | platform-events defaults |
 
 ### Rotation, JWKS and jobs

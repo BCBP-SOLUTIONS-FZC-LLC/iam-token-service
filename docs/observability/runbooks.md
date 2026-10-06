@@ -190,6 +190,8 @@ Common starting points:
 
 **Triage.** Consumer logs (`trace_id`). OpenBao deletes run inside the cascade transaction, before it commits (material-first), so OpenBao failures are the usual cause; then Postgres. A persistent failure ends in the DLQ after the queue's `RedrivePolicy` `maxReceiveCount`. SQS moves it there itself, so no in-service counter records it: the signal is `platform_dlq_depth` (`IAMTokenServiceOffboardingDLQBacklog`).
 
+**Backoff.** Redelivery backs off exponentially (`SQS_RETRY_BACKOFF` 60s → 1m, 2m, 4m, 8m, capped at `SQS_MAX_RETRY_BACKOFF` 15m), so the 5 receives span roughly 15 minutes before a message reaches the DLQ. Retries are therefore sparse during an outage; that is expected, not a stuck consumer.
+
 **Mitigate.** Restore the dependency; redrive anything that reached the DLQ.
 
 ### IAMTokenServiceSQSReceiveErrors

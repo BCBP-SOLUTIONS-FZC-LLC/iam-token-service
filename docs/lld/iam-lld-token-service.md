@@ -1532,7 +1532,8 @@ shutdown:  { drainDelay: 5s }                     # SHUTDOWN_DRAIN_DELAY
 cronjobs:  { istioInject: false }
 realmProvisioner: { baseUrl: "http://iam-realm-provisioner.iam.svc.cluster.local:8080" }  # REALM_PROVISIONER_BASE_URL (RP-17)
 sqs: { queueUrl: <SQS_QUEUE_URL>, concurrency: 2, maxMessages: 10, waitSeconds: 20,
-       visibilityTimeoutSeconds: 60, handlerTimeout: 45s, drainTimeout: 15s, queueDepthInterval: 60s }
+       visibilityTimeoutSeconds: 60, handlerTimeout: 45s, drainTimeout: 15s, queueDepthInterval: 60s,
+       retryBackoff: 60s, maxRetryBackoff: 15m }
 events: { glueRegistryName: iam-serviceaccount-events, topicArn: <SNS_TOPIC_ARN>, awsRegion: ap-south-1 }
 outbox: { pollInterval: 500ms, batchSize: 50, maxAttempts: 5, drainTimeout: 30s, publishConcurrency: 4, publishTimeout: 10s, startupJitter: 2s, claimLeaseDuration: 10m }
 exporters: { rotationOverlapInterval: 30s, rlsViolationInterval: 1m, keysRefreshInterval: 30s }
@@ -1579,7 +1580,7 @@ Key env vars (non-secret in Helm `env`; OpenBao access via Kubernetes auth, not 
 | `AWS_REGION`, `AWS_ENDPOINT_URL` (dev only) | server, consumer + platform-events | AWS clients |
 | `GLUE_REGISTRY_NAME` (`iam-serviceaccount-events`), `SNS_TOPIC_ARN` | server + platform-events `config.LoadSNS` | produced events (§7); both required outside dev |
 | `OUTBOX_*` (`POLL_INTERVAL`, `BATCH_SIZE`, `MAX_ATTEMPTS`, `DRAIN_TIMEOUT`, `PUBLISH_CONCURRENCY`, `PUBLISH_TIMEOUT`, `STARTUP_JITTER`, `CLAIM_LEASE_DURATION`) | server + platform-events `config.LoadOutbox` | outbox runner |
-| `SQS_QUEUE_URL`, `SQS_CONCURRENCY`, `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT`, `SQS_HANDLER_TIMEOUT`, `SQS_DRAIN_TIMEOUT`, `SQS_QUEUE_DEPTH_INTERVAL` | consumer + platform-events `config.LoadSQS` | offboarding queue; `SQS_QUEUE_URL` required outside dev |
+| `SQS_QUEUE_URL`, `SQS_CONCURRENCY`, `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT`, `SQS_HANDLER_TIMEOUT`, `SQS_DRAIN_TIMEOUT`, `SQS_QUEUE_DEPTH_INTERVAL`, `SQS_RETRY_BACKOFF` (60s), `SQS_MAX_RETRY_BACKOFF` (15m) | consumer + platform-events `config.LoadSQS` | offboarding queue; `SQS_QUEUE_URL` required outside dev. The retry backoff (platform-events v2.1.0) hides a failed message 60s·2^(n-1) after its n-th delivery, so `maxReceiveCount=5` spans ~15 minutes of outage instead of ~5; `0s` turns it off |
 | `DOCS_ENABLED`, `DOCS_AUTH_TOKEN` | server | AsyncAPI/Swagger viewer gating |
 
 The system principal (`…00a1`) and the OpenBao path prefix (`iam/serviceaccount/…`, §6.3) are compiled constants (frozen, §25), not configuration.

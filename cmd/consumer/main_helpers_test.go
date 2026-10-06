@@ -113,7 +113,7 @@ func TestLoadSQSEnv_UsesCanonicalNames(t *testing.T) {
 }
 
 func TestLoadSQSEnv_AppliesServiceDefaultsWhenUnset(t *testing.T) {
-	for _, k := range []string{"SQS_QUEUE_URL", "SQS_CONCURRENCY", "SQS_VISIBILITY_TIMEOUT", "SQS_HANDLER_TIMEOUT", "SQS_DRAIN_TIMEOUT", "SQS_QUEUE_DEPTH_INTERVAL"} {
+	for _, k := range []string{"SQS_QUEUE_URL", "SQS_CONCURRENCY", "SQS_VISIBILITY_TIMEOUT", "SQS_HANDLER_TIMEOUT", "SQS_DRAIN_TIMEOUT", "SQS_QUEUE_DEPTH_INTERVAL", "SQS_RETRY_BACKOFF", "SQS_MAX_RETRY_BACKOFF"} {
 		t.Setenv(k, "")
 	}
 	env := loadSQSEnv("dev")
@@ -123,6 +123,17 @@ func TestLoadSQSEnv_AppliesServiceDefaultsWhenUnset(t *testing.T) {
 	assert.Equal(t, 45*time.Second, env.HandlerTimeout, "below the visibility timeout")
 	assert.Equal(t, 15*time.Second, env.DrainTimeout, "inside the 30s termination grace period")
 	assert.Equal(t, 60*time.Second, env.QueueDepthInterval, "queue-depth sampling is on by default")
+	assert.Equal(t, 60*time.Second, env.RetryBackoff, "redelivery backoff is on by default")
+	assert.Equal(t, 15*time.Minute, env.MaxRetryBackoff)
+}
+
+func TestLoadSQSEnv_RetryBackoffOverride(t *testing.T) {
+	t.Setenv("SQS_QUEUE_URL", "http://localhost/q")
+	t.Setenv("SQS_RETRY_BACKOFF", "0s")
+	t.Setenv("SQS_MAX_RETRY_BACKOFF", "5m")
+	env := loadSQSEnv("dev")
+	assert.Zero(t, env.RetryBackoff, "an explicit 0s turns the backoff off")
+	assert.Equal(t, 5*time.Minute, env.MaxRetryBackoff)
 }
 
 func TestLoadSQSEnv_QueueURLRequiredOutsideDev(t *testing.T) {

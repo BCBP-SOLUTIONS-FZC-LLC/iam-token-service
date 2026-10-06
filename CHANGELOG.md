@@ -8,7 +8,11 @@ This service has never been deployed to any environment — there is no released
 
 ### Dependencies
 
-- platform-events/v2 v2.0.0 → v2.1.0 (additive: opt-in SQS consumer retry backoff, `SQS_RETRY_BACKOFF` / `SQS_MAX_RETRY_BACKOFF`; off by default, so consumer behaviour is unchanged).
+- platform-events/v2 v2.0.0 → v2.1.0 (additive: SQS consumer retry backoff, `SQS_RETRY_BACKOFF` / `SQS_MAX_RETRY_BACKOFF`).
+
+### Changed
+
+- **Offboarding consumer retry backoff on by default.** A failed cascade is now redelivered after 1m, 2m, 4m, 8m (`SQS_RETRY_BACKOFF=60s`, capped by `SQS_MAX_RETRY_BACKOFF=15m`; Helm `sqs.retryBackoff` / `sqs.maxRetryBackoff`) instead of every 60s, so with `maxReceiveCount=5` a ~15-minute OpenBao/Postgres outage no longer pushes a tenant's erasure into the DLQ. `0s` restores the fixed redelivery. Uses the already-granted `sqs:ChangeMessageVisibility`.
 - github.com/moby/go-archive v0.2.0 → v0.3.0 (Dependabot high: crafted tar archive can write outside the extraction directory). Test-only dependency via testcontainers-go; no binary imports it.
 
 ### Fixed (third production-readiness pass, TS-D23)

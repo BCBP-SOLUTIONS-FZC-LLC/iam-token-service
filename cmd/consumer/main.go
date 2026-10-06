@@ -441,5 +441,16 @@ func loadSQSEnv(appEnv string) eventcfg.SQSConfigEnv {
 	if os.Getenv("SQS_QUEUE_DEPTH_INTERVAL") == "" {
 		env.QueueDepthInterval = 60 * time.Second
 	}
+	// Exponential redelivery backoff (platform-events v2.1.0): a failed
+	// cascade (OpenBao or Postgres down) is hidden 60s·2^(n-1) after its n-th
+	// delivery — 1m, 2m, 4m, 8m — instead of reappearing every 60s, so the
+	// queue's maxReceiveCount=5 spans ~15 minutes of outage rather than ~5
+	// before a tenant's erasure lands in the DLQ. "0s" turns it off.
+	if os.Getenv("SQS_RETRY_BACKOFF") == "" {
+		env.RetryBackoff = 60 * time.Second
+	}
+	if os.Getenv("SQS_MAX_RETRY_BACKOFF") == "" {
+		env.MaxRetryBackoff = 15 * time.Minute
+	}
 	return env
 }

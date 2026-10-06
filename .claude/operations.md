@@ -233,7 +233,7 @@ sets every one it needs from `values.yaml`.
 | `AWS_REGION` (`ap-south-1`), `AWS_ENDPOINT_URL` | server, consumer | AWS SDK region / local endpoint (Floci) |
 | `GLUE_REGISTRY_NAME`, `SNS_TOPIC_ARN` | server | Produced events (empty = no-op codec / publisher; required outside dev) |
 | `OUTBOX_POLL_INTERVAL` (`500ms`), `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_PUBLISH_CONCURRENCY` (`4`), `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_STARTUP_JITTER` (`2s`), `OUTBOX_CLAIM_LEASE_DURATION` (`10m`) | server | platform-events outbox runner (service defaults in parentheses) |
-| `SQS_QUEUE_URL`, `SQS_CONCURRENCY` (`2`), `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT` (`60s`), `SQS_HANDLER_TIMEOUT` (`45s`), `SQS_DRAIN_TIMEOUT` (`15s`), `SQS_QUEUE_DEPTH_INTERVAL` (`60s`, `0s` disables) | consumer | The one inbound subscription (platform-events `config.LoadSQS`) |
+| `SQS_QUEUE_URL`, `SQS_CONCURRENCY` (`2`), `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT` (`60s`), `SQS_HANDLER_TIMEOUT` (`45s`), `SQS_DRAIN_TIMEOUT` (`15s`), `SQS_QUEUE_DEPTH_INTERVAL` (`60s`, `0s` disables), `SQS_RETRY_BACKOFF` (`60s`, `0s` off) / `SQS_MAX_RETRY_BACKOFF` (`15m`) | consumer | The one inbound subscription (platform-events `config.LoadSQS`) |
 | `ROTATION_DEFAULT_OVERLAP_SECONDS` (`300`) | server, scheduler | TS-1 default overlap / scheduler overlap; startup fails outside `[0,900]` |
 | `ROTATION_DEFAULT_CADENCE_DAYS` (`90`) | server, scheduler | Stamped into `next_rotation_at` |
 | `ROTATION_REPLAY_WINDOW` (`15m`, `0` = unlimited) | server | TS-1 replay window → `409 credential_replay_expired`; startup fails on a bad value |

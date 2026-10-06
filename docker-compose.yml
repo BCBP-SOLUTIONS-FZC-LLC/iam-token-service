@@ -101,6 +101,8 @@ services:
       SQS_WAIT_SECONDS: "20"
       SQS_VISIBILITY_TIMEOUT: "60s"
       SQS_QUEUE_DEPTH_INTERVAL: "60s"
+      SQS_RETRY_BACKOFF: "60s"
+      SQS_MAX_RETRY_BACKOFF: "15m"
     depends_on:
       pgbouncer:
         condition: service_healthy

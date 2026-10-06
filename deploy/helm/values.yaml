@@ -508,6 +508,13 @@ sqs:
   # SQS_QUEUE_DEPTH_INTERVAL: platform-events samples the queue's and its
   # DLQ's depth into platform_queue_depth / platform_dlq_depth ("0s" disables).
   queueDepthInterval: "60s"
+  # SQS_RETRY_BACKOFF / SQS_MAX_RETRY_BACKOFF: a failed message is hidden
+  # retryBackoff·2^(n-1) after its n-th delivery (1m, 2m, 4m, 8m), capped at
+  # maxRetryBackoff, so maxReceiveCount=5 rides out ~15 minutes of an
+  # OpenBao/Postgres outage before the message reaches the DLQ. "0s" = off
+  # (back to a fixed visibility-timeout redelivery).
+  retryBackoff: "60s"
+  maxRetryBackoff: "15m"
   # SQS_HANDLER_TIMEOUT stays below the visibility timeout so a hung cascade
   # fails and is redelivered; SQS_DRAIN_TIMEOUT fits inside
   # terminationGracePeriodSeconds.
