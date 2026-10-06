@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/obsregistry"
 )
 
 // testutilCounterValue reads a Counter's current value — shared by this
@@ -34,7 +36,7 @@ func TestGincommonLabels_TransitionsFromNilToPopulated(t *testing.T) {
 	// gincommon.ObservabilityMiddlewares.
 	before := gincommonLabels()
 
-	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{ServiceName: "iam-token-service-test", BuildVersion: "test"})
+	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{ServiceName: "iam-token-service-test", BuildVersion: "test", Domain: "iam", Environment: "test"})
 
 	after := gincommonLabels()
 	assert.NotEmpty(t, after, "gincommonLabels must be non-empty after ObservabilityMiddlewares runs")
@@ -62,7 +64,6 @@ func TestRegister_IsIdempotentAndRegistersAllCollectors(t *testing.T) {
 	assert.NotNil(t, UnknownEventAcknowledged)
 	assert.NotNil(t, DependencyRequestDuration, "Tier 1 (registry-proposed)")
 	assert.NotNil(t, DuplicateMessagesTotal, "Tier 1 (registry-proposed)")
-	assert.NotNil(t, IAMOffboardingCascadeTotal, "Tier 2 (proposed for the IAM Domain Metric Registry)")
 
 	// A collector being non-nil only proves it was constructed, not that
 	// it was actually passed to MustRegister — CadenceRotationTotal was
@@ -77,19 +78,17 @@ func TestRegister_IsIdempotentAndRegistersAllCollectors(t *testing.T) {
 		OffboardingCascadeTotal, RotationSweepTotal, MaterialReconcileTotal,
 		CadenceRotationTotal, JWKSKeyErrorsTotal, ProcessedEventsDuplicates,
 		UnknownEventAcknowledged, DependencyRequestDuration, DuplicateMessagesTotal,
-		IAMOffboardingCascadeTotal,
+		JWKSRateLimitedByBucketTotal, CredentialReplaysTotal, KeysRefreshPending,
+		KeysRefreshOldestAgeSeconds, ConsumerDLQRejectsTotal,
 	} {
 		assert.Panics(t, func() { gincommon.MetricsRegisterer().MustRegister(c) },
 			"%T was constructed but never actually passed to MustRegister in registerMetrics", c)
 	}
 }
 
-// TestTier1Labels_CarryDomainServiceEnvironment and
-// TestTier2Labels_CarryServiceEnvironment lock down the Enterprise
+// TestTier1Labels_CarryDomainServiceEnvironment locks down the Enterprise
 // Platform Observability Standard's required-label contract: Tier 1 must
-// carry {domain, service, environment}; Tier 2 must carry {service,
-// environment} (domain is implicit in the iam_ name prefix, not repeated
-// as a label). These labels are injected centrally by registerMetrics
+// carry {domain, service, environment}. These labels are injected centrally by registerMetrics
 // (requirement #8 — instrumentation call sites never set them), so this
 // test reads them back off an already-registered collector rather than
 // constructing one itself.
@@ -97,8 +96,32 @@ func TestTier1Labels_CarryDomainServiceEnvironment(t *testing.T) {
 	Register("test")
 	labels := tier1Labels()
 	assert.Equal(t, "iam", labels["domain"])
-	assert.Equal(t, "token-service", labels["service"])
+	assert.Equal(t, expectedService(), labels["service"],
+		"Tier 1 service must be gincommon's service label (shared with platform-events/pgcommon), not a separate spelling")
 	assert.Equal(t, "test", labels["environment"])
+}
+
+// expectedService is gincommon's service label once ObservabilityMiddlewares
+// has run in this test binary, else the package fallback.
+func expectedService() string {
+	if s := gincommonLabels()["service"]; s != "" {
+		return s
+	}
+	return serviceName
+}
+
+// TestSharedTier1Collectors_UseRegistryShape locks the Tier 1 collectors to
+// the Platform Observability Registry's label sets — the shape platform-events
+// registers, so Register can adopt platform-events' collector instead of
+// disabling it.
+func TestSharedTier1Collectors_UseRegistryShape(t *testing.T) {
+	Register("test")
+	require.NotPanics(t, func() {
+		DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "write", OutcomeError)
+		DuplicateMessagesTotal.WithLabelValues("tenant-lifecycle-tokensvc-q", "TenantMembershipsPurged")
+	})
+	assert.Equal(t, []string{"dependency", "operation", "outcome"}, registryEntry(dependencyRequestSecondsName).Labels)
+	assert.Equal(t, []string{"queue", "event_type"}, registryEntry(duplicateMessagesTotalName).Labels)
 }
 
 // TestWithEnvironment_NilAndPopulatedBase covers both branches of
@@ -116,11 +139,82 @@ func TestWithEnvironment_NilAndPopulatedBase(t *testing.T) {
 	assert.Equal(t, prometheus.Labels{"service": "iam-token-service", "version": "v1", "environment": "test"}, populated)
 }
 
-func TestTier2Labels_CarryServiceEnvironmentOnly(t *testing.T) {
+// TestRegister_EmitsNoUnregisteredDomainMetric guards the platform libraries'
+// metrics contract: an iam_* name outside this service's iam_token_service_
+// prefix must be a Platform Observability Registry entry, and
+// iam_offboarding_cascade_total is not one yet (Proposal 3).
+func TestRegister_EmitsNoUnregisteredDomainMetric(t *testing.T) {
 	Register("test")
-	labels := tier2Labels()
-	assert.Equal(t, "token-service", labels["service"])
-	assert.Equal(t, "test", labels["environment"])
-	_, hasDomain := labels["domain"]
-	assert.False(t, hasDomain, "Tier 2 must not repeat domain as a label — it is already the iam_ name prefix")
+	families, err := gincommon.MetricsGatherer().Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		name := mf.GetName()
+		if strings.HasPrefix(name, "iam_") && !strings.HasPrefix(name, "iam_token_service_") {
+			_, ok := obsregistry.Default().Lookup(name)
+			assert.True(t, ok, "%s is an iam_* domain metric missing from the registry", name)
+		}
+	}
+}
+
+// TestTSD23Helpers_PreInitialisedAndBounded pins the TS-D23 counters'
+// label vocabularies: every known value is pre-initialised (a dashboard
+// shows 0, not "no data"), unknown values are folded or dropped so
+// cardinality never grows, and the gauge pair reports 0 age when empty.
+func TestTSD23Helpers_PreInitialisedAndBounded(t *testing.T) {
+	Register("test")
+
+	for _, b := range []string{"tenant", "global", "unknown"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_jwks_rate_limited_by_bucket_total", "bucket"), b)
+	}
+	for _, r := range []string{"served", "expired", "revoked"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_credential_replays_total", "result"), r)
+	}
+	for _, r := range []string{"schema_violation", "invalid_envelope_id"} {
+		assert.Contains(t, gatherLabelValues(t, "iam_token_service_consumer_dlq_rejects_total", "reason"), r)
+	}
+
+	before := testutil.ToFloat64(JWKSRateLimitedByBucketTotal.WithLabelValues(JWKSBucketUnknown))
+	IncJWKSRateLimited(JWKSBucketUnknown)
+	IncJWKSRateLimited("bogus")
+	assert.InDelta(t, before+1, testutil.ToFloat64(JWKSRateLimitedByBucketTotal.WithLabelValues(JWKSBucketUnknown)), 0)
+	assert.NotContains(t, gatherLabelValues(t, "iam_token_service_jwks_rate_limited_by_bucket_total", "bucket"), "bogus")
+
+	before = testutil.ToFloat64(CredentialReplaysTotal.WithLabelValues(ReplayServed))
+	IncCredentialReplay(ReplayServed)
+	IncCredentialReplay("bogus")
+	assert.InDelta(t, before+1, testutil.ToFloat64(CredentialReplaysTotal.WithLabelValues(ReplayServed)), 0)
+
+	before = testutil.ToFloat64(ConsumerDLQRejectsTotal.WithLabelValues("other"))
+	IncConsumerDLQReject("something_new")
+	assert.InDelta(t, before+1, testutil.ToFloat64(ConsumerDLQRejectsTotal.WithLabelValues("other")), 0)
+	assert.NotContains(t, gatherLabelValues(t, "iam_token_service_consumer_dlq_rejects_total", "reason"), "something_new")
+
+	SetKeysRefreshPending(3, 125.5)
+	assert.InDelta(t, 3, testutil.ToFloat64(KeysRefreshPending), 0)
+	assert.InDelta(t, 125.5, testutil.ToFloat64(KeysRefreshOldestAgeSeconds), 0)
+	SetKeysRefreshPending(0, 99)
+	assert.InDelta(t, 0, testutil.ToFloat64(KeysRefreshPending), 0)
+	assert.InDelta(t, 0, testutil.ToFloat64(KeysRefreshOldestAgeSeconds), 0, "an empty table reports age 0")
+}
+
+// gatherLabelValues returns every value label takes on metric name in the
+// gincommon registry.
+func gatherLabelValues(t *testing.T, name, label string) []string {
+	t.Helper()
+	mfs, err := gincommon.MetricsGatherer().Gather()
+	require.NoError(t, err)
+	var out []string
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == label {
+					out = append(out, lp.GetValue())
+				}
+			}
+		}
+	}
+	return out
 }

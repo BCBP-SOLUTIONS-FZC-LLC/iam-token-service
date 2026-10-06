@@ -4,9 +4,11 @@ package postgres_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +34,7 @@ func TestReconcilerRepository_ListExpiredRotating(t *testing.T) {
 	require.NoError(t, err)
 
 	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
-	rows, err := repo.ListExpiredRotating(ctx)
+	rows, err := repo.ListExpiredRotating(ctx, 500)
 	require.NoError(t, err)
 
 	require.Len(t, rows, 1)
@@ -69,7 +71,7 @@ func TestReconcilerRepository_ListDueForRotation(t *testing.T) {
 	require.NoError(t, err)
 
 	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
-	rows, err := repo.ListDueForRotation(ctx)
+	rows, err := repo.ListDueForRotation(ctx, 500)
 	require.NoError(t, err)
 
 	require.Len(t, rows, 1)
@@ -79,7 +81,7 @@ func TestReconcilerRepository_ListDueForRotation(t *testing.T) {
 }
 
 // TestReconcilerRepository_ListPrincipalMaterialStates — §8.6: MaxVersion
-// and CommittedVersions reflect exactly the committed rows across tenants;
+// and Credentials reflect exactly the committed rows across tenants;
 // a principal with no credential rows yields MaxVersion=0 and an empty set.
 func TestReconcilerRepository_ListPrincipalMaterialStates(t *testing.T) {
 	t.Parallel()
@@ -109,7 +111,7 @@ func TestReconcilerRepository_ListPrincipalMaterialStates(t *testing.T) {
 			maxVersion int
 			versions   []int
 			clientID   string
-		}{st.MaxVersion, st.CommittedVersions, st.KeycloakClientID}
+		}{st.MaxVersion, versionsOf(st.Credentials, false), st.KeycloakClientID}
 	}
 
 	a, ok := byPrincipal[principalA]
@@ -137,7 +139,7 @@ func TestReconcilerRepository_ListExpiredRotating_EmptyWhenNothingExpired(t *tes
 	seedCredential(t, ctx, rawPool, tenantID, principalID, 1, "active")
 
 	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
-	rows, err := repo.ListExpiredRotating(ctx)
+	rows, err := repo.ListExpiredRotating(ctx, 500)
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 }
@@ -171,8 +173,13 @@ func TestReconcilerRepository_ListPrincipalMaterialStates_ThreeVersionsCrossTena
 		switch st.PrincipalID {
 		case principalA:
 			seenA = true
-			assert.Equal(t, 3, st.MaxVersion)
-			assert.ElementsMatch(t, []int{1, 2, 3}, st.CommittedVersions)
+			assert.Equal(t, 3, st.MaxVersion, "MaxVersion counts revoked rows too (orphan boundary)")
+			assert.ElementsMatch(t, []int{1, 2, 3}, versionsOf(st.Credentials, false))
+			assert.ElementsMatch(t, []int{2, 3}, versionsOf(st.Credentials, true),
+				"only active/rotating rows are live — a revoked row's material is deleted by design and must never be reported missing")
+			for _, c := range st.Credentials {
+				assert.Equal(t, fmt.Sprintf("iam/serviceaccount/%s/%s/v%d", tenantA, testKeycloakClientID, c.Version), c.OpenBaoPath)
+			}
 		case principalC:
 			seenC = true
 			assert.Equal(t, 1, st.MaxVersion)
@@ -180,4 +187,54 @@ func TestReconcilerRepository_ListPrincipalMaterialStates_ThreeVersionsCrossTena
 	}
 	assert.True(t, seenA, "tenant A's principal must appear in the cross-tenant enumeration")
 	assert.True(t, seenC, "tenant C's principal must appear in the SAME cross-tenant enumeration call")
+}
+
+// versionsOf returns the credential versions, optionally only the live ones.
+func versionsOf(creds []port.CredentialMaterial, liveOnly bool) []int {
+	var out []int
+	for _, c := range creds {
+		if !liveOnly || c.Live {
+			out = append(out, c.Version)
+		}
+	}
+	return out
+}
+
+func TestReconcilerRepository_IsCredentialLive(t *testing.T) {
+	t.Parallel()
+	_, reconcilerPool, rawPool := setupTestDB(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+	principalID := seedPrincipal(t, ctx, rawPool, tenantID)
+	seedCredential(t, ctx, rawPool, tenantID, principalID, 1, "revoked")
+	seedCredential(t, ctx, rawPool, tenantID, principalID, 2, "active")
+	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
+
+	live, err := repo.IsCredentialLive(ctx, principalID, 2)
+	require.NoError(t, err)
+	assert.True(t, live)
+	live, err = repo.IsCredentialLive(ctx, principalID, 1)
+	require.NoError(t, err)
+	assert.False(t, live)
+	live, err = repo.IsCredentialLive(ctx, principalID, 9)
+	require.NoError(t, err)
+	assert.False(t, live)
+}
+
+func TestReconcilerRepository_ListExpiredRotating_RespectsLimitOldestFirst(t *testing.T) {
+	t.Parallel()
+	_, reconcilerPool, rawPool := setupTestDB(t)
+	ctx := context.Background()
+	for i := range 3 {
+		tenantID := uuid.New()
+		principalID := seedPrincipal(t, ctx, rawPool, tenantID)
+		id := seedCredential(t, ctx, rawPool, tenantID, principalID, 1, "rotating")
+		_, err := rawPool.Exec(ctx, `UPDATE service_account_credentials SET expires_at = now() - make_interval(mins => $2) WHERE id = $1`, id, 10*(i+1))
+		require.NoError(t, err)
+	}
+	repo := pgadapter.NewReconcilerRepository(reconcilerPool)
+
+	rows, err := repo.ListExpiredRotating(ctx, 2)
+	require.NoError(t, err)
+	assert.Len(t, rows, 2, "a batch never exceeds the limit; the rest wait for the next run")
 }

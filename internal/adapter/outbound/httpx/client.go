@@ -18,7 +18,7 @@ import (
 // NewTransport wraps base — nil meaning http.DefaultTransport — with the
 // OpenTelemetry round-tripper, which injects the traceparent header carried
 // on the request context and records a client span per call. Both
-// composition roots call gincommon.InitTracingFromEnv unconditionally, so
+// composition roots call gincommon.InitTracingWithConfig unconditionally, so
 // the global propagator and tracer provider are already installed.
 func NewTransport(base http.RoundTripper) http.RoundTripper {
 	return otelhttp.NewTransport(base)

@@ -17,6 +17,17 @@ type PrincipalRepository interface {
 	// (§5.5).
 	FindByID(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error)
 
+	// LockForUpdate reads the principal like FindByID but takes a row lock
+	// (SELECT … FOR UPDATE) held until the caller's transaction ends. TS-1,
+	// TS-2 and the offboarding cascade take it first, so issue/rotate/revoke
+	// for one principal are serialized: two concurrent TS-1 calls can no
+	// longer pick the same next version and overwrite each other's OpenBao
+	// material. MUST be called inside TxRunner.RunInTx. A lock wait that
+	// exceeds the transaction's lock_timeout returns
+	// domain.ErrRotationInFlight (409) — another write for this principal
+	// is in progress.
+	LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error)
+
 	// FindByPrincipalSub reads the principal by its Keycloak sub rather
 	// than Token Service's own internal id — the TS-5 lookup (AUTH-9,
 	// org-membership's service-account-not-grantable defense-in-depth
@@ -54,8 +65,16 @@ type PrincipalRepository interface {
 	// with the post-launch multi-principal-type surface, §2.4). Used by
 	// the offboarding cascade to discover every principal (and, via
 	// CredentialRepository.ListByPrincipal, every OpenBao path) that must
-	// be reclaimed before the tenant's rows are hard-deleted.
+	// be reclaimed before the tenant's rows are hard-deleted. A plain read,
+	// no locks — also used by the public JWKS route.
 	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error)
+
+	// LockByTenant is ListByTenant with the rows locked FOR UPDATE until the
+	// caller's transaction ends — the offboarding cascade's read, so it
+	// waits for (and then sees the result of) any in-progress issue/rotate,
+	// which holds the same row lock, and no new one can start until the
+	// cascade commits. MUST be called inside a transaction.
+	LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error)
 
 	// DeleteByTenant hard-deletes every principal row for tenantID; the
 	// composite (principal_id, tenant_id) FK's ON DELETE CASCADE removes

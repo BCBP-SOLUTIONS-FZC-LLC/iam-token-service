@@ -23,14 +23,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/httpx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 )
-
-// systemPrincipalUserID is the reserved iam-system caller identity every
-// IAM internal-service route requires as x-user-id (§5.2/§10.4) — the
-// dedicated service identity cmd/scheduler authenticates as (§16 TSQ-6
-// Resolved: a new in-mesh caller, not a new authorization mechanism).
-const systemPrincipalUserID = "00000000-0000-0000-0000-0000000000a1"
 
 // Client implements port.RealmProvisionerClient against the Realm
 // Provisioner's internal API.
@@ -81,8 +76,8 @@ var retryBackoff = []time.Duration{300 * time.Millisecond}
 //
 // Retries once (2 attempts total, see retryBackoff) on a plausibly-transient
 // failure — RP-17 is documented idempotent (clearing an already-fresh cache
-// is a no-op, RP LLD §2.5), and both a network-level failure and RP-17's
-// own documented 502 (keycloak_unavailable) qualify; retrying here absorbs
+// is a no-op, RP LLD §2.5), and a network-level failure, RP-17's own
+// documented 502 (keycloak_unavailable) and a mesh-level 429/503/504 qualify; retrying here absorbs
 // the kind of blip that would otherwise page on-call for nothing
 // (cmd/scheduler's cadence_rotation_total{result="failed"}, cmd/rotator's
 // rotation_sweep_total{result="error"}) every 5-minute CronJob tick. A 422
@@ -123,7 +118,10 @@ func (c *Client) refreshKeysOnce(ctx context.Context, tenantID uuid.UUID) (retry
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set("x-user-id", systemPrincipalUserID)
+	// The reserved iam-system caller identity every IAM internal route
+	// requires (§5.2/§10.4) — one constant for the whole service, so it can
+	// never drift from what this service itself accepts.
+	req.Header.Set("x-user-id", domain.SystemPrincipalID.String())
 	req.Header.Set("x-tenant-id", tenantID.String())
 
 	resp, err := c.http.Do(req)
@@ -132,19 +130,29 @@ func (c *Client) refreshKeysOnce(ctx context.Context, tenantID uuid.UUID) (retry
 	}
 	defer closeBody(c.log, resp.Body)
 
-	switch resp.StatusCode {
-	case http.StatusNoContent:
-		return false, nil
-	case http.StatusBadGateway:
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return false, nil // RP-17 answers 204; any 2xx is success
+	case resp.StatusCode == http.StatusBadGateway:
 		return true, fmt.Errorf("realmprovisioner: RP-17 reports keycloak_unavailable (502)")
+	case resp.StatusCode == http.StatusTooManyRequests,
+		resp.StatusCode == http.StatusServiceUnavailable,
+		resp.StatusCode == http.StatusGatewayTimeout:
+		// Mesh/proxy-level transients (an RP restart, "no healthy upstream",
+		// rate limiting): worth the single retry. A post-commit RP-17 failure
+		// does self-heal through keys_refresh_pending (TS-D22), but only on a
+		// later CronJob run (≥4 minutes), and it still counts as failed and
+		// pages — so absorbing a blip here is still worth it.
+		return true, fmt.Errorf("realmprovisioner: RP-17 temporarily unavailable (%d)", resp.StatusCode)
 	default:
 		return false, fmt.Errorf("realmprovisioner: unexpected status %d from RP-17", resp.StatusCode)
 	}
 }
 
-// closeBody closes body, logging (not propagating) a failure — mirrors
-// the Realm Provisioner tokenservice client's identical helper.
-func closeBody(log port.Logger, body io.Closer) {
+// closeBody drains (bounded) and closes body, logging (not propagating) a
+// failure. Draining lets the transport reuse the keep-alive connection.
+func closeBody(log port.Logger, body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
 	if err := body.Close(); err != nil && log != nil {
 		log.Warn("realmprovisioner: close response body failed", map[string]interface{}{"error": err.Error()})
 	}

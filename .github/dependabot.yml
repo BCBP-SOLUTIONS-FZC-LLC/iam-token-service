@@ -36,16 +36,12 @@ updates:
       - dependencies
       - github-actions
 
-# This file is named dependabot.yml.disabled (not dependabot.yml) so
-# Dependabot does not act on it yet — this service has no released
-# dependents relying on pinned versions and the team has not yet decided on
-# an auto-merge policy for private-module updates.
+# Enabled: third-party GitHub Actions are pinned to commit SHAs (with the
+# tag in a trailing comment), and this file is what keeps those pins — and
+# Go modules and the base images — current.
 #
-# To enable:
-#   git mv .github/dependabot.yml.disabled .github/dependabot.yml
-#
-# The github-bcbp registry entry also requires a Dependabot secret named
-# GO_PRIVATE_TOKEN to be configured separately in
-# Settings → Secrets and variables → Dependabot (this is a distinct secret
-# store from Actions secrets — the same token used there does not
-# automatically apply here).
+# The github-bcbp registry entry requires a Dependabot secret named
+# GO_PRIVATE_TOKEN in Settings → Secrets and variables → Dependabot (a
+# distinct secret store from Actions secrets — the same token used there
+# does not automatically apply here). Without it, only the gomod updates for
+# private modules fail; github-actions and docker updates still run.

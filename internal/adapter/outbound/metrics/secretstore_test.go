@@ -61,7 +61,7 @@ func histogramSampleCount(t *testing.T, h prometheus.Observer) uint64 {
 func TestInstrumentedSecretStore_Write_ObservesDurationAndPassesThrough(t *testing.T) {
 	Register("test")
 	before := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
-	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write"))
+	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success"))
 
 	inner := &fakeSecretStoreForDecorator{}
 	s := NewInstrumentedSecretStore(inner)
@@ -70,14 +70,14 @@ func TestInstrumentedSecretStore_Write_ObservesDurationAndPassesThrough(t *testi
 
 	after := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
 	assert.Equal(t, before+1, after, "Write must observe exactly one sample on op=write")
-	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write")),
-		"the Tier-1 platform_dependency_request_seconds{dependency=openbao,operation=write} must be dual-emitted alongside the legacy metric")
+	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success")),
+		"the Tier-1 platform_dependency_request_seconds{dependency=openbao,operation=write,outcome=success} must be dual-emitted alongside the legacy metric")
 }
 
 func TestInstrumentedSecretStore_Write_ObservesDurationEvenOnError(t *testing.T) {
 	Register("test")
 	before := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
-	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write"))
+	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "error"))
 
 	wantErr := errors.New("openbao unavailable")
 	inner := &fakeSecretStoreForDecorator{writeErr: wantErr}
@@ -87,13 +87,13 @@ func TestInstrumentedSecretStore_Write_ObservesDurationEvenOnError(t *testing.T)
 
 	after := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
 	assert.Equal(t, before+1, after, "call duration is observed unconditionally, even on failure")
-	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write")))
+	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "error")))
 }
 
 func TestInstrumentedSecretStore_Delete_ObservesDurationAndPassesThrough(t *testing.T) {
 	Register("test")
 	before := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
-	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete"))
+	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success"))
 
 	inner := &fakeSecretStoreForDecorator{}
 	s := NewInstrumentedSecretStore(inner)
@@ -102,14 +102,14 @@ func TestInstrumentedSecretStore_Delete_ObservesDurationAndPassesThrough(t *test
 
 	after := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
 	assert.Equal(t, before+1, after)
-	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete")),
-		"the Tier-1 platform_dependency_request_seconds{dependency=openbao,operation=delete} must be dual-emitted alongside the legacy metric")
+	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success")),
+		"the Tier-1 platform_dependency_request_seconds{dependency=openbao,operation=delete,outcome=success} must be dual-emitted alongside the legacy metric")
 }
 
 func TestInstrumentedSecretStore_Delete_ObservesDurationEvenOnError(t *testing.T) {
 	Register("test")
 	before := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
-	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete"))
+	beforeDep := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "error"))
 
 	wantErr := errors.New("openbao unavailable")
 	inner := &fakeSecretStoreForDecorator{deleteErr: wantErr}
@@ -119,7 +119,7 @@ func TestInstrumentedSecretStore_Delete_ObservesDurationEvenOnError(t *testing.T
 
 	after := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
 	assert.Equal(t, before+1, after)
-	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete")))
+	assert.Equal(t, beforeDep+1, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "error")))
 }
 
 // TestInstrumentedSecretStore_Read_PassesThroughUnmeasured and
@@ -131,8 +131,8 @@ func TestInstrumentedSecretStore_Read_PassesThroughUnmeasured(t *testing.T) {
 	Register("test")
 	beforeWrite := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
 	beforeDelete := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
-	beforeDepWrite := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write"))
-	beforeDepDelete := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete"))
+	beforeDepWrite := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success"))
+	beforeDepDelete := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success"))
 
 	inner := &fakeSecretStoreForDecorator{readVal: "plaintext"}
 	s := NewInstrumentedSecretStore(inner)
@@ -143,8 +143,8 @@ func TestInstrumentedSecretStore_Read_PassesThroughUnmeasured(t *testing.T) {
 
 	assert.Equal(t, beforeWrite, histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write")))
 	assert.Equal(t, beforeDelete, histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete")))
-	assert.Equal(t, beforeDepWrite, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write")))
-	assert.Equal(t, beforeDepDelete, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete")))
+	assert.Equal(t, beforeDepWrite, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success")))
+	assert.Equal(t, beforeDepDelete, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success")))
 }
 
 func TestInstrumentedSecretStore_Read_ErrorPassesThroughUnmeasured(t *testing.T) {
@@ -160,8 +160,8 @@ func TestInstrumentedSecretStore_List_PassesThroughUnmeasured(t *testing.T) {
 	Register("test")
 	beforeWrite := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write"))
 	beforeDelete := histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete"))
-	beforeDepWrite := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write"))
-	beforeDepDelete := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete"))
+	beforeDepWrite := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success"))
+	beforeDepDelete := histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success"))
 
 	inner := &fakeSecretStoreForDecorator{listVal: []string{"v1", "v2"}}
 	s := NewInstrumentedSecretStore(inner)
@@ -172,8 +172,8 @@ func TestInstrumentedSecretStore_List_PassesThroughUnmeasured(t *testing.T) {
 
 	assert.Equal(t, beforeWrite, histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("write")))
 	assert.Equal(t, beforeDelete, histogramSampleCount(t, OpenBaoCallDuration.WithLabelValues("delete")))
-	assert.Equal(t, beforeDepWrite, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write")))
-	assert.Equal(t, beforeDepDelete, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete")))
+	assert.Equal(t, beforeDepWrite, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "write", "success")))
+	assert.Equal(t, beforeDepDelete, histogramSampleCount(t, DependencyRequestDuration.WithLabelValues("openbao", "delete", "success")))
 }
 
 func TestInstrumentedSecretStore_List_ErrorPassesThrough(t *testing.T) {
@@ -187,4 +187,22 @@ func TestInstrumentedSecretStore_List_ErrorPassesThrough(t *testing.T) {
 
 func TestNewInstrumentedSecretStore_SatisfiesSecretStorePort(t *testing.T) {
 	var _ port.SecretStore = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{})
+}
+
+// Read (the JWKS hot path) and List are recorded on the Tier-1 dependency
+// metric only — the Tier-3 op label set stays frozen at write|delete.
+func TestInstrumentedSecretStore_ReadAndListRecordTier1Only(t *testing.T) {
+	Register("test")
+	readOK := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "read", OutcomeSuccess)
+	readErr := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "read", OutcomeError)
+	listOK := DependencyRequestDuration.WithLabelValues(DependencyOpenBao, "list", OutcomeSuccess)
+	beforeReadOK, beforeReadErr, beforeListOK := histogramSampleCount(t, readOK), histogramSampleCount(t, readErr), histogramSampleCount(t, listOK)
+
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{readVal: "k"}).Read(context.Background(), "p")
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{readErr: errors.New("403")}).Read(context.Background(), "p")
+	_, _ = NewInstrumentedSecretStore(&fakeSecretStoreForDecorator{listVal: []string{"v1"}}).List(context.Background(), "p")
+
+	assert.Equal(t, beforeReadOK+1, histogramSampleCount(t, readOK))
+	assert.Equal(t, beforeReadErr+1, histogramSampleCount(t, readErr), "read errors are visible")
+	assert.Equal(t, beforeListOK+1, histogramSampleCount(t, listOK))
 }

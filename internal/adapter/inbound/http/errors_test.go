@@ -1,7 +1,9 @@
 package http
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -195,4 +197,72 @@ func TestWriteMissingIdentityHeaders(t *testing.T) {
 	er := decodeErrorBody(t, rec)
 	assert.Equal(t, "missing_identity_headers", er.Error)
 	assert.Nil(t, er.Details)
+}
+
+// A 5xx domain error is logged with its cause and tenant — before, an
+// OpenBao outage left only a status code behind. 4xx stay quiet.
+func TestHandleError_ServerSideDomainErrorIsLogged(t *testing.T) {
+	fl := &fakeLogger{}
+	prevLogger := errorLogger
+	errorLogger = fl
+	defer func() { errorLogger = prevLogger }()
+
+	r := gin.New()
+	r.GET("/tenants/:id/probe", func(c *gin.Context) {
+		HandleError(c, domain.NewError(domain.ErrSecretStoreUnavailable, "openbao: write_secret: connection refused"))
+	})
+	r.GET("/tenants/:id/business", func(c *gin.Context) {
+		HandleError(c, domain.NewError(domain.ErrPrincipalRevoked, "revoked"))
+	})
+	tenantID := "8f1c3a2e-0000-4000-8000-000000000001"
+
+	rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID+"/probe", nil, nil)
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Len(t, fl.errorCalls, 1)
+	assert.Contains(t, fl.errorCalls[0]["error"], "write_secret")
+	assert.Equal(t, tenantID, fl.errorCalls[0]["tenant_id"])
+
+	doRequest(t, r, http.MethodGet, "/tenants/"+tenantID+"/business", nil, nil)
+	assert.Len(t, fl.errorCalls, 1, "a 4xx business outcome is not logged as an error")
+}
+
+// A statement cancelled because the request ended is not a database outage.
+func TestHandleError_CanceledRequestIsNotDBUnavailable(t *testing.T) {
+	fl := &fakeLogger{}
+	prevLogger := errorLogger
+	errorLogger = fl
+	defer func() { errorLogger = prevLogger }()
+
+	r := gin.New()
+	r.GET("/probe", func(c *gin.Context) {
+		ctx, cancel := context.WithCancel(c.Request.Context())
+		cancel()
+		c.Request = c.Request.WithContext(ctx)
+		HandleError(c, &pgconn.PgError{Code: "57014", Message: "canceling statement due to user request"})
+	})
+	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
+	assert.NotContains(t, rec.Body.String(), "db_unavailable")
+	assert.Empty(t, fl.errorCalls)
+}
+
+func TestHandleError_LeakedLockTimeout_Returns409RotationInFlight(t *testing.T) {
+	r := gin.New()
+	r.GET("/probe", func(c *gin.Context) {
+		HandleError(c, fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"}))
+	})
+	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	assert.Equal(t, "rotation_in_flight", decodeErrorBody(t, rec).Error)
+}
+
+func TestHandleError_CredentialReplayExpired_Is409WithVersion(t *testing.T) {
+	r := gin.New()
+	r.GET("/probe", func(c *gin.Context) {
+		HandleError(c, domain.NewError(domain.ErrCredentialReplayExpired, "too late").WithDetails(map[string]any{"version": 3}))
+	})
+	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	er := decodeErrorBody(t, rec)
+	assert.Equal(t, "credential_replay_expired", er.Error)
+	assert.EqualValues(t, 3, er.Details["version"])
 }

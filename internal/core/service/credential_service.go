@@ -1,6 +1,6 @@
-// Package service implements the business logic behind TS-1..TS-4 and the
-// reconciler jobs — domain + port only, no adapter/Gin/pgx/OpenBao-SDK
-// import (§3.2, enforced by .go-arch-lint.yml).
+// Package service implements the business logic behind TS-1..TS-6, the
+// EXT-6 JWKS route and the reconciler jobs — domain + port only, no
+// adapter/Gin/pgx/OpenBao-SDK import (§3.2, enforced by .go-arch-lint.yml).
 package service
 
 import (
@@ -24,7 +24,24 @@ type CredentialService struct {
 	log         port.Logger
 	generate    SecretGenerator
 	cadenceDays int
+
+	// replayWindow bounds how long after issue a rotation_id replay may
+	// re-read the private key (WithReplayWindow); 0 = unlimited.
+	replayWindow time.Duration
 }
+
+// DefaultReplayWindow is the rotation_id replay window applied when
+// WithReplayWindow is not called (ROTATION_REPLAY_WINDOW's default).
+const DefaultReplayWindow = 15 * time.Minute
+
+// inLockSecretWriteTimeout bounds TS-1's OpenBao write — including the
+// OpenBao client's one 403 re-login retry — while the principal row lock is
+// held. Every other credential write for the principal (and TS-4's
+// Register) waits on that lock only PG_LOCK_TIMEOUT (seconds) before
+// failing 409 rotation_in_flight; an unbounded write (HTTPTimeout per
+// attempt, a login plus a retry: ~24s) would fail every one of them.
+// A variable, not a const, so a test can shrink it.
+var inLockSecretWriteTimeout = 5 * time.Second
 
 // NewCredentialService wires CredentialService's dependencies. generate
 // defaults to DefaultKeyGenerator when nil (tests substitute a
@@ -43,7 +60,24 @@ func NewCredentialService(
 	return &CredentialService{
 		principals: principals, credentials: credentials, secrets: secrets,
 		tx: tx, log: log, generate: generate,
+		replayWindow: DefaultReplayWindow,
 	}
+}
+
+// WithReplayWindow sets how long after a credential's issued_at a TS-1
+// replay of its rotation_id may still return the private key
+// (ROTATION_REPLAY_WINDOW, default DefaultReplayWindow). A rotation_id is an
+// idempotency key for a retry of the SAME call, which happens within
+// seconds to minutes; without a bound, anyone holding an old rotation_id
+// (logs, a retry queue) could re-read a still-live private key at any
+// later time. Past the window the replay is 409 credential_replay_expired.
+// d <= 0 disables the limit.
+func (s *CredentialService) WithReplayWindow(d time.Duration) *CredentialService {
+	if d < 0 {
+		d = 0
+	}
+	s.replayWindow = d
+	return s
 }
 
 // WithCadenceDays overrides the default rotation cadence (§16 TSQ-6
@@ -72,6 +106,12 @@ func (s *CredentialService) cadenceDaysOrDefault() int {
 type IssueOrRotateRequest struct {
 	RotationID     uuid.UUID
 	OverlapSeconds int
+	// ExpectActiveVersion, when > 0, makes the call conditional: if the
+	// principal's active version (read under the principal lock) is not
+	// this one, nothing is written and ErrOptimisticLockConflict is
+	// returned. cmd/scheduler sets it to the version it found due, so a
+	// rotation an operator committed since enumeration is not rotated again.
+	ExpectActiveVersion int
 }
 
 // IssueOrRotateResult is the TS-1 response body (§5.4). Replayed is true
@@ -92,11 +132,23 @@ type IssueOrRotateResult struct {
 
 // issueOrRotate implements TS-1 (§5.4): issue the first credential for a
 // principal or rotate to the next version, returning the generated
-// plaintext exactly once (TS-INV-2). Write ordering is material-first,
-// then row, then commit (§9.3): an OpenBao failure leaves nothing
-// committed in Postgres; a crash between the OpenBao write and the
-// Postgres commit leaves a reclaimable orphan (§8.6, CUST-3). Wrapped by
-// the exported IssueOrRotate (tracing.go) which starts the
+// plaintext exactly once (TS-INV-2).
+//
+// Everything runs in ONE transaction that first locks the principal row
+// (PrincipalRepository.LockForUpdate), so issue/rotate/revoke for one
+// principal are serialized: two concurrent calls can no longer pick the
+// same next version and overwrite each other's OpenBao material, and a
+// caller waiting on the lock re-checks the rotation_id replay and the
+// principal's status after it acquires it. Write ordering stays
+// material-first (§9.3): the OpenBao write precedes the INSERT and the
+// commit, so an OpenBao failure commits nothing, and a crash between the
+// write and the commit leaves material at a version no row claims — the
+// next attempt for the principal overwrites it (it computes the same
+// max+1), and otherwise the §8.6 reconciler reclaims it. The lock is held
+// as briefly as possible: the keypair is generated before the transaction
+// and the in-lock OpenBao write is time-bounded (inLockSecretWriteTimeout).
+// Wrapped by the
+// exported IssueOrRotate (tracing.go), which starts the
 // "credential.issue_rotate" span (§11.3).
 func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, principalID uuid.UUID, req IssueOrRotateRequest, actor uuid.UUID) (*IssueOrRotateResult, error) {
 	if req.RotationID == uuid.Nil {
@@ -104,6 +156,9 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 			WithDetails(map[string]any{"field": "rotation_id"})
 	}
 
+	// Cheap pre-checks outside the lock: 404 / revoked principal, and the
+	// common replay of an already-committed rotation_id (§9.2) — no new
+	// material, no lock needed. Both are re-checked under the lock below.
 	principal, err := s.principals.FindByID(ctx, tenantID, principalID)
 	if err != nil {
 		return nil, err
@@ -111,10 +166,6 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 	if principal.IsRevoked() {
 		return nil, domain.NewError(domain.ErrPrincipalRevoked, "principal is revoked; issue/rotate rejected")
 	}
-
-	// Idempotency per rotation_id (§9.2): a retried call under the same
-	// rotation_id returns the already-committed version and secret without
-	// generating new material.
 	if existing, err := s.credentials.FindByRotationID(ctx, tenantID, principalID, req.RotationID); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -123,51 +174,97 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 
 	overlap := domain.ClampOverlapSeconds(req.OverlapSeconds)
 
-	active, err := s.credentials.FindActive(ctx, tenantID, principalID)
-	if err != nil {
-		return nil, err
-	}
-
-	nextVersion := 1
-	if active != nil {
-		nextVersion = active.Version + 1
-	}
-	path := domain.OpenBaoPathFor(tenantID, principal.KeycloakClientID, nextVersion)
-
+	// RSA-2048 keygen (tens to hundreds of ms) runs BEFORE the transaction,
+	// not while the principal row lock is held: it is pure, so a RunInTx
+	// retry reuses the same key, and a call that turns out to be a replay
+	// under the lock just discards it.
 	secret, err := s.generate()
 	if err != nil {
 		return nil, err
 	}
-	if err := s.secrets.Write(ctx, path, secret); err != nil {
-		return nil, err
-	}
 
-	rotationID := req.RotationID
-	cadenceDays := s.cadenceDaysOrDefault()
-	now := time.Now().UTC()
-	nextRotationAt := now.AddDate(0, 0, cadenceDays)
-	newCred := &domain.Credential{
-		TenantID: tenantID, PrincipalID: principalID, Version: nextVersion,
-		Status: domain.CredentialStatusActive, OpenBaoPath: path,
-		GrantedBy: actor, RotationID: &rotationID,
-		RotationCadenceDays: &cadenceDays, NextRotationAt: &nextRotationAt,
-	}
-
-	var expiresPrior *time.Time
+	var (
+		result *IssueOrRotateResult
+		replay *domain.Credential
+	)
 	err = s.tx.RunInTx(ctx, func(ctx context.Context) error {
-		// Demote the prior `active` row to `rotating` BEFORE inserting the
-		// new `active` row: uq_sac_one_active is a plain (non-deferrable)
-		// partial unique index, checked immediately per-statement — an
-		// insert-then-demote ordering would have both rows `active`
-		// simultaneously and fail the constraint at INSERT time.
+		// Every value below is derived inside the closure: RunInTx retries
+		// it on a serialization failure or deadlock, and a retry must start
+		// from freshly-read rows, not from structs a failed attempt mutated
+		// (Update scans the bumped record_version back into them).
+		result, replay = nil, nil
+		locked, err := s.principals.LockForUpdate(ctx, tenantID, principalID)
+		if err != nil {
+			return err
+		}
+		if locked.IsRevoked() {
+			return domain.NewError(domain.ErrPrincipalRevoked, "principal is revoked; issue/rotate rejected")
+		}
+		// A concurrent call with the same rotation_id may have committed
+		// while this one waited for the lock.
+		if existing, err := s.credentials.FindByRotationID(ctx, tenantID, principalID, req.RotationID); err != nil {
+			return err
+		} else if existing != nil {
+			replay = existing
+			return nil
+		}
+
+		active, err := s.credentials.FindActive(ctx, tenantID, principalID)
+		if err != nil {
+			return err
+		}
+		if req.ExpectActiveVersion > 0 && (active == nil || active.Version != req.ExpectActiveVersion) {
+			return domain.NewError(domain.ErrOptimisticLockConflict, "the active credential version changed; nothing was rotated")
+		}
+		// max+1, not active+1: after the active version has been revoked
+		// there is no active row, and restarting at 1 would collide with the
+		// existing rows (uq_sac_version) on every later issue.
+		maxVersion, err := s.credentials.MaxVersion(ctx, tenantID, principalID)
+		if err != nil {
+			return err
+		}
+		nextVersion := maxVersion + 1
+		path := domain.OpenBaoPathFor(tenantID, locked.KeycloakClientID, nextVersion)
+
+		// Material-first (§9.3): the write precedes the INSERT and commit.
+		// Bounded (inLockSecretWriteTimeout) because the principal lock is
+		// held across it.
+		writeCtx, cancelWrite := context.WithTimeout(ctx, inLockSecretWriteTimeout)
+		err = s.secrets.Write(writeCtx, path, secret)
+		cancelWrite()
+		if err != nil {
+			return err
+		}
+
+		rotationID := req.RotationID
+		cadenceDays := s.cadenceDaysOrDefault()
+		now := time.Now().UTC()
+		nextRotationAt := now.AddDate(0, 0, cadenceDays)
+		newCred := &domain.Credential{
+			TenantID: tenantID, PrincipalID: principalID, Version: nextVersion,
+			Status: domain.CredentialStatusActive, OpenBaoPath: path,
+			GrantedBy: actor, RotationID: &rotationID,
+			RotationCadenceDays: &cadenceDays, NextRotationAt: &nextRotationAt,
+		}
+
+		var expiresPrior *time.Time
 		if active != nil {
+			// TS-INV-3: at most one additional `rotating` version. A second
+			// rotate inside the overlap window ends any still-open earlier
+			// overlap now — JWKS stops serving it and the next sweep (this
+			// call's own, below, or cmd/rotator's) revokes it — so at most the
+			// new active plus the one being demoted stay live.
+			if err := s.expireOpenOverlaps(ctx, tenantID, principalID, active.ID, now); err != nil {
+				return err
+			}
+			// Demote the prior `active` row to `rotating` BEFORE inserting the
+			// new `active` row: uq_sac_one_active is a plain (non-deferrable)
+			// partial unique index, checked immediately per-statement.
 			expiresAt := now.Add(time.Duration(overlap) * time.Second)
 			active.Status = domain.CredentialStatusRotating
 			active.ExpiresAt = &expiresAt
 			// Only the current `active` version is ever "due" (§4.2, §16
-			// TSQ-6 Resolved) — clear the superseded row's cadence state
-			// rather than leaving a stale next_rotation_at on a row
-			// cmd/scheduler's idx_sac_next_rotation scan must never match.
+			// TSQ-6 Resolved) — clear the superseded row's cadence state.
 			active.RotationCadenceDays = nil
 			active.NextRotationAt = nil
 			if err := s.credentials.Update(ctx, active); err != nil {
@@ -178,6 +275,11 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 		if err := s.credentials.Insert(ctx, newCred); err != nil {
 			return err
 		}
+		result = &IssueOrRotateResult{
+			Version: nextVersion, Secret: secret, OpenBaoPath: path,
+			ExpiresPriorAt: expiresPrior, RecordVersion: newCred.RecordVersion,
+		}
+
 		pub, ok := port.EventPublisherFromContext(ctx)
 		if !ok {
 			return nil
@@ -200,26 +302,46 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 		})
 	})
 	if err != nil {
-		// Nothing further to compensate: the OpenBao write above is a
-		// reclaimable orphan (below the principal's committed max version),
-		// left for the §8.6 reconciler rather than deleted here — a
-		// same-transaction failure here means the caller never got a
-		// version number back, so it cannot yet be "the committed max".
-		return nil, err
+		return nil, s.enrichRotationInFlight(ctx, err, tenantID, principalID)
+	}
+	if replay != nil {
+		return s.replayIssueOrRotate(ctx, tenantID, principalID, replay)
 	}
 
-	s.sweepExpiredRotating(ctx, tenantID, principalID, actor)
+	// Detached from the request: the TS-1 response is already decided, and a
+	// client disconnect must not cut a revoke off between its OpenBao delete
+	// and its commit (a live row with no material, until the cron sweep).
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	s.sweepExpiredRotating(sweepCtx, tenantID, principalID, actor)
+	return result, nil
+}
 
-	return &IssueOrRotateResult{
-		Version: nextVersion, Secret: secret, OpenBaoPath: path,
-		ExpiresPriorAt: expiresPrior, RecordVersion: newCred.RecordVersion,
-	}, nil
+// expireOpenOverlaps ends the overlap window of every `rotating` row of the
+// principal other than exceptID whose window is still open, by setting its
+// expires_at to now (TS-INV-3). Runs inside the caller's locked transaction.
+func (s *CredentialService) expireOpenOverlaps(ctx context.Context, tenantID, principalID, exceptID uuid.UUID, now time.Time) error {
+	creds, err := s.credentials.ListByPrincipal(ctx, tenantID, principalID)
+	if err != nil {
+		return err
+	}
+	for _, c := range creds {
+		if c.ID == exceptID || c.Status != domain.CredentialStatusRotating || c.IsExpiredOverlap(now) {
+			continue
+		}
+		c.ExpiresAt = &now
+		if err := s.credentials.Update(ctx, c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // replayIssueOrRotate handles a TS-1 retry under an already-committed
 // rotation_id (§9.2): no new material, no new row, no new event — just the
 // existing version's secret re-read from OpenBao (port.SecretStore.Read,
-// scoped to exactly this replay path).
+// scoped to exactly this replay path) — and only within the replay window
+// (WithReplayWindow) of the row's issued_at.
 //
 // rotation_id is keyed to the row it created for the lifetime of that row,
 // not just "the current in-flight rotation" — a caller may legitimately
@@ -232,16 +354,32 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 // fail on a missing OpenBao entry would surface as a misleading 502
 // secret_store_unavailable (looks like an outage), so that case is
 // classified explicitly instead.
+//
+// Every replay is an audit event (TS-D23): a served one re-hands out a live
+// private key. replayIssueOrRotate logs each outcome at Info (never the
+// key); the metrics decorator counts it in
+// iam_token_service_credential_replays_total{result} from Replayed / the
+// replay error codes.
 func (s *CredentialService) replayIssueOrRotate(ctx context.Context, tenantID, principalID uuid.UUID, existing *domain.Credential) (*IssueOrRotateResult, error) {
 	if existing.Status == domain.CredentialStatusRevoked {
+		s.auditReplay(ctx, "revoked", tenantID, principalID, existing)
 		return nil, domain.NewError(domain.ErrCredentialReplayRevoked,
 			"rotation_id refers to a credential version that has since been revoked; issue a new rotation_id to rotate again").
+			WithDetails(map[string]any{"version": existing.Version})
+	}
+	// Past the replay window the key is still live but is no longer handed
+	// out again (WithReplayWindow, TS-D22).
+	if s.replayWindow > 0 && time.Now().After(existing.IssuedAt.Add(s.replayWindow)) {
+		s.auditReplay(ctx, "expired", tenantID, principalID, existing)
+		return nil, domain.NewError(domain.ErrCredentialReplayExpired,
+			"rotation_id replay window has elapsed; the private key is not returned again — issue a new rotation_id to rotate").
 			WithDetails(map[string]any{"version": existing.Version})
 	}
 	secret, err := s.secrets.Read(ctx, existing.OpenBaoPath)
 	if err != nil {
 		return nil, err
 	}
+	s.auditReplay(ctx, "served", tenantID, principalID, existing)
 	var expiresPrior *time.Time
 	if existing.Version > 1 {
 		if prior, err := s.credentials.FindByVersion(ctx, tenantID, principalID, existing.Version-1); err == nil && prior != nil {
@@ -252,6 +390,22 @@ func (s *CredentialService) replayIssueOrRotate(ctx context.Context, tenantID, p
 		Version: existing.Version, Secret: secret, OpenBaoPath: existing.OpenBaoPath,
 		ExpiresPriorAt: expiresPrior, RecordVersion: existing.RecordVersion, Replayed: true,
 	}, nil
+}
+
+// auditReplay writes the Info-level audit line for a rotation_id replay
+// (TS-D23). Identifiers only — never the key or its path's material.
+func (s *CredentialService) auditReplay(ctx context.Context, result string, tenantID, principalID uuid.UUID, c *domain.Credential) {
+	if s.log == nil {
+		return
+	}
+	fields := map[string]interface{}{
+		"tenant_id": tenantID.String(), "principal_id": principalID.String(),
+		"version": c.Version, "result": result,
+	}
+	if c.RotationID != nil {
+		fields["rotation_id"] = c.RotationID.String()
+	}
+	s.log.Info("credential: rotation_id replay", withTraceID(ctx, fields))
 }
 
 // RevokeResult is the TS-2 response body (§5.4).
@@ -280,35 +434,59 @@ func (s *CredentialService) revoke(ctx context.Context, tenantID, principalID uu
 }
 
 // revokeCredential is the shared revoke path used by both the public
-// Revoke (TS-2) and the opportunistic overlap-expiry sweep (§8.3). Ordering
-// mirrors TS-1's material-first discipline in the destructive direction:
-// OpenBao material is deleted BEFORE the Postgres commit, so a credential
-// row is never left `revoked` while its material still lives (CUST-2). A
-// crash between the two leaves a divergence in the opposite direction — a
-// non-revoked row whose material is already gone — which the §8.6
-// reconciler surfaces as `missing_material` (page-worthy) rather than
-// silently losing the fact that a delete was attempted.
+// Revoke (TS-2) and the opportunistic overlap-expiry sweep (§8.3). It runs
+// in one transaction that first takes the principal lock (serializing with
+// TS-1 and other revokes) and re-reads the row under it. Ordering mirrors
+// TS-1's material-first discipline in the destructive direction: the
+// OpenBao delete precedes the UPDATE and the commit, so a row is never left
+// `revoked` while its material still lives (CUST-2). A crash between the
+// two leaves the opposite divergence — a still-live row whose material is
+// gone — which the §8.6 reconciler surfaces as `missing_material`
+// (page-worthy) rather than silently losing the fact that a delete was
+// attempted.
 func (s *CredentialService) revokeCredential(ctx context.Context, tenantID, principalID uuid.UUID, cred *domain.Credential, actor uuid.UUID) (*RevokeResult, error) {
 	if cred.Status == domain.CredentialStatusRevoked {
-		revokedAt := time.Time{}
-		if cred.RevokedAt != nil {
-			revokedAt = *cred.RevokedAt
-		}
-		return &RevokeResult{Version: cred.Version, Status: cred.Status, RevokedAt: revokedAt}, nil
+		return revokedResult(cred), nil
 	}
 
-	if err := s.secrets.Delete(ctx, cred.OpenBaoPath); err != nil {
-		return nil, err
-	}
-
-	now := time.Now().UTC()
-	cred.Status = domain.CredentialStatusRevoked
-	cred.RevokedAt = &now
-
+	var result *RevokeResult
 	err := s.tx.RunInTx(ctx, func(ctx context.Context) error {
-		if err := s.credentials.Update(ctx, cred); err != nil {
+		result = nil
+		if _, err := s.principals.LockForUpdate(ctx, tenantID, principalID); err != nil {
 			return err
 		}
+		// Re-read under the lock: another revoke (TS-2, the sweep) may have
+		// won the race while this call waited — TS-2 is idempotent (§5.4),
+		// so that is success, not a 409.
+		latest, err := s.credentials.FindByVersion(ctx, tenantID, principalID, cred.Version)
+		if err != nil {
+			return err
+		}
+		if latest == nil {
+			return domain.NewError(domain.ErrPrincipalNotFound, "no credential at this version for this principal")
+		}
+		if latest.Status == domain.CredentialStatusRevoked {
+			result = revokedResult(latest)
+			return nil
+		}
+
+		// Bounded like TS-1's in-lock write (inLockSecretWriteTimeout): the
+		// principal lock is held across it, and every other writer for the
+		// principal gives up after PG_LOCK_TIMEOUT.
+		deleteCtx, cancelDelete := context.WithTimeout(ctx, inLockSecretWriteTimeout)
+		err = s.secrets.Delete(deleteCtx, latest.OpenBaoPath)
+		cancelDelete()
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		latest.Status = domain.CredentialStatusRevoked
+		latest.RevokedAt = &now
+		if err := s.credentials.Update(ctx, latest); err != nil {
+			return err
+		}
+		result = &RevokeResult{Version: latest.Version, Status: latest.Status, RevokedAt: now}
+
 		pub, ok := port.EventPublisherFromContext(ctx)
 		if !ok {
 			return nil
@@ -316,34 +494,68 @@ func (s *CredentialService) revokeCredential(ctx context.Context, tenantID, prin
 		return pub.Enqueue(ctx, &domain.Event{
 			Type: domain.EventServiceAccountCredentialRevoked, TenantID: tenantID, Actor: actor,
 			Data: domain.ServiceAccountCredentialRevokedPayload{
-				TenantID: tenantID, PrincipalID: principalID, Version: cred.Version,
+				TenantID: tenantID, PrincipalID: principalID, Version: latest.Version,
 				RevokedAt: now.Format(time.RFC3339),
 			},
 		})
 	})
 	if err != nil {
-		// A concurrent actor (another TS-2 call, or cmd/rotator's
-		// overlap-expiry sweep) may have revoked this exact row between our
-		// read and this write — record_version no longer matches, so Update
-		// reports ErrOptimisticLockConflict even though the caller's desired
-		// end state (revoked) was already reached by the other actor. TS-2
-		// is documented as idempotent (§5.4); that guarantee must hold
-		// against a genuine race, not only a stale read taken before one
-		// started. Re-check before surfacing what would otherwise be a
-		// misleading 409 for what is, from the caller's perspective, success.
+		// Defense in depth for a writer that does not take the principal lock
+		// (cmd/rotator's sweep revokes through the repository directly): if it
+		// revoked this row between our read and our write, Update reports
+		// ErrOptimisticLockConflict although the desired end state was reached.
 		var de *domain.Error
 		if errors.As(err, &de) && de.Code == domain.ErrOptimisticLockConflict {
 			if latest, findErr := s.credentials.FindByVersion(ctx, tenantID, principalID, cred.Version); findErr == nil && latest != nil && latest.Status == domain.CredentialStatusRevoked {
-				revokedAt := time.Time{}
-				if latest.RevokedAt != nil {
-					revokedAt = *latest.RevokedAt
-				}
-				return &RevokeResult{Version: latest.Version, Status: latest.Status, RevokedAt: revokedAt}, nil
+				return revokedResult(latest), nil
 			}
 		}
-		return nil, err
+		return nil, s.enrichRotationInFlight(ctx, err, tenantID, principalID)
 	}
-	return &RevokeResult{Version: cred.Version, Status: cred.Status, RevokedAt: now}, nil
+	return result, nil
+}
+
+// rotationInFlightLookupTimeout bounds enrichRotationInFlight's read: it
+// runs on a request that is already failing, and must not extend it much.
+const rotationInFlightLookupTimeout = 2 * time.Second
+
+// enrichRotationInFlight adds the frozen details.active_rotation_id (§17)
+// to a rotation_in_flight that lacks it — the principal-lock wait timeout
+// (SQLSTATE 55P03, TS-D21) is raised by LockForUpdate, which knows nothing
+// about credentials. Best effort: a plain, unlocked read of the principal's
+// active credential, outside the aborted transaction (ctx here carries no
+// tx); a failed read, or no active row, returns err unchanged. The value
+// is the rotation_id of the active credential as last committed — the one
+// a caller would retry against — since the lock holder's own rotation is
+// not visible until it commits. Any other error passes through untouched.
+func (s *CredentialService) enrichRotationInFlight(ctx context.Context, err error, tenantID, principalID uuid.UUID) error {
+	var de *domain.Error
+	if !errors.As(err, &de) || de.Code != domain.ErrRotationInFlight {
+		return err
+	}
+	if _, ok := de.Details["active_rotation_id"]; ok {
+		return err
+	}
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rotationInFlightLookupTimeout)
+	defer cancel()
+	active, findErr := s.credentials.FindActive(lookupCtx, tenantID, principalID)
+	if findErr != nil || active == nil || active.RotationID == nil {
+		return err
+	}
+	details := make(map[string]any, len(de.Details)+1)
+	for k, v := range de.Details {
+		details[k] = v
+	}
+	details["active_rotation_id"] = *active.RotationID
+	return domain.NewError(de.Code, de.Message).WithDetails(details)
+}
+
+func revokedResult(c *domain.Credential) *RevokeResult {
+	revokedAt := time.Time{}
+	if c.RevokedAt != nil {
+		revokedAt = *c.RevokedAt
+	}
+	return &RevokeResult{Version: c.Version, Status: c.Status, RevokedAt: revokedAt}
 }
 
 // sweepExpiredRotating opportunistically revokes principalID's own expired

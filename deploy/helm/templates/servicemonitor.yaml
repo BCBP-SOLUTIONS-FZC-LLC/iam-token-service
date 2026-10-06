@@ -21,6 +21,13 @@ spec:
     # metrics platform-gincommon/platform-events already emit.
     - port: metrics
       path: /metrics
+      # Keep the series' own const labels {domain, service, environment}:
+      # without honorLabels the operator's target label service=<k8s
+      # Service name> overwrites gincommon's service="iam-token-service"
+      # (renamed exported_service), and every alert selecting on
+      # service="iam-token-service" (OutboxStuck, OutboxBacklogGrowing,
+      # SQSReceiveErrors, PostgresPoolExhaustion) never matches.
+      honorLabels: true
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       {{- with .Values.serviceMonitor.relabelings }}

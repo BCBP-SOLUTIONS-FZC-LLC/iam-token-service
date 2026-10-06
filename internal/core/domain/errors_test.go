@@ -19,6 +19,9 @@ func TestError_Status(t *testing.T) {
 		{ErrSecretStoreUnavailable, 502},
 		{ErrInvalidRequest, 400},
 		{ErrDBUnavailable, 503},
+		{ErrCredentialReplayRevoked, 409},
+		{ErrCredentialReplayExpired, 409},
+		{ErrJWKSKeysUnavailable, 503},
 		{ErrorCode("something_unmapped"), 500},
 	}
 	for _, tc := range cases {

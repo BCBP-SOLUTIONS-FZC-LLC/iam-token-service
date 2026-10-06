@@ -2,25 +2,24 @@ package main
 
 import (
 	"context"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel"
-	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // startJobSpan starts a top-level rotator span on gincommon's process-global
-// TracerProvider (installed by InitTracingFromEnv in main). Matches
-// iam-org-membership cmd/reconciler's otel.Tracer(serviceName).Start.
+// TracerProvider (installed by InitTracingWithConfig in main). Matches
+// iam-org-membership cmd/reconciler's gincommon.NewTracer(serviceName).Start.
 func startJobSpan(ctx context.Context, serviceName, jobName string) (context.Context, func()) {
 	if serviceName == "" {
 		serviceName = "iam-token-service"
 	}
-	ctx, span := otel.Tracer(serviceName).Start(ctx, "rotator."+jobName)
+	ctx, span := gincommon.NewTracer(serviceName).Start(ctx, "rotator."+jobName)
 	return ctx, func() { span.End() }
 }
 
@@ -72,11 +71,11 @@ func withTenantGUC(ctx context.Context, tenantID uuid.UUID) context.Context {
 // gincommon's TracerProvider, adds trace_id so rotator logs join the same
 // trace as the rotator.* job span (iam-user-profile logCtx).
 func fieldsWithTrace(ctx context.Context, fields map[string]interface{}) map[string]interface{} {
-	if span := oteltrace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+	if traceID := gincommon.SpanTraceID(ctx); traceID != "" {
 		if fields == nil {
 			fields = map[string]interface{}{}
 		}
-		fields["trace_id"] = span.SpanContext().TraceID().String()
+		fields["trace_id"] = traceID
 	}
 	return fields
 }

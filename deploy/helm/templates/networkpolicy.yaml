@@ -17,10 +17,21 @@ namespace — keycloakNamespaceSelector lets it be scoped separately,
 wherever Keycloak actually runs, with the identical fail-closed posture as
 ingressNamespaceSelector above (no safe default; an empty selector is a
 silent open-to-the-cluster, not a restriction).
+
+NetworkPolicy is L4 only: the Keycloak (and Workflow) rules below admit the
+WHOLE HTTP port, not one route. The Istio AuthorizationPolicy
+(authorizationpolicy.yaml) is what limits each to its one route, and it is
+required outside local/dev/test (templates/validate.yaml).
 */}}
 {{- if .Values.networkPolicy.enabled }}
 {{- if not .Values.networkPolicy.ingressNamespaceSelector }}
 {{- fail "networkPolicy.ingressNamespaceSelector is required when networkPolicy.enabled is true — an empty selector matches every namespace in the cluster (no restriction). Set it to a real namespace label selector scoping ingress to your mesh namespace(s), e.g. {matchLabels: {mesh: iam}}. See values.yaml." }}
+{{- end }}
+{{- if not .Values.networkPolicy.monitoringNamespaceSelector }}
+{{- fail "networkPolicy.monitoringNamespaceSelector is required when networkPolicy.enabled is true — without it Prometheus cannot scrape any pod, ServerDown pages permanently and every other alert goes dark. Set it to your monitoring namespace's label selector, e.g. {matchLabels: {kubernetes.io/metadata.name: monitoring}}. See values.yaml." }}
+{{- end }}
+{{- if not (.Values.networkPolicy.egress | default dict).postgresCIDRs }}
+{{- fail "networkPolicy.egress.postgresCIDRs is required when networkPolicy.enabled is true — Postgres (RDS) is off-cluster and a namespaceSelector never matches it, so without its CIDR every workload fails its startup database connection. See values.yaml." }}
 {{- end }}
 {{- if not .Values.networkPolicy.keycloakNamespaceSelector }}
 {{- fail "networkPolicy.keycloakNamespaceSelector is required when networkPolicy.enabled is true — the platform-automation JWKS route (EXT-6) needs Keycloak's own outbound fetch admitted separately from ingressNamespaceSelector, since Keycloak's request carries no caller identity and may not live in the same namespace as the RP/O&M/operator mesh. Set it to a real namespace label selector, e.g. {matchLabels: {app: keycloak}}. See values.yaml." }}
@@ -44,14 +55,15 @@ spec:
             {{- .Values.networkPolicy.ingressNamespaceSelector | toYaml | nindent 12 }}
       ports:
         - port: http
-        - port: metrics
-    # Keycloak's client-jwt authenticator fetch (EXT-6) — JWKS only, in
-    # practice, but NetworkPolicy has no path-level granularity; the JWKS
-    # route's own security model is network-trust-plus-RLS-from-path
-    # rather than header auth (§5.6), so this coarser port-level rule
-    # doesn't weaken any other route's actual gate (RequireAuth/
-    # GUCBridgeMiddleware still reject a header-less request everywhere
-    # else on this port).
+    {{- include "iam-token-service.metricsIngress" . | nindent 4 }}
+    # Keycloak's client-jwt authenticator fetch (EXT-6). NetworkPolicy has
+    # no path-level granularity, so this admits Keycloak's namespace to the
+    # WHOLE HTTP port — and the other routes' only gate is the x-user-id
+    # header, which any pod in that namespace can set to the reserved
+    # system principal. This rule alone therefore lets that namespace call
+    # TS-1/TS-2/TS-4; the Istio AuthorizationPolicy (authorizationpolicy.yaml,
+    # required outside local/dev/test) is what restricts it to the JWKS
+    # route.
     - from:
         - namespaceSelector:
             {{- .Values.networkPolicy.keycloakNamespaceSelector | toYaml | nindent 12 }}
@@ -60,7 +72,8 @@ spec:
     {{- with .Values.networkPolicy.workflowNamespaceSelector }}
     # Workflow connector workers reading TS-6 (TS-D17) — optional, only
     # rendered when Workflow runs outside ingressNamespaceSelector's
-    # namespaces. Header auth still gates the route itself.
+    # namespaces. Like the Keycloak rule, this admits the whole port; the
+    # AuthorizationPolicy limits Workflow to TS-6.
     - from:
         - namespaceSelector:
             {{- . | toYaml | nindent 12 }}
@@ -86,12 +99,13 @@ spec:
   ingress:
     # The consumer's HTTP surface is only /healthz /readyz (probes) and
     # /metrics — no business API (§7.1 — it is driven by SQS, not HTTP).
+    # Probes come from the kubelet (node-local, not subject to this policy).
     - from:
         - namespaceSelector:
             {{- .Values.networkPolicy.ingressNamespaceSelector | toYaml | nindent 12 }}
       ports:
         - port: http
-        - port: metrics
+    {{- include "iam-token-service.metricsIngress" . | nindent 4 }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
 ---
@@ -116,7 +130,11 @@ spec:
     matchLabels:
       {{- include "iam-token-service.componentSelectorLabels" (dict "component" "rotator" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
   policyTypes:
+    - Ingress
     - Egress
+  # Prometheus scrapes the run's metrics during its brief grace window.
+  ingress:
+    {{- include "iam-token-service.metricsIngress" . | nindent 4 }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
     - to:
@@ -140,7 +158,11 @@ spec:
     matchLabels:
       {{- include "iam-token-service.componentSelectorLabels" (dict "component" "scheduler" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
   policyTypes:
+    - Ingress
     - Egress
+  # Prometheus scrapes the run's metrics during its brief grace window.
+  ingress:
+    {{- include "iam-token-service.metricsIngress" . | nindent 4 }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
     - to:
@@ -148,4 +170,49 @@ spec:
       ports:
         - port: {{ .Values.networkPolicy.realmProvisionerPort }}
           protocol: TCP
+{{- if .Values.migrations.enabled }}
+---
+# The migrate hook Job (job-migrate.yaml): no ingress at all (it serves
+# nothing — no probes, no /metrics), egress only to DNS, Postgres (the
+# migrator DSN goes direct on postgresDirectPort, past PgBouncer; DATABASE_URL
+# may go through PgBouncer on postgresPort) and the OTel collector. A pre-install/
+# pre-upgrade hook at weight -10, like the Job's ServiceAccount, so it is in
+# place before the Job's pod starts on a first install.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-migrate
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    {{- include "iam-token-service.migrateHookPrereqAnnotations" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-token-service.componentSelectorLabels" (dict "component" "migrate" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    {{- $egress := .Values.networkPolicy.egress | default dict }}
+    - to:
+        {{- include "iam-token-service.egressPeers" (dict "cidrs" $egress.dnsCIDRs) | nindent 8 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        {{- include "iam-token-service.egressPeers" (dict "cidrs" $egress.postgresCIDRs) | nindent 8 }}
+      ports:
+        {{- include "iam-token-service.postgresEgressPorts" . | nindent 8 }}
+    {{- if .Values.otel.exporterEndpoint }}
+    - to:
+        {{- include "iam-token-service.egressPeers" (dict "cidrs" $egress.otelCIDRs) | nindent 8 }}
+      ports:
+        - port: {{ .Values.networkPolicy.otelPort | default 4317 }}
+          protocol: TCP
+    {{- end }}
+{{- end }}
 {{- end }}

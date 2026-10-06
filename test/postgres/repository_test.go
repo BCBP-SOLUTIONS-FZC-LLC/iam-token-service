@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -371,30 +372,46 @@ func TestCredentialRepository_RotationIDIdempotency(t *testing.T) {
 	require.Error(t, err, "a second row under the same rotation_id must be rejected (uq_sac_rotation_id)")
 }
 
-// TestProcessedEventsRepository_MarkAndCheck — the dedup round trip
-// (§9.2, ON CONFLICT DO NOTHING at the DB level).
-func TestProcessedEventsRepository_MarkAndCheck(t *testing.T) {
+// TestInboxRepository_ProcessOnceAndPrune — the platform-events inbox over
+// the service-owned processed_events table (§9.2): the first delivery runs
+// fn and records the ID, a redelivery is a duplicate, a failed fn leaves the
+// ID unrecorded, and Prune removes only rows past retention.
+func TestInboxRepository_ProcessOnceAndPrune(t *testing.T) {
 	t.Parallel()
-	appPool, _, _ := setupTestDB(t)
+	appPool, _, rawPool := setupTestDB(t)
 	ctx := context.Background()
-	// processed_events is RLS-exempt (§4.3) — no tenant GUC needed, the
-	// plain appPool (no WithGUCSet in ctx) reaches it directly.
-	repo := pgadapter.NewProcessedEventsRepository(appPool)
-
+	// processed_events is RLS-exempt (§4.3) — no tenant GUC needed.
+	repo := pgadapter.NewInboxRepository(appPool, nil)
+	consumer := port.ProcessedEventsConsumerTenantOffboarding
 	eventID := uuid.NewString()
 
-	seen, err := repo.IsProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, eventID)
+	runs := 0
+	dup, err := repo.ProcessOnce(ctx, consumer, eventID, "TenantMembershipsPurged", func(txCtx context.Context) error {
+		_, inTx := port.TxFromContext(txCtx)
+		assert.True(t, inTx, "fn must run inside the claim's transaction")
+		runs++
+		return nil
+	})
 	require.NoError(t, err)
-	assert.False(t, seen)
+	assert.False(t, dup)
 
-	require.NoError(t, repo.MarkProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, eventID))
-
-	seen, err = repo.IsProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, eventID)
+	dup, err = repo.ProcessOnce(ctx, consumer, eventID, "TenantMembershipsPurged", func(context.Context) error { runs++; return nil })
 	require.NoError(t, err)
-	assert.True(t, seen)
+	assert.True(t, dup)
+	assert.Equal(t, 1, runs)
 
-	// Idempotent re-mark: no error, no duplicate row (composite PK).
-	require.NoError(t, repo.MarkProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, eventID))
+	failing := uuid.NewString()
+	_, err = repo.ProcessOnce(ctx, consumer, failing, "TenantMembershipsPurged", func(context.Context) error { return errors.New("boom") })
+	require.Error(t, err)
+	var n int
+	require.NoError(t, rawPool.QueryRow(ctx, `SELECT count(*) FROM processed_events WHERE event_id = $1`, failing).Scan(&n))
+	assert.Zero(t, n, "a failed fn must roll the claim back")
+
+	_, err = rawPool.Exec(ctx, `UPDATE processed_events SET processed_at = now() - interval '10 days' WHERE event_id = $1`, eventID)
+	require.NoError(t, err)
+	deleted, err := repo.Prune(ctx, consumer, 8*24*time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
 }
 
 // TestPrincipalRepository_FindByID covers the found, not-found, and
@@ -678,53 +695,47 @@ func TestCredentialRepository_InsertConflicts(t *testing.T) {
 		"no active row exists at this point — activeRotationID must resolve to nil, leaving details unset")
 }
 
-// TestProcessedEventsRepository_Prune — deletes only rows older than
-// ttlDays, respecting the limit batch size so a backlog larger than one
-// tick converges over several calls (§4.2/§15.4).
-func TestProcessedEventsRepository_Prune(t *testing.T) {
+// TestInboxRepository_Prune — deletes only rows older than the retention,
+// in batches of the given size until none are left (inbox.Store.Prune), so
+// a backlog larger than one batch converges in one call (§4.2/§15.4).
+func TestInboxRepository_Prune(t *testing.T) {
 	t.Parallel()
 	appPool, _, rawPool := setupTestDB(t)
 	ctx := context.Background()
-	repo := pgadapter.NewProcessedEventsRepository(appPool)
+	repo := pgadapter.NewInboxRepository(appPool, nil)
+	consumer := port.ProcessedEventsConsumerTenantOffboarding
 
 	// Three old rows (eligible) + one fresh row (not eligible).
-	var oldIDs []string
-	for i := 0; i < 3; i++ {
-		id := uuid.NewString()
-		oldIDs = append(oldIDs, id)
+	for range 3 {
 		_, err := rawPool.Exec(ctx, `
 			INSERT INTO processed_events (event_id, consumer, processed_at)
-			VALUES ($1, $2, now() - interval '10 days')`, id, string(port.ProcessedEventsConsumerTenantOffboarding))
+			VALUES ($1, $2, now() - interval '10 days')`, uuid.NewString(), string(consumer))
 		require.NoError(t, err)
 	}
 	freshID := uuid.NewString()
-	require.NoError(t, repo.MarkProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, freshID))
-
-	// No-op: nothing older than a very long TTL.
-	n, err := repo.Prune(ctx, 365, 100)
+	_, err := repo.ProcessOnce(ctx, consumer, freshID, "TenantMembershipsPurged", func(context.Context) error { return nil })
 	require.NoError(t, err)
-	assert.Equal(t, 0, n)
 
-	// First call: TTL of 8 days makes the 3 old rows eligible, but limit=2
-	// caps this call to 2 deletions.
-	n, err = repo.Prune(ctx, 8, 2)
+	// No-op: nothing older than a very long retention.
+	n, err := repo.Prune(ctx, consumer, 365*24*time.Hour, 100)
 	require.NoError(t, err)
-	assert.Equal(t, 2, n, "must respect the limit batch size")
+	assert.Zero(t, n)
 
-	// Second call: the remaining 1 old row is pruned; the fresh row is untouched.
-	n, err = repo.Prune(ctx, 8, 100)
+	// Batch size 2 below the 3 eligible rows: the loop still clears them all.
+	n, err = repo.Prune(ctx, consumer, 8*24*time.Hour, 2)
 	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	assert.Equal(t, int64(3), n)
 
-	seenFresh, err := repo.IsProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, freshID)
+	var remaining []string
+	rows, err := rawPool.Query(ctx, `SELECT event_id FROM processed_events WHERE consumer = $1`, string(consumer))
 	require.NoError(t, err)
-	assert.True(t, seenFresh, "a fresh row must survive pruning")
-
-	for _, id := range oldIDs {
-		seen, err := repo.IsProcessed(ctx, port.ProcessedEventsConsumerTenantOffboarding, id)
-		require.NoError(t, err)
-		assert.False(t, seen, "an old row must be gone after pruning")
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		remaining = append(remaining, id)
 	}
+	assert.Equal(t, []string{freshID}, remaining, "only the fresh row survives pruning")
 }
 
 // TestPrincipalRepository_ListByTenantAndDeleteByTenant — the offboarding

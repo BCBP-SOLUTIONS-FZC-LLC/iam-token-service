@@ -6,9 +6,13 @@ metadata:
     {{- include "iam-token-service.labels" . | nindent 4 }}
     app.kubernetes.io/component: server
 spec:
+  {{- if not .Values.autoscaling.enabled }}
+  # Omitted when the HPA owns the replica count, so `helm upgrade` does not
+  # reset it.
   replicas: {{ .Values.server.replicaCount }}
+  {{- end }}
   # No local disk state and no long-running in-flight work beyond a single
-  # HTTP request or outbox-publish batch, but maxSurge: 0 with hard pod
+  # HTTP request or outbox-publish batch, but maxSurge: 0 with pod
   # anti-affinity below still means a rolling update never has 0 AND never
   # exceeds replicaCount pods scheduled at once (§13.2 — HA, not throughput).
   strategy:
@@ -30,29 +34,49 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.service.metricsPort | quote }}
         prometheus.io/path: /metrics
-        {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-        {{- else }}
-        rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
-        {{- end }}
+        {{- include "iam-token-service.secretRestartAnnotation" . | nindent 8 }}
+        {{- include "iam-token-service.meshPodAnnotations" (dict "grace" (.Values.server.terminationGracePeriodSeconds | default 80) "root" $) | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      serviceAccountName: {{ include "iam-token-service.workloadServiceAccountName" (dict "component" "server" "root" $) }}
+      # Covers SHUTDOWN_DRAIN_DELAY + HTTP drain (30s) + outbox drain (30s)
+      # + pool drain, so a rollout never SIGKILLs a publish mid-flight.
+      terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds | default 80 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       # Spreads server replicas across nodes so a single node loss/drain
       # cannot take out more than one replica at a time — matches
-      # maxUnavailable: 1 above (§13.2 HA).
+      # maxUnavailable: 1 above (§13.2 HA). Hard (required) for the fixed
+      # replicaCount; preferred under the HPA, which may scale past the
+      # node count — a hard rule would leave the extra replicas Pending.
       affinity:
         podAntiAffinity:
+          {{- if .Values.autoscaling.enabled }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+          {{- else }}
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
                   {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 18 }}
               topologyKey: kubernetes.io/hostname
+          {{- end }}
+      # And across zones, best effort: hostname anti-affinity alone allows
+      # both replicas in one AZ.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 14 }}
       containers:
         - name: server
-          image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+          image: {{ include "iam-token-service.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/iam-token-service-server"]
           securityContext:
@@ -64,6 +88,9 @@ spec:
               containerPort: {{ .Values.service.metricsPort }}
           env:
             {{- include "iam-token-service.commonEnv" . | nindent 12 }}
+            {{- include "iam-token-service.reconcilerDBEnv" . | nindent 12 }}
+            - name: GOMEMLIMIT
+              value: {{ .Values.server.goMemLimit | quote }}
             - name: APP_PORT
               value: {{ .Values.service.port | quote }}
             - name: METRICS_PORT
@@ -76,12 +103,34 @@ spec:
               value: {{ .Values.jwks.rateLimitRPS | quote }}
             - name: JWKS_RATE_LIMIT_BURST
               value: {{ .Values.jwks.rateLimitBurst | quote }}
+            - name: JWKS_RATE_LIMIT_PER_TENANT_RPS
+              value: {{ .Values.jwks.perTenantRPS | quote }}
+            - name: JWKS_RATE_LIMIT_PER_TENANT_BURST
+              value: {{ .Values.jwks.perTenantBurst | quote }}
+            - name: JWKS_RATE_LIMIT_UNKNOWN_TENANT_RPS
+              value: {{ .Values.jwks.unknownTenantRPS | default 2 | quote }}
+            - name: JWKS_RATE_LIMIT_UNKNOWN_TENANT_BURST
+              value: {{ .Values.jwks.unknownTenantBurst | default 5 | quote }}
+            - name: JWKS_KNOWN_TENANTS_REFRESH
+              value: {{ .Values.jwks.knownTenantsRefresh | default "15s" | quote }}
+            - name: ROTATION_REPLAY_WINDOW
+              value: {{ .Values.rotation.replayWindow | default "15m" | quote }}
+            - name: SHUTDOWN_DRAIN_DELAY
+              value: {{ .Values.shutdown.drainDelay | quote }}
             - name: GLUE_REGISTRY_NAME
               value: {{ .Values.events.glueRegistryName | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.events.awsRegion | quote }}
             - name: SNS_TOPIC_ARN
               value: {{ .Values.events.topicArn | quote }}
-            - name: SNS_TOPIC_SERVICEACCOUNT_ARN
-              value: {{ .Values.events.topicArn | quote }}
+            - name: PG_STATEMENT_TIMEOUT
+              value: {{ .Values.database.pool.statementTimeout | quote }}
+            - name: ROTATION_OVERLAP_GAUGE_INTERVAL
+              value: {{ .Values.exporters.rotationOverlapInterval | quote }}
+            - name: RLS_VIOLATION_EXPORTER_INTERVAL
+              value: {{ .Values.exporters.rlsViolationInterval | quote }}
+            - name: KEYS_REFRESH_EXPORTER_INTERVAL
+              value: {{ .Values.exporters.keysRefreshInterval | default "30s" | quote }}
             - name: OUTBOX_POLL_INTERVAL
               value: {{ .Values.outbox.pollInterval | quote }}
             - name: OUTBOX_BATCH_SIZE
@@ -100,7 +149,7 @@ spec:
               value: {{ .Values.outbox.claimLeaseDuration | quote }}
             - name: DOCS_ENABLED
               value: {{ .Values.docs.enabled | quote }}
-            {{- if .Values.docs.authToken }}
+            {{- if .Values.docs.authEnabled }}
             - name: DOCS_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -113,24 +162,31 @@ spec:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2
             periodSeconds: 5
-            failureThreshold: 12
             timeoutSeconds: 3
+            failureThreshold: 12
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 0
             periodSeconds: 15
+            timeoutSeconds: 3
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 0
             periodSeconds: 10
+            # Above the handler's own 2s per-check bound (readinessCheckTimeout),
+            # so a slow dependency answers 503 from /readyz rather than the
+            # kubelet timing out the probe at the 1s default.
+            timeoutSeconds: 3
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- include "iam-token-service.openbaoVolumeMounts" . | trim | nindent 12 }}
       # Required under securityContext.readOnlyRootFilesystem: true — any
       # incidental temp-file write (e.g. Go's os.CreateTemp) needs a writable
       # path.
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- include "iam-token-service.openbaoVolumes" . | trim | nindent 8 }}

@@ -1,0 +1,11 @@
+# Trivy exceptions. Every entry is narrow (one advisory id), carries a
+# reason, and EXPIRES: once the date passes Trivy reports it again and the
+# CI gate fails, forcing a re-check instead of a permanent silence.
+
+# tzdata 2026b in the gcr.io/distroless/static-debian12:nonroot base image.
+# DLA-4792-1 is a timezone-rules data update (2026c), not a code
+# vulnerability; Trivy rates it UNKNOWN, which ci.yml's PR scan treats as
+# blocking. As of 2026-10-07 the newest upstream distroless image
+# (sha256:afa5c872…) still ships 2026b, so there is no base to move to yet.
+# Drop this line once a rebuilt distroless image carries 2026c.
+DLA-4792-1 exp:2026-11-07

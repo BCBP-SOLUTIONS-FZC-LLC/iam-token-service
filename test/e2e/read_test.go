@@ -96,10 +96,8 @@ func TestRead_NonexistentPrincipal(t *testing.T) {
 }
 
 // TestRead_MissingIdentityHeaders covers the 401 path when no identity
-// headers are sent at all — see
-// TestRegister_MissingIdentityHeaders/TestRegister_NonSystemPrincipalUserID
-// (register_test.go) for why this asserts a generic gincommon error
-// rather than this service's own missing_identity_headers code.
+// headers are sent at all: the frozen §17 missing_identity_headers code (see
+// TestRegister_MissingIdentityHeaders, register_test.go).
 func TestRead_MissingIdentityHeaders(t *testing.T) {
 	t.Parallel()
 	tenantID := newTenantID()
@@ -111,8 +109,8 @@ func TestRead_MissingIdentityHeaders(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if er.Error == "" {
-		t.Fatal("error must be set")
+	if er.Error != "missing_identity_headers" {
+		t.Fatalf("error = %q, want missing_identity_headers", er.Error)
 	}
 }
 

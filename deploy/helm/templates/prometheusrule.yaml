@@ -8,6 +8,8 @@ add or change an alert, update BOTH files.
 */ -}}
 {{- if .Values.serviceMonitor.enabled }}
 {{- $job := include "iam-token-service.fullname" . }}
+{{- /* The HPA's floor when it owns the replica count, else the fixed count. */}}
+{{- $minServer := ternary .Values.autoscaling.minReplicas .Values.server.replicaCount .Values.autoscaling.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -30,11 +32,17 @@ spec:
           labels:
             severity: critical
             team: platform
+            # Static identity: absent() and kube-state-metrics series carry
+            # none of the {domain, service, environment} const labels the
+            # service's own metrics do, so routing by environment needs them set.
+            domain: {{ .Values.observabilityDomain | default "iam" | quote }}
+            service: {{ include "iam-token-service.name" . | quote }}
+            environment: {{ .Values.appEnv | quote }}
           annotations:
             summary: iam-token-service server has no healthy instances
             description: >-
               No iam-token-service server pods have been scraped as healthy
-              for 2 minutes — this blocks TS-1..TS-4. Check pod readiness:
+              for 2 minutes — this blocks TS-1..TS-6 and the JWKS route. Check pod readiness:
               kubectl get pods -l app.kubernetes.io/component=server,app.kubernetes.io/name=iam-token-service
 
         - alert: IAMTokenServiceConsumerDown
@@ -44,6 +52,12 @@ spec:
           labels:
             severity: warning
             team: platform
+            # Static identity: absent() and kube-state-metrics series carry
+            # none of the {domain, service, environment} const labels the
+            # service's own metrics do, so routing by environment needs them set.
+            domain: {{ .Values.observabilityDomain | default "iam" | quote }}
+            service: {{ include "iam-token-service.name" . | quote }}
+            environment: {{ .Values.appEnv | quote }}
           annotations:
             summary: iam-token-service consumer has no healthy instances
             description: >-
@@ -57,7 +71,7 @@ spec:
         # ── Pod count below minimum ─────────────────────────────────────
         - alert: IAMTokenServiceServerReplicasMissing
           expr: |
-            sum(up{job={{ printf "%s-server" $job | quote }}}) < {{ .Values.server.replicaCount }}
+            count by (domain, service, environment) (platform_build_info{job={{ printf "%s-server" $job | quote }}}) < {{ $minServer }}
           for: 5m
           labels:
             severity: warning
@@ -65,7 +79,7 @@ spec:
           annotations:
             summary: iam-token-service server running below configured replica count
             description: >-
-              Fewer than {{ .Values.server.replicaCount }} server replicas are healthy. Current healthy count: {{ "{{ $value }}" }}.
+              Fewer than {{ $minServer }} server replicas are healthy. Current healthy count: {{ "{{ $value }}" }}.
 
         # ── Rotator CronJob missed its schedule ─────────────────────────
         - alert: IAMTokenServiceRotatorNotRunning
@@ -74,6 +88,12 @@ spec:
           labels:
             severity: warning
             team: platform
+            # Static identity: absent() and kube-state-metrics series carry
+            # none of the {domain, service, environment} const labels the
+            # service's own metrics do, so routing by environment needs them set.
+            domain: {{ .Values.observabilityDomain | default "iam" | quote }}
+            service: {{ include "iam-token-service.name" . | quote }}
+            environment: {{ .Values.appEnv | quote }}
           annotations:
             summary: iam-token-service rotator has not completed successfully recently
             description: >-
@@ -82,20 +102,78 @@ spec:
               15 minutes against its {{ .Values.rotator.schedule }} schedule.
               Check kubectl get jobs -l app.kubernetes.io/component=rotator.
 
+        # ── Scheduler CronJob missed its schedule (§16 TSQ-6) ──────────
+        - alert: IAMTokenServiceSchedulerNotRunning
+          expr: |
+            time() - kube_cronjob_status_last_successful_time{cronjob={{ printf "%s-scheduler" $job | quote }}} > 900
+          labels:
+            severity: warning
+            team: platform
+            # Static identity: absent() and kube-state-metrics series carry
+            # none of the {domain, service, environment} const labels the
+            # service's own metrics do, so routing by environment needs them set.
+            domain: {{ .Values.observabilityDomain | default "iam" | quote }}
+            service: {{ include "iam-token-service.name" . | quote }}
+            environment: {{ .Values.appEnv | quote }}
+          annotations:
+            summary: iam-token-service scheduler has not completed successfully recently
+            description: >-
+              The cadence-rotation CronJob has not had a successful run in
+              over 15 minutes — automatic rotations are not happening. Check
+              kubectl get jobs -l app.kubernetes.io/component=scheduler.
+
+        # ── A CronJob's latest run did not succeed ──────────────────────
+        # Both binaries exit 1 on a failed run or a page-worthy divergence
+        # (podFailurePolicy fails the Job at once). The per-run counters below
+        # say why; this fires from kube-state-metrics even when the run's
+        # metrics were never scraped. The latest run was scheduled after the
+        # last success (or nothing ever succeeded) and nothing is running now:
+        # it failed. Fires ~2m after the first failed run, well before
+        # Rotator/SchedulerNotRunning's 15m.
+        - alert: IAMTokenServiceCronJobRunFailed
+          expr: |
+            (
+              kube_cronjob_status_last_schedule_time{cronjob=~{{ printf "%s-(rotator|scheduler)" $job | quote }}}
+                > on (namespace, cronjob) kube_cronjob_status_last_successful_time{cronjob=~{{ printf "%s-(rotator|scheduler)" $job | quote }}}
+              or
+              kube_cronjob_status_last_schedule_time{cronjob=~{{ printf "%s-(rotator|scheduler)" $job | quote }}}
+                unless on (namespace, cronjob) kube_cronjob_status_last_successful_time{cronjob=~{{ printf "%s-(rotator|scheduler)" $job | quote }}}
+            )
+            and on (namespace, cronjob) (kube_cronjob_status_active{cronjob=~{{ printf "%s-(rotator|scheduler)" $job | quote }}} == 0)
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+            # Static identity: absent() and kube-state-metrics series carry
+            # none of the {domain, service, environment} const labels the
+            # service's own metrics do, so routing by environment needs them set.
+            domain: {{ .Values.observabilityDomain | default "iam" | quote }}
+            service: {{ include "iam-token-service.name" . | quote }}
+            environment: {{ .Values.appEnv | quote }}
+          annotations:
+            summary: iam-token-service {{ "{{ $labels.cronjob }}" }} run failed
+            description: >-
+              The latest scheduled run of {{ "{{ $labels.cronjob }}" }} has
+              not succeeded. Check the failed Job's logs (kubectl get jobs
+              -l app.kubernetes.io/component=rotator|scheduler) for the
+              failing tenant/principal/version.
+
     - name: iam_token_service_errors
       rules:
 
         # ── HTTP 5xx error rate (server) ──────────────────────────────────
         - alert: IAMTokenServiceHighErrorRate
           expr: |
-            sum(rate(http_requests_total{job={{ printf "%s-server" $job | quote }}, status=~"5.."}[5m]))
+            sum by (domain, service, environment) (rate(platform_http_requests_total{job={{ printf "%s-server" $job | quote }}, status_class="5xx"}[5m]))
               /
-            sum(rate(http_requests_total{job={{ printf "%s-server" $job | quote }}}[5m]))
+            sum by (domain, service, environment) (rate(platform_http_requests_total{job={{ printf "%s-server" $job | quote }}}[5m]))
             > 0.05
           for: 5m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service 5xx error rate above 5%
             description: >-
@@ -103,13 +181,13 @@ spec:
               over the last 5 minutes. Check Postgres/OpenBao dependency
               health and application logs.
 
-        # ── OpenBao call failures via elevated call duration (proxy — no
-        #    dedicated failure counter exists; a stalled/unreachable OpenBao
-        #    shows up as call duration piling up against HTTPTimeout) ──────
+        # ── OpenBao call latency — a stalled OpenBao shows up here before the
+        #    calls fail; the failures themselves are
+        #    IAMTokenServiceOpenBaoErrors below ──────────────────────────────
         - alert: IAMTokenServiceOpenBaoCallLatencyHigh
           expr: |
             histogram_quantile(0.99,
-              sum by (le, op) (
+              sum by (le, op, domain, service, environment) (
                 rate(iam_token_service_openbao_call_duration_seconds_bucket{job={{ printf "%s-server" $job | quote }}}[5m])
               )
             ) > 5
@@ -123,6 +201,34 @@ spec:
               OpenBao KV v2 {{ "{{ $labels.op }}" }} calls are taking over 5s at p99 —
               approaching the 8s HTTPTimeout default. Check OpenBao health
               and the Kubernetes auth login path (§10.5).
+
+        # ── OpenBao call failures ─────────────────────────────────────────
+        # platform_dependency_request_seconds_count{dependency="openbao",
+        # outcome="error"} counts failed KV v2 calls (write|delete|read|list),
+        # dual-emitted by every binary — selected by service, not job, so the
+        # consumer's cascade deletes and the CronJobs' sweeps count too. All
+        # series are pre-initialised at 0, so a plain rate() is exact.
+        - alert: IAMTokenServiceOpenBaoErrors
+          expr: |
+            sum by (domain, service, environment) (rate(platform_dependency_request_seconds_count{service={{ include "iam-token-service.name" . | quote }}, dependency="openbao", outcome="error"}[10m]))
+              /
+            sum by (domain, service, environment) (rate(platform_dependency_request_seconds_count{service={{ include "iam-token-service.name" . | quote }}, dependency="openbao"}[10m]))
+            > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
+          annotations:
+            summary: iam-token-service OpenBao calls are failing
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of OpenBao KV v2 calls failed over
+              the last 10 minutes. TS-1/TS-2 return 502 secret_store_unavailable,
+              the JWKS route may answer 503 jwks_keys_unavailable, and the
+              offboarding cascade is redelivered. Check OpenBao health/seal
+              status and the Kubernetes auth login (role binding, token
+              audience).
 
         # ── Offboarding cascade failures ──────────────────────────────────
         - alert: IAMTokenServiceOffboardingCascadeFailures
@@ -143,7 +249,7 @@ spec:
         # ── Consumed-schema contract break (page) ─────────────────────────
         - alert: IAMTokenServiceConsumedSchemaViolation
           expr: |
-            sum by (event_type) (increase(iam_token_service_consumed_schema_violations_total{job={{ printf "%s-consumer" $job | quote }}}[15m])) > 0
+            sum by (domain, service, environment, event_type) (increase(iam_token_service_consumed_schema_violations_total{job={{ printf "%s-consumer" $job | quote }}}[15m])) > 0
           labels:
             severity: critical
             team: platform
@@ -158,25 +264,56 @@ spec:
               api/asyncapi.yaml is stale. Inspect the DLQ message, fix the
               wrong side, then redrive.
 
+        # ── Offboarding event with no usable envelope id (page) ───────────
+        #    A TenantMembershipsPurged that cannot be deduplicated is sent
+        #    straight to the DLQ (DLQReason=invalid_envelope_id) rather than
+        #    acked: the tenant's credential erasure (GDPR, §15.2) has NOT run
+        #    and will not until someone redrives it. schema_violation rejects
+        #    are counted here too but already page via
+        #    IAMTokenServiceConsumedSchemaViolation, so they are not repeated.
+        - alert: IAMTokenServiceOffboardingInvalidEnvelopeRejected
+          expr: |
+            sum by (domain, service, environment) (increase(iam_token_service_consumer_dlq_rejects_total{job={{ printf "%s-consumer" $job | quote }}, reason="invalid_envelope_id"}[15m])) > 0
+          labels:
+            severity: critical
+            team: platform
+            compliance: gdpr-erasure
+          annotations:
+            summary: iam-token-service sent a TenantMembershipsPurged with no valid envelope id to the DLQ
+            description: >-
+              {{ "{{ $value | humanize }}" }} TenantMembershipsPurged event(s) in the last
+              15 minutes had a missing or non-UUID envelope id and were sent
+              straight to the offboarding DLQ (DLQReason=invalid_envelope_id) —
+              those tenants' credentials have NOT been revoked. Fix the producer
+              (iam-org-membership), give the DLQ message a valid id, then
+              redrive.
+
         # ── Overlap-expiry sweep failures ─────────────────────────────────
+        #    An RP-17 failure after a revoke leaves a keys_refresh_pending
+        #    marker that the next rotator/scheduler run retries first, so that
+        #    half self-heals once the Realm Provisioner is healthy again ─────
         - alert: IAMTokenServiceRotationSweepFailures
           expr: |
-            increase(iam_token_service_rotation_sweep_total{job={{ printf "%s-rotator" $job | quote }}, result="error"}[1h]) > 0
+            max by (domain, service, environment) (max_over_time(iam_token_service_rotation_sweep_total{job={{ printf "%s-rotator" $job | quote }}, result="error"}[1h])) > 0
           labels:
             severity: warning
             team: platform
           annotations:
             summary: iam-token-service overlap-expiry sweep is failing
             description: >-
-              {{ "{{ $value | humanize }}" }} sweep error(s) in the last hour (§8.3) —
-              overlap-window credential material may not be revoked on
-              time. Check rotator CronJob logs.
+              {{ "{{ $value | humanize }}" }} sweep run(s) with errors in the last hour (§8.3) —
+              overlap-window credential material may not be revoked on time, or
+              a revoke committed but its RP-17 key-cache refresh failed. The
+              latter is retried at the start of every rotator/scheduler run from
+              keys_refresh_pending (SELECT * FROM keys_refresh_pending) and
+              self-heals once the Realm Provisioner is healthy. Check rotator
+              CronJob logs.
 
         # ── Orphan-material reconciler found material with no owning row —
         #    page-worthy per §11.5 (a real inconsistency, not routine) ─────
         - alert: IAMTokenServiceOrphanMaterialMissing
           expr: |
-            increase(iam_token_service_material_reconcile_total{job={{ printf "%s-rotator" $job | quote }}, result="missing_material"}[1h]) > 0
+            max by (domain, service, environment) (max_over_time(iam_token_service_material_reconcile_total{job={{ printf "%s-rotator" $job | quote }}, result="missing_material"}[1h])) > 0
           labels:
             severity: critical
             team: platform
@@ -189,33 +326,34 @@ spec:
               Investigate immediately; this principal cannot authenticate.
 
         # ── Cadence-driven rotation failed (§16 TSQ-6 Resolved, TS-D14) —
-        #    page-worthy per §11.5: this can mean IssueOrRotate committed
-        #    but the RP-17 key-refresh then failed (TS-INV-7-style
-        #    two-halves gap, TS-D15), which does NOT self-heal on the next
-        #    scan since next_rotation_at has already advanced ────────────
+        #    page-worthy per §11.5: IssueOrRotate failed, or it committed but
+        #    the RP-17 key-refresh then failed (TS-D15). next_rotation_at has
+        #    already advanced, but the owed refresh is kept in
+        #    keys_refresh_pending and retried at the start of every
+        #    rotator/scheduler run, so it self-heals once RP-17 recovers ─────
         - alert: IAMTokenServiceCadenceRotationFailures
           expr: |
-            increase(iam_token_service_cadence_rotation_total{job={{ printf "%s-scheduler" $job | quote }}, result="failed"}[1h]) > 0
+            max by (domain, service, environment) (max_over_time(iam_token_service_cadence_rotation_total{job={{ printf "%s-scheduler" $job | quote }}, result="failed"}[1h])) > 0
           labels:
             severity: critical
             team: platform
           annotations:
             summary: iam-token-service automatic cadence-driven rotation is failing
             description: >-
-              {{ "{{ $value | humanize }}" }} failed result(s) from the §16 TSQ-6
-              cadence scheduler in the last hour — either IssueOrRotate
-              itself failed (retried next scan), or it committed but the
-              RP-17 ClearServiceAccountKeysCache call then failed (TS-D15),
-              which will NOT self-heal: the affected principal's
-              next_rotation_at has already advanced. Check scheduler
-              CronJob logs for the tenant/principal/version and complete
-              the missed RP-17 call by hand if needed.
+              {{ "{{ $value | humanize }}" }} failed result(s) from the §16 TSQ-6 cadence scheduler
+              in the last hour — either IssueOrRotate itself failed (retried next
+              scan), or it committed but the RP-17 ClearServiceAccountKeysCache
+              call then failed (TS-D15). The owed refresh stays in
+              keys_refresh_pending and is retried at the start of every
+              rotator/scheduler run; check SELECT * FROM keys_refresh_pending
+              and the Realm Provisioner's health. Rows older than a few runs
+              mean RP-17 is still failing — see the scheduler CronJob logs.
 
         # ── JWKS route couldn't serve a live credential's key (EXT-6,
         #    TS-D15) — page-worthy per §11.5: this service believes the
-        #    credential is live, so this is a real per-credential Keycloak
-        #    auth outage silently returned as 200, not a routine "unknown
-        #    tenant" empty response ────────────────────────────────────
+        #    credential is live but cannot read its key from OpenBao, so the
+        #    route answers 503 (Keycloak keeps its cached keys) instead of a
+        #    200 that silently drops the key ─────────────────────────────────
         - alert: IAMTokenServiceJWKSKeyErrors
           expr: |
             increase(iam_token_service_jwks_key_errors_total{job={{ printf "%s-server" $job | quote }}}[15m]) > 0
@@ -225,13 +363,37 @@ spec:
           annotations:
             summary: iam-token-service JWKS route could not serve a live credential's key
             description: >-
-              {{ "{{ $value | humanize }}" }} unreadable/unparseable credential(s)
-              in the last 15 minutes (§5.4, EXT-6) — Keycloak's client-jwt
-              authenticator cannot validate that principal's assertion
-              until this is fixed. Check server logs for "jwks: skipping
-              unreadable credential"
-              (tenant_id/principal_id/credential_id/version) and
-              investigate the OpenBao entry at that credential's path.
+              {{ "{{ $value | humanize }}" }} unreadable/unparseable credential(s) in the last 15
+              minutes (§5.4, EXT-6). If the active key, or every key, was
+              unreadable the route answered 503 jwks_keys_unavailable (Keycloak
+              keeps its cached keys, but cannot pick up a new one); if only an
+              overlap (rotating) key was missing it answered 200 without it.
+              Check server logs for "jwks: skipping unreadable credential"
+              (tenant_id/principal_id/credential_id/version), OpenBao health,
+              and the OpenBao entry at that credential's path.
+
+        # ── JWKS route rate limiting (per-tenant or global) ─────────────
+        #    By bucket: a flood of unknown/random tenant ids is absorbed by
+        #    the shared "unknown" bucket and never reaches a real tenant's
+        #    budget, so it does not page. The unlabelled
+        #    iam_token_service_jwks_rate_limited_total still counts every 429.
+        - alert: IAMTokenServiceJWKSRateLimited
+          expr: |
+            sum by (domain, service, environment) (increase(iam_token_service_jwks_rate_limited_by_bucket_total{job={{ printf "%s-server" $job | quote }}, bucket!="unknown"}[10m])) > 0
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-token-service is rate-limiting JWKS requests
+            description: >-
+              {{ "{{ $value | humanize }}" }} JWKS request(s) for known tenants answered
+              429 in the last 10 minutes (per-tenant or global bucket). A
+              rate-limited Keycloak fetch right after RP-17 means that tenant's
+              automation cannot authenticate. Find the flooding caller (access
+              log by tenant path); raise jwks.perTenantRPS only if the traffic
+              is legitimate. 429s in the shared unknown-tenant bucket (random
+              tenant ids, a scan) are deliberately excluded:
+              iam_token_service_jwks_rate_limited_by_bucket_total{bucket="unknown"}.
 
     - name: iam_token_service_latency
       rules:
@@ -240,14 +402,16 @@ spec:
         - alert: IAMTokenServiceHighLatency
           expr: |
             histogram_quantile(0.99,
-              sum by (le) (
-                rate(http_request_duration_seconds_bucket{job={{ printf "%s-server" $job | quote }}}[5m])
+              sum by (le, domain, service, environment) (
+                rate(platform_http_request_duration_seconds_bucket{job={{ printf "%s-server" $job | quote }}}[5m])
               )
             ) > 1
           for: 10m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service p99 latency above 1s
             description: >-
@@ -273,15 +437,48 @@ spec:
               hour — this should trend to zero as the overlap window
               expires and the §8.3 sweep runs. Check the rotator CronJob.
 
+        # ── Owed RP-17 key-cache refreshes not draining (EXT-6, TS-D15) ───
+        # iam_token_service_keys_refresh_oldest_age_seconds: age of the oldest
+        # keys_refresh_pending row — a committed rotate/revoke whose Keycloak
+        # key-cache refresh is not yet confirmed. Every rotator/scheduler run
+        # retries them first, so a row older than 15m has survived ~3 runs:
+        # RP-17 is still failing and Keycloak may be serving a revoked key or
+        # missing a new one. Every server replica exports the same DB state,
+        # hence max.
+        - alert: IAMTokenServiceKeysRefreshBacklog
+          expr: |
+            max by (domain, service, environment) (iam_token_service_keys_refresh_oldest_age_seconds{job={{ printf "%s-server" $job | quote }}}) > 900
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-token-service has RP-17 key-cache refreshes owed for over 15 minutes
+            description: >-
+              The oldest owed Keycloak key-cache refresh is
+              {{ "{{ $value | humanizeDuration }}" }} old
+              (iam_token_service_keys_refresh_pending tenants are owed one).
+              Keycloak may still accept a revoked key or reject a new one for
+              those tenants. Check the Realm Provisioner's health and the
+              rotator/scheduler CronJob logs; SELECT * FROM keys_refresh_pending.
+
     - name: iam_token_service_outbox_and_queues
       rules:
 
-        # ── Transactional outbox dead-letters — outbox_dead_letters_total
-        #    is platform-events' own metric (registered automatically by
-        #    events.Init), not something this service defines itself.
+        # ── Transactional outbox dead-letters — platform_dlq_messages_total
+        #    {operation="outbox_publish", reason="max_attempts"} is
+        #    platform-events' own metric (registered by events.InitMetrics),
+        #    not something this service defines itself. Its per-event_type
+        #    series are born at 1, which increase() alone reports as 0, so a
+        #    series born inside the window counts too (platform-events'
+        #    reference-rule pattern).
         - alert: IAMTokenServiceOutboxStuck
           expr: |
-            increase(outbox_dead_letters_total{service={{ $job | quote }}}[30m]) > 0
+            sum by (domain, service, environment) (
+              (platform_dlq_messages_total{service={{ include "iam-token-service.name" . | quote }}, operation="outbox_publish", reason="max_attempts"} unless last_over_time(platform_dlq_messages_total{service={{ include "iam-token-service.name" . | quote }}, operation="outbox_publish", reason="max_attempts"}[1h] offset 30m))
+                or
+              increase(platform_dlq_messages_total{service={{ include "iam-token-service.name" . | quote }}, operation="outbox_publish", reason="max_attempts"}[30m])
+            ) > 0
           for: 15m
           labels:
             severity: warning
@@ -294,82 +491,102 @@ spec:
               ServiceAccountCredentialRotated, ServiceAccountCredentialRevoked,
               ServiceAccountRevoked) exhausted MaxAttempts and were moved to
               outbox_dead_letters. Check the outbox runner logs for SNS
-              publish errors and verify SNS_TOPIC_SERVICEACCOUNT_ARN
+              publish errors and verify SNS_TOPIC_ARN
               connectivity; outbox_dead_letters is queryable/retryable via
               standard SQL.
 
-        # ── SQS ReceiveMessage errors on the offboarding queue ────────────
+        # ── SQS ReceiveMessage errors ─────────────────────────────────────
+        # platform_dependency_request_seconds_count{dependency="sqs",
+        # operation="receive_message", outcome="error"} is the successor of the
+        # removed per-queue SQS receive-error counter: it has NO queue label, so this is per
+        # service (cmd/consumer reads only the offboarding queue, so nothing is
+        # lost here). Error series are born at 1 — counted like the DLQ alert.
         - alert: IAMTokenServiceSQSReceiveErrors
           expr: |
-            increase(sqs_receive_errors_total{service={{ $job | quote }}}[30m]) > 0
+            sum by (domain, service, environment) (
+              (platform_dependency_request_seconds_count{service={{ include "iam-token-service.name" . | quote }}, dependency="sqs", operation="receive_message", outcome="error"} unless last_over_time(platform_dependency_request_seconds_count{service={{ include "iam-token-service.name" . | quote }}, dependency="sqs", operation="receive_message", outcome="error"}[1h] offset 30m))
+                or
+              increase(platform_dependency_request_seconds_count{service={{ include "iam-token-service.name" . | quote }}, dependency="sqs", operation="receive_message", outcome="error"}[30m])
+            ) > 0
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
-            summary: iam-token-service is failing to receive from the offboarding queue
+            summary: iam-token-service is failing to receive from SQS
             description: >-
-              {{ "{{ $value | humanize }}" }} SQS ReceiveMessage error(s) (excludes context
-              cancellation) in the last 30 minutes. Check IAM permissions
-              and queue connectivity for the offboarding queue.
+              SQS ReceiveMessage error(s) (excludes context cancellation) in
+              the last 30 minutes. The metric has no queue label; this
+              service consumes only the offboarding queue. Check IAM
+              permissions and queue connectivity for it.
 
         # ── Outbox backlog building up (before dead-letter, above) ────────
-        # outbox_pending_total is platform-events' own gauge (see
+        # platform_outbox_pending_events is platform-events' own gauge (see
         # internal/adapter/outbound/metrics/metrics.go's header comment for
-        # why this service does not duplicate it) — a sustained backlog here
+        # why this service does not duplicate it; unlike its removed predecessor
+        # it is never -1 — a failed count keeps the last
+        # value and increments platform_outbox_errors_total{operation="pending_count"})
+        # — a sustained backlog here
         # means the 500ms outbox runner is falling behind or stalled,
         # distinct from IAMTokenServiceOutboxStuck (only fires once
         # MaxAttempts is exhausted and a row is dead-lettered — this catches
         # the earlier, still-recoverable stage).
         - alert: IAMTokenServiceOutboxBacklogGrowing
           expr: |
-            outbox_pending_total{service={{ $job | quote }}} > 100
+            max by (domain, service, environment) (platform_outbox_pending_events{service={{ include "iam-token-service.name" . | quote }}}) > 100
           for: 15m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service outbox has a growing unrelayed backlog
             description: >-
               {{ "{{ $value | humanize }}" }} outbox rows have been unrelayed for 15+
-              minutes. Check the outbox runner logs and SNS_TOPIC_SERVICEACCOUNT_ARN
+              minutes. Check the outbox runner logs and SNS_TOPIC_ARN
               connectivity before this escalates to dead-lettered events.
 
         # ── Postgres connection pool exhaustion ───────────────────────────
-        # pgcommon_pool_empty_acquire_total (platform-pgcommon's
-        # PoolStatsCollector, wired in cmd/server/consumer/rotator's
-        # main.go) counts acquires that had to wait because the pool had no
-        # idle connection — a rising count under normal traffic means
-        # PG_MAX_CONNS is undersized for current concurrency, or a slow
-        # query/transaction is holding connections open longer than
-        # expected. The "-reconciler" suffix on the service label
-        # distinguishes the BYPASSRLS reconciler pool from the RLS-scoped
-        # app pool.
+        # platform_db_pool_empty_acquires_total (platform-pgcommon; registered
+        # per pool by pgcommon.NewPool once pgmetrics.InitWithIdentity has run)
+        # counts acquires that had to wait because the pool had no idle
+        # connection — a rising count under normal traffic means PG_MAX_CONNS
+        # is undersized for current concurrency, or a slow query/transaction is
+        # holding connections open longer than expected. The `pool` label
+        # distinguishes the RLS-scoped app pool ("default") from the BYPASSRLS
+        # reconciler pool ("reconciler") — it replaces the old "-reconciler"
+        # suffix on the service label.
         - alert: IAMTokenServicePostgresPoolExhaustion
           expr: |
-            increase(pgcommon_pool_empty_acquire_total{service=~{{ printf "^%s.*" $job | quote }}}[15m]) > 0
+            sum by (domain, service, environment, pool) (
+              increase(platform_db_pool_empty_acquires_total{service={{ include "iam-token-service.name" . | quote }}}[15m])
+            ) > 0
           for: 5m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: iam-token-service Postgres connection pool is exhausted
             description: >-
-              One or more requests on pool "{{ "{{ $labels.service }}" }}" had to wait
+              One or more requests on pool "{{ "{{ $labels.pool }}" }}" had to wait
               for a connection because none were idle. Compare
-              pgcommon_pool_acquired_conns to pgcommon_pool_max_conns and check
+              platform_db_pool_connections{state="acquired"} to
+              platform_db_pool_max_connections and check
               for slow queries/long-held transactions before raising
               PG_MAX_CONNS.
 
-        # ── SQS backlog/message-age on the offboarding queue ──────────────
-        # NOTE: this requires a CloudWatch metrics exporter (e.g.
-        # yet-another-cloudwatch-exporter) scraping
-        # tenant-lifecycle-tokensvc-q into
-        # aws_sqs_approximate_age_of_oldest_message_maximum — neither this
-        # service's process nor platform-events exposes queue depth/age
-        # in-process (SQS ReceiveMessage never reveals it; only the AWS API
-        # does). Dormant (no data, never fires) until that exporter is
-        # deployed and configured for this queue — IAMTokenServiceSQSReceiveErrors
-        # above is what IS monitored today without one.
+        # ── SQS message-age on the offboarding queue ──────────────────────
+        # NOTE: needs a CloudWatch metrics exporter (e.g.
+        # yet-another-cloudwatch-exporter) scraping tenant-lifecycle-tokensvc-q
+        # into aws_sqs_approximate_age_of_oldest_message_maximum — SQS exposes
+        # message age only through CloudWatch. Dormant (no data, never fires)
+        # until that exporter is deployed; the depth-based
+        # IAMTokenServiceOffboardingQueueStalled below covers the same failure
+        # from platform-events' own sampler.
         - alert: IAMTokenServiceOffboardingQueueBacklogGrowing
           expr: |
             aws_sqs_approximate_age_of_oldest_message_maximum{queue_name="tenant-lifecycle-tokensvc-q"} > 900
@@ -383,44 +600,98 @@ spec:
               The oldest unprocessed TenantMembershipsPurged message on
               tenant-lifecycle-tokensvc-q has been waiting more than 15
               minutes — the consumer may be stalled or under-provisioned
-              (SQS_OFFBOARDING_CONCURRENCY). Check consumer pod health and
+              (SQS_CONCURRENCY). Check consumer pod health and
               IAMTokenServiceConsumerDown.
+
+        # ── Offboarding queue backlog not draining ────────────────────────
+        # platform_queue_depth (platform-events, sampled every
+        # SQS_QUEUE_DEPTH_INTERVAL): visible messages waiting on the queue.
+        # Offboarding traffic is sparse and each message is handled in seconds,
+        # so a backlog that never empties for 15m means the consumer is not
+        # receiving. Every replica samples the same queue, hence max.
+        - alert: IAMTokenServiceOffboardingQueueStalled
+          expr: |
+            max by (domain, service, environment, queue) (platform_queue_depth{job={{ printf "%s-consumer" $job | quote }}}) > 0
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
+          annotations:
+            summary: iam-token-service's offboarding queue is not draining
+            description: >-
+              {{ "{{ $value }}" }} TenantMembershipsPurged message(s) have been waiting on
+              {{ "{{ $labels.queue }}" }} for 15+ minutes — offboarded tenants'
+              credentials are not being revoked. Check consumer pod health
+              (IAMTokenServiceConsumerDown), IAMTokenServiceSQSReceiveErrors and
+              IAMTokenServiceOffboardingCascadeFailures.
+
+        # ── Messages sitting in the offboarding DLQ ───────────────────────
+        # platform_dlq_depth (platform-events): the DLQ named by the queue's
+        # RedrivePolicy, labelled with the SOURCE queue. The inflow alerts
+        # (IAMTokenServiceConsumedSchemaViolation, cascade failures) say why
+        # messages arrived; this one says they are still there.
+        - alert: IAMTokenServiceOffboardingDLQBacklog
+          expr: |
+            max by (domain, service, environment, queue) (platform_dlq_depth{job={{ printf "%s-consumer" $job | quote }}}) > 0
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
+          annotations:
+            summary: Messages are waiting in the {{ "{{ $labels.queue }}" }} DLQ
+            description: >-
+              {{ "{{ $value }}" }} message(s) in the DLQ of {{ "{{ $labels.queue }}" }} — those
+              tenants' offboarding cascade has not run. Inspect their DLQReason
+              attribute, fix the cause, then redrive.
 
     - name: iam_token_service_tenant_isolation
       rules:
 
         # ── RLS-6 cross-tenant access (§17.5 Case 5 equivalent) ───────────
+        # iam_rls_violations_total (Tier 2) is counted by the server's
+        # exporter from rls_violation_log (migration 000003, 1%-sampled).
+        # Every server replica counts the same rows, hence max, not sum.
         - alert: IAMTokenServiceRLSCrossTenantAccess
           expr: |
-            increase(iam_token_service_rls_violations_total{violation_type="cross_tenant_access"}[5m]) > 0
+            max by (domain, service, environment) (
+              increase(iam_rls_violations_total{job={{ printf "%s-server" $job | quote }}, violation_type="cross_tenant_access"}[5m])
+            ) > 0
           labels:
             severity: critical
             team: platform
             compliance: tenant-isolation
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
-            summary: RLS blocked a cross-tenant access attempt
+            summary: RLS hid another tenant's row from a query
             description: >-
-              A caller with a valid tenant GUC attempted to read/write a row
-              belonging to a different tenant. This alert has no `for`
-              clause — one occurrence is enough to page. NOTE — this
-              service does not currently emit iam_token_service_rls_violations_total;
-              wire it before relying on this alert (tracked as a gap, not
-              yet built).
+              A query running under one tenant's GUC touched a row belonging
+              to a different tenant; RLS hid it. The log is 1%-sampled, so
+              one sample means more occurred. No `for` clause — one
+              occurrence is enough to page. Query rls_violation_log
+              (reconciler/admin_readonly role) for table_name, row_tenant_id,
+              app_tenant_id and query_text.
 
         # ── RLS-6 missing/invalid GUC (§17.5 Case 5 equivalent) ───────────
         - alert: IAMTokenServiceRLSMissingGUC
           expr: |
-            rate(iam_token_service_rls_violations_total{violation_type="missing_or_invalid_guc"}[5m]) > 0
+            max by (domain, service, environment) (
+              increase(iam_rls_violations_total{job={{ printf "%s-server" $job | quote }}, violation_type="missing_or_invalid_guc"}[15m])
+            ) > 0
           for: 10m
           labels:
             severity: warning
             team: platform
+            # successor metric awaits Platform Observability Registry ratification
+            metric_status: proposed
           annotations:
             summary: RLS violations from missing or invalid tenant GUC
             description: >-
               A caller path is not binding app.tenant_id via SET LOCAL
-              (RLS-6) before touching a tenant-scoped table. NOTE — this
-              service does not currently emit iam_token_service_rls_violations_total;
-              wire it before relying on this alert (tracked as a gap, not
-              yet built).
+              (RLS-6) before touching a tenant-scoped table; RLS returns zero
+              rows instead. query_text in rls_violation_log names the path.
 {{- end }}

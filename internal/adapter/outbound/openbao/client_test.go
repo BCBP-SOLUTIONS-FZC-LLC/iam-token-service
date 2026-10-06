@@ -1,6 +1,7 @@
 package openbao
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,6 +118,14 @@ type fakeBaoServer struct {
 
 	listStatus int
 	listBody   string
+
+	// forbidReads, when > 0, answers that many reads with 403 (a token
+	// revoked server-side) before serving normally.
+	forbidReads atomic.Int32
+
+	// loginGate, when non-nil, blocks every login until it is closed —
+	// lets a test hold a login in flight while concurrent callers pile up.
+	loginGate chan struct{}
 }
 
 func newFakeBaoServer(t *testing.T) *fakeBaoServer {
@@ -131,6 +140,9 @@ func (f *fakeBaoServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/v1/auth/kubernetes/login": // Logical().Write issues PUT, not POST
 		f.loginCalls.Add(1)
+		if f.loginGate != nil {
+			<-f.loginGate
+		}
 		if f.loginBody != "" {
 			writeJSON(w, f.loginStatus, f.loginBody)
 			return
@@ -146,6 +158,11 @@ func (f *fakeBaoServer) handle(w http.ResponseWriter, r *http.Request) {
 			`{"data":{"version":1,"created_time":"2024-01-01T00:00:00Z","deletion_time":"","destroyed":false}}`)
 
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/iam/data/serviceaccount/read":
+		if f.forbidReads.Load() > 0 {
+			f.forbidReads.Add(-1)
+			writeJSON(w, http.StatusForbidden, `{"errors":["permission denied"]}`)
+			return
+		}
 		if f.readBody != "" {
 			writeJSON(w, statusOr(f.readStatus, http.StatusOK), f.readBody)
 			return
@@ -543,4 +560,127 @@ func TestInstrumentedHTTPClient_WrapsTransportWithOTel(t *testing.T) {
 	assert.Equal(t, 5*time.Second, wrapped.Timeout)
 	_, ok = wrapped.Transport.(*otelhttp.Transport)
 	assert.True(t, ok)
+}
+
+// A token revoked server-side before its cached expiry: the client drops
+// it, logs in again and retries once — instead of 502 until expiry.
+func TestRead_ReLoginsOnceAfter403(t *testing.T) {
+	srv := newFakeBaoServer(t)
+	c := newTestClient(t, srv.srv.URL)
+	_, err := c.token(t.Context()) // warm the cache
+	require.NoError(t, err)
+	srv.forbidReads.Store(1)
+
+	got, err := c.Read(t.Context(), "iam/serviceaccount/read")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cr3t", got)
+	assert.Equal(t, int32(2), srv.loginCalls.Load(), "the 403 forces exactly one fresh login")
+}
+
+func TestRead_PersistentForbiddenFailsAfterOneRetry(t *testing.T) {
+	srv := newFakeBaoServer(t)
+	c := newTestClient(t, srv.srv.URL)
+	srv.forbidReads.Store(10)
+
+	_, err := c.Read(t.Context(), "iam/serviceaccount/read")
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrSecretStoreUnavailable, de.Code)
+	assert.Equal(t, int32(2), srv.loginCalls.Load(), "one retry only — no login storm")
+}
+
+// ── single-flight login (TS-D22) ────────────────────────────────────────
+
+// Concurrent cache misses share one Kubernetes-auth login instead of each
+// queueing behind a mutex held across the network call.
+func TestToken_ConcurrentMissesShareOneLogin(t *testing.T) {
+	srv := newFakeBaoServer(t)
+	srv.loginGate = make(chan struct{})
+	c := newTestClient(t, srv.srv.URL)
+	var joined atomic.Int32
+	c.joinedLogin = func() { joined.Add(1) }
+
+	const callers = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.token(t.Context())
+			errs <- err
+		}()
+	}
+	// Barrier: release the login only once every caller is waiting on the
+	// shared flight (the login is held at the gate, so none can have hit a
+	// cached token instead).
+	require.Eventually(t, func() bool { return joined.Load() == callers }, 5*time.Second, time.Millisecond)
+	// Joining the flight precedes the flight's HTTP request reaching the
+	// fake server, so wait for that too rather than asserting it instantly.
+	require.Eventually(t, func() bool { return srv.loginCalls.Load() >= 1 }, 5*time.Second, time.Millisecond)
+	assert.Equal(t, int32(1), srv.loginCalls.Load())
+	close(srv.loginGate)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int32(1), srv.loginCalls.Load())
+}
+
+// One caller giving up (its request was cancelled) must neither fail the
+// login nor the other callers waiting on it.
+func TestToken_CancelledCallerDoesNotFailSharedLogin(t *testing.T) {
+	srv := newFakeBaoServer(t)
+	srv.loginGate = make(chan struct{})
+	c := newTestClient(t, srv.srv.URL)
+
+	firstCtx, cancelFirst := context.WithCancel(t.Context())
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := c.token(firstCtx)
+		firstErr <- err
+	}()
+	require.Eventually(t, func() bool { return srv.loginCalls.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+
+	secondTok := make(chan string, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		tok, err := c.token(t.Context())
+		secondTok <- tok
+		secondErr <- err
+	}()
+
+	cancelFirst()
+	err := <-firstErr
+	var de *domain.Error
+	require.ErrorAs(t, err, &de, "the cancelled caller returns promptly with its own error")
+	assert.Equal(t, domain.ErrSecretStoreUnavailable, de.Code)
+
+	close(srv.loginGate)
+	require.NoError(t, <-secondErr)
+	assert.Equal(t, "fake-token", <-secondTok)
+	assert.Equal(t, int32(1), srv.loginCalls.Load())
+	_, ok := c.cached()
+	assert.True(t, ok, "the detached login still populated the cache")
+}
+
+// A short lease must still be reused: a flat 30s margin on a 20s lease
+// would expire the token before it was ever cached.
+func TestToken_ShortLeaseIsStillCached(t *testing.T) {
+	srv := newFakeBaoServer(t)
+	srv.loginBody = `{"auth":{"client_token":"fake-token","lease_duration":20}}`
+	c := newTestClient(t, srv.srv.URL)
+
+	_, err := c.token(t.Context())
+	require.NoError(t, err)
+	_, err = c.token(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), srv.loginCalls.Load())
+}
+
+func TestTokenSafetyMargin(t *testing.T) {
+	assert.Equal(t, 30*time.Second, tokenSafetyMargin(time.Hour))
+	assert.Equal(t, 10*time.Second, tokenSafetyMargin(20*time.Second))
+	assert.Equal(t, time.Duration(0), tokenSafetyMargin(0))
 }

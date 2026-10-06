@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublishServiceAccountEvents",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "${serviceaccount_events_topic_arn}"
+    },
+    {
+      "Sid": "GlueSchemaRegistryReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetRegistry",
+        "glue:GetSchema",
+        "glue:GetSchemaVersion",
+        "glue:GetSchemaByDefinition",
+        "glue:ListSchemas"
+      ],
+      "Resource": [
+        "${glue_registry_arn}",
+        "arn:aws:glue:${aws_region}:${aws_account_id}:schema/${glue_registry_name}/*"
+      ]
+    }
+  ]
+}

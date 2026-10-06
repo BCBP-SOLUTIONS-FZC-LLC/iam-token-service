@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -115,24 +114,58 @@ func TestClient_RefreshKeys_422DoesNotRetry(t *testing.T) {
 
 // TestClient_RefreshKeys_ContextCancelledDuringBackoffReturnsPromptly
 // covers the backoff wait itself respecting ctx cancellation rather than
-// always sleeping out the full retryBackoff duration.
+// always sleeping out the full retryBackoff duration. No wall-clock bound:
+// the ctx is cancelled by the first (retryable) attempt, and the backoff
+// branch is the only one returning the bare ctx.Err() — a second attempt
+// would have reached the server (calls == 2) or returned a wrapped
+// "unreachable" error.
 func TestClient_RefreshKeys_ContextCancelledDuringBackoffReturnsPromptly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusBadGateway)
+		cancel()
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-
 	c := realmprovisioner.New(srv.URL, nil)
-	start := time.Now()
 	err := c.RefreshKeys(ctx, uuid.New())
-	elapsed := time.Since(start)
 
 	require.Error(t, err)
-	assert.Less(t, elapsed, 150*time.Millisecond, "must return once ctx is cancelled, not wait out the full backoff")
+	assert.Equal(t, context.Canceled, err, "returned from the backoff wait, not from a second attempt")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calls), "no second attempt after cancellation")
+}
+
+// Mesh/proxy-level transients are retried once, like RP-17's own 502: a
+// post-commit RP-17 failure only self-heals on a later CronJob run, via
+// keys_refresh_pending (TS-D22), and still pages.
+func TestClient_RefreshKeys_RetriesTransientProxyStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if atomic.AddInt32(&calls, 1) == 1 {
+					w.WriteHeader(status)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			require.NoError(t, realmprovisioner.New(srv.URL, nil).RefreshKeys(context.Background(), uuid.New()))
+			assert.Equal(t, int32(2), atomic.LoadInt32(&calls))
+		})
+	}
+}
+
+func TestClient_RefreshKeys_Any2xxIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"refreshed"}`))
+	}))
+	defer srv.Close()
+
+	assert.NoError(t, realmprovisioner.New(srv.URL, nil).RefreshKeys(context.Background(), uuid.New()))
 }

@@ -26,6 +26,20 @@ spec:
       # crashing run retries at most twice before the next scheduled fire
       # (concurrencyPolicy: Forbid) picks up any principal it missed.
       backoffLimit: 2
+      # Exit code 1 is the binary's deliberate "run failed / page-worthy
+      # divergence" signal: fail the Job at once instead of re-running the
+      # whole batch twice (3x OpenBao and RP-17 load on a persistent fault).
+      # Crashes and node disruptions are still retried.
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: scheduler
+              operator: In
+              values: [1]
+          - action: Ignore
+            onPodConditions:
+              - type: DisruptionTarget
       template:
         metadata:
           labels:
@@ -42,19 +56,21 @@ spec:
             prometheus.io/scrape: "true"
             prometheus.io/port: {{ .Values.service.metricsPort | quote }}
             prometheus.io/path: /metrics
-            {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
-            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-            {{- else }}
-            rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
-            {{- end }}
+            {{- include "iam-token-service.cronjobIstioAnnotations" . | nindent 12 }}
+            {{- include "iam-token-service.secretRestartAnnotation" . | nindent 12 }}
         spec:
-          serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
+          serviceAccountName: {{ include "iam-token-service.workloadServiceAccountName" (dict "component" "scheduler" "root" $) }}
           restartPolicy: Never
+          # On SIGTERM the binary finishes the current tenant — its row
+          # reserve (20s) plus its RP-17 call (10s) — then exits; this covers
+          # both, so a node drain never cuts a rotate/revoke off from its
+          # RP-17 key-cache refresh.
+          terminationGracePeriodSeconds: {{ .Values.scheduler.terminationGracePeriodSeconds | default 45 }}
           securityContext:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
             - name: scheduler
-              image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+              image: {{ include "iam-token-service.image" . | quote }}
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command: ["/iam-token-service-scheduler"]
               securityContext:
@@ -64,17 +80,32 @@ spec:
                   containerPort: {{ .Values.service.metricsPort }}
               env:
                 {{- include "iam-token-service.commonEnv" . | nindent 16 }}
+                {{- include "iam-token-service.reconcilerDBEnv" . | nindent 16 }}
+                - name: GOMEMLIMIT
+                  value: {{ .Values.scheduler.goMemLimit | quote }}
                 - name: METRICS_PORT
                   value: {{ .Values.service.metricsPort | quote }}
                 - name: ROTATION_DEFAULT_CADENCE_DAYS
                   value: {{ .Values.rotation.defaultCadenceDays | quote }}
+                - name: ROTATION_DEFAULT_OVERLAP_SECONDS
+                  value: {{ .Values.rotation.defaultOverlapSeconds | quote }}
                 - name: REALM_PROVISIONER_BASE_URL
                   value: {{ .Values.realmProvisioner.baseUrl | quote }}
+                - name: SCHEDULER_BATCH_LIMIT
+                  value: {{ .Values.scheduler.batchLimit | quote }}
+                - name: PG_STATEMENT_TIMEOUT
+                  value: {{ .Values.database.pool.jobStatementTimeout | quote }}
+                - name: SCHEDULER_RUN_TIMEOUT
+                  value: {{ .Values.scheduler.runTimeout | quote }}
+                - name: SCHEDULER_METRICS_SCRAPE_GRACE
+                  value: {{ .Values.scheduler.metricsScrapeGrace | quote }}
               resources:
                 {{- toYaml .Values.scheduler.resources | nindent 16 }}
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+                {{- include "iam-token-service.openbaoVolumeMounts" . | trim | nindent 16 }}
           volumes:
             - name: tmp
               emptyDir: {}
+            {{- include "iam-token-service.openbaoVolumes" . | trim | nindent 12 }}

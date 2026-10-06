@@ -26,14 +26,13 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.service.metricsPort | quote }}
         prometheus.io/path: /metrics
-        {{- if and (not .Values.existingSecret) (not .Values.database.existingSecretName) }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-        {{- else }}
-        rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
-        {{- end }}
+        {{- include "iam-token-service.secretRestartAnnotation" . | nindent 8 }}
+        {{- include "iam-token-service.meshPodAnnotations" (dict "grace" (.Values.consumer.terminationGracePeriodSeconds | default 60) "root" $) | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "iam-token-service.serviceAccountName" . }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      serviceAccountName: {{ include "iam-token-service.workloadServiceAccountName" (dict "component" "consumer" "root" $) }}
+      # Covers SHUTDOWN_DRAIN_DELAY + SQS drain (15s) + health/metrics drain
+      # + pool drain.
+      terminationGracePeriodSeconds: {{ .Values.consumer.terminationGracePeriodSeconds | default 60 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       affinity:
@@ -43,9 +42,16 @@ spec:
                 matchLabels:
                   {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 18 }}
               topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "iam-token-service.componentSelectorLabels" (dict "component" "consumer" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 14 }}
       containers:
         - name: consumer
-          image: "{{ .Values.image.repository }}:{{ include "iam-token-service.imageTag" . }}"
+          image: {{ include "iam-token-service.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/iam-token-service-consumer"]
           securityContext:
@@ -57,43 +63,64 @@ spec:
               containerPort: {{ .Values.service.metricsPort }}
           env:
             {{- include "iam-token-service.commonEnv" . | nindent 12 }}
+            - name: GOMEMLIMIT
+              value: {{ .Values.consumer.goMemLimit | quote }}
             - name: APP_PORT
               value: {{ .Values.service.port | quote }}
             - name: METRICS_PORT
               value: {{ .Values.service.metricsPort | quote }}
+            - name: PG_STATEMENT_TIMEOUT
+              value: {{ .Values.database.pool.statementTimeout | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.events.awsRegion | quote }}
             - name: SQS_QUEUE_URL
-              value: {{ .Values.sqs.offboardingQueueUrl | quote }}
-            - name: SQS_OFFBOARDING_QUEUE_URL
-              value: {{ .Values.sqs.offboardingQueueUrl | quote }}
+              value: {{ .Values.sqs.queueUrl | quote }}
             - name: SQS_CONCURRENCY
-              value: {{ .Values.sqs.offboardingConcurrency | quote }}
-            - name: SQS_OFFBOARDING_CONCURRENCY
-              value: {{ .Values.sqs.offboardingConcurrency | quote }}
+              value: {{ .Values.sqs.concurrency | quote }}
             - name: SQS_MAX_MESSAGES
               value: {{ .Values.sqs.maxMessages | quote }}
             - name: SQS_WAIT_SECONDS
               value: {{ .Values.sqs.waitSeconds | quote }}
             - name: SQS_VISIBILITY_TIMEOUT
               value: {{ printf "%ds" (.Values.sqs.visibilityTimeoutSeconds | int) | quote }}
+            - name: SQS_QUEUE_DEPTH_INTERVAL
+              value: {{ .Values.sqs.queueDepthInterval | default "60s" | quote }}
+            - name: SQS_RETRY_BACKOFF
+              value: {{ .Values.sqs.retryBackoff | default "60s" | quote }}
+            - name: SQS_MAX_RETRY_BACKOFF
+              value: {{ .Values.sqs.maxRetryBackoff | default "15m" | quote }}
+            - name: SQS_HANDLER_TIMEOUT
+              value: {{ .Values.sqs.handlerTimeout | quote }}
+            - name: SQS_DRAIN_TIMEOUT
+              value: {{ .Values.sqs.drainTimeout | quote }}
+            - name: SHUTDOWN_DRAIN_DELAY
+              value: {{ .Values.shutdown.drainDelay | quote }}
           startupProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 2
             periodSeconds: 5
-            failureThreshold: 12
             timeoutSeconds: 3
+            failureThreshold: 12
           livenessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 0
             periodSeconds: 15
+            timeoutSeconds: 3
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 0
             periodSeconds: 10
+            # Above the handler's own 2s per-check bound (readinessCheckTimeout),
+            # so a slow dependency answers 503 from /readyz rather than the
+            # kubelet timing out the probe at the 1s default.
+            timeoutSeconds: 3
           resources:
             {{- toYaml .Values.consumer.resources | nindent 12 }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- include "iam-token-service.openbaoVolumeMounts" . | trim | nindent 12 }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- include "iam-token-service.openbaoVolumes" . | trim | nindent 8 }}

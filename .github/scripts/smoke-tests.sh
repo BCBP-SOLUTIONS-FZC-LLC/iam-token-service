@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Image size + startup gate smoke tests for the CI-built Docker image.
-# Invoked by ci.yml once per binary (server / consumer / rotator — all
-# three ship in the SAME image, per the repo-root Dockerfile) with
-# IMAGE_TAG and BINARY set, and ENTRYPOINT set for the consumer/rotator legs
+# Invoked by ci.yml once per binary (server / consumer / rotator /
+# scheduler — all four ship in the SAME image, per the repo-root Dockerfile) with
+# IMAGE_TAG and BINARY set, and ENTRYPOINT set for the consumer/rotator/scheduler legs
 # (server uses the image's default entrypoint) — keeps shell operators out
 # of inline YAML run blocks.
 set -euo pipefail
@@ -29,14 +29,16 @@ echo "::endgroup::"
 echo "::group::Startup gate (${BINARY})"
 # The binary must exit non-zero on missing required config, proving its
 # config-loading validation actually fires (DATABASE_URL/OPENBAO_ADDR/
-# SNS_TOPIC_SERVICEACCOUNT_ARN for the server; SQS_OFFBOARDING_QUEUE_URL
-# for the consumer; the rotator's own required env for the sweep/
-# reconciler/prune tasks).
-# timeout 10s kills the container if it hangs instead of exiting.
+# SNS_TOPIC_ARN for the server; SQS_QUEUE_URL
+# for the consumer; DATABASE_URL/OPENBAO_ADDR/REALM_PROVISIONER_BASE_URL for the
+# rotator and scheduler).
+# timeout 10s kills the container if it hangs instead of exiting; that
+# exit code (124, or 137 after KILL) is a FAILURE, not the expected
+# non-zero — a binary that hangs on missing config never reached validation.
 exit_code=0
 timeout 10s docker run --rm "${ENTRYPOINT_ARGS[@]}" "${IMAGE_TAG}" 2>/dev/null || exit_code=$?
 echo "Container exit code: ${exit_code} (expected non-zero)"
-[ "${exit_code}" -ne 0 ] &
+[ "${exit_code}" -ne 0 ] && [ "${exit_code}" -ne 124 ] && [ "${exit_code}" -ne 137 ] &
 P2=$!
 echo "::endgroup::"
 
@@ -45,7 +47,7 @@ wait $P1 || {
   exit 1
 }
 wait $P2 || {
-  echo "::error title=Startup gate (${BINARY})::Binary exited 0 on missing required env vars - config loading must exit non-zero"
+  echo "::error title=Startup gate (${BINARY})::Binary exited ${exit_code} on missing required env vars - config loading must exit non-zero promptly (0 = no validation; 124/137 = hung until the 10s timeout)"
   exit 1
 }
 

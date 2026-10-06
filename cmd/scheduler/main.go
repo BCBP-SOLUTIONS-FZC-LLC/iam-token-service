@@ -6,9 +6,10 @@
 // next_rotation_at (idx_sac_next_rotation), calls TS-1's own
 // CredentialService.IssueOrRotate in-process for each one — the same
 // core/service code cmd/server's HTTP handler calls, just invoked
-// directly rather than over the wire — and then relays the returned
-// plaintext to the Realm Provisioner's RP-17 endpoint exactly as an
-// operator/O&M tool does by hand today (§8.2). It authenticates to
+// directly rather than over the wire — and then, once per tenant, asks the
+// Realm Provisioner's RP-17 endpoint to clear Keycloak's cached JWKS so the
+// new key is fetched (no key material is sent — EXT-6, rev 1.3). It
+// authenticates to
 // Postgres RLS as the reserved iam-system system principal, the same
 // dedicated service identity every other internal caller of this service
 // presents (§5.2/§10.4) — a new in-mesh caller, not a new authorization
@@ -31,10 +32,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	eventbusadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/eventbus"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
@@ -45,13 +47,9 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // buildVersion is injected by -ldflags at build time (see Dockerfile / Makefile).
@@ -64,18 +62,46 @@ func main() {
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
-	shutdownTracing := gincommon.InitTracingFromEnv()
-	defer shutdownTracing()
 
 	cfg := gincommon.Config{
 		Logger:       log,
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
+		// Observability identity (Enterprise Platform Observability
+		// Standard): domain "iam" (OBSERVABILITY_DOMAIN overrides it) and the
+		// environment label, which must be one of local/dev/test/staging/prod
+		// — ObservabilityMiddlewares panics on anything else (e.g. "production").
+		Domain:      envOr("OBSERVABILITY_DOMAIN", metrics.ObservabilityDomain),
+		Environment: appEnv,
 	}
+
+	// Tracing with the SAME identity as metrics (service, version, domain,
+	// environment) — InitTracingFromEnv read OTEL_SERVICE_NAME and the
+	// domain/environment from the environment on its own, so traces could
+	// disagree with metrics. Always installs gincommon's TracerProvider so
+	// in-process spans get valid trace IDs even with no OTLP endpoint (dev);
+	// ObservabilityMiddlewares' EnsureInitTelemetry is then a no-op.
+	shutdownTracing, err := gincommon.InitTracingWithConfig(gincommon.TracingConfig{
+		ServiceName:  cfg.ServiceName,
+		BuildVersion: cfg.BuildVersion,
+		Domain:       cfg.Domain,
+		Environment:  cfg.Environment,
+		Logger:       log,
+	})
+	if err != nil {
+		panic("init tracing: " + err.Error())
+	}
+	defer shutdownTracing()
 	_ = gincommon.ObservabilityMiddlewares(cfg) // metrics-init side effect only — this process has no Gin router
+	// platform-events' (outbox/publish/consume/SQS/SNS) and platform-pgcommon's
+	// (platform_db_*) metrics share gincommon's registerer and identity so one
+	// /metrics scrape serves HTTP + business + messaging + DB collectors. Must
+	// run before NewPool (pool gauges are registered by NewPool) and before
+	// metrics.Register (which records into platform-events' shared collectors).
+	if err := metrics.InitLibraryMetrics(log); err != nil {
+		panic(fmt.Sprintf("init library metrics: %v", err))
+	}
 	metrics.Register(appEnv)
-	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
 
 	// ── Database: the normal RLS-scoped app pool for IssueOrRotate's
 	// per-tenant writes, and the BYPASSRLS serviceaccount_reconciler pool
@@ -90,23 +116,21 @@ func main() {
 	pgCfg.DSN = pgadapter.DSNFromEnv()
 	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
 	pgCfg.Logger = pgadapter.NewLoggerAdapter(log)
-	pgCfg.Tracer = pgadapter.NewOTelTracer(cfg.ServiceName)
+	pgCfg.Tracer = gincommon.NewSpanTracer(cfg.ServiceName)
 	appPool, err := pgcommon.NewPool(context.Background(), pgCfg)
 	if err != nil {
 		panic(fmt.Sprintf("connect app pool: %v", err))
 	}
 	defer appPool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(appPool, cfg.ServiceName))
 
 	reconDSN := pgadapter.ReconcilerDSNFromEnv()
 	reconCfg := pgadapter.SystemPoolConfig(reconDSN, log)
-	reconCfg.Tracer = pgadapter.NewOTelTracer(cfg.ServiceName)
+	reconCfg.Tracer = gincommon.NewSpanTracer(cfg.ServiceName)
 	reconcilerPool, err := pgcommon.NewPool(context.Background(), reconCfg)
 	if err != nil {
 		panic(fmt.Sprintf("connect reconciler pool: %v", err))
 	}
 	defer reconcilerPool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(reconcilerPool, cfg.ServiceName+"-reconciler"))
 	if reconDSN == pgCfg.DSN {
 		log.Warn("RECONCILER_DATABASE_URL not set — reconciler pool reuses app DSN; cross-tenant queries will be RLS-filtered", nil)
 	}
@@ -118,14 +142,24 @@ func main() {
 	// graceful exit path (log summary, serveMetricsBriefly, pool drain)
 	// below before Kubernetes SIGKILLs the Pod first. 180s leaves a ~60s
 	// margin for that cleanup to actually run.
-	ctx, cancel := context.WithTimeout(context.Background(), envDuration("SCHEDULER_RUN_TIMEOUT", 180*time.Second))
+	//
+	// SIGTERM/SIGINT cancels the run context: no new tenant starts, the
+	// in-flight tenant finishes on its own detached context (workCtx) —
+	// including its RP-17 call — and the summary/metrics path below still
+	// runs. terminationGracePeriodSeconds (Helm: 45s) covers rowReserve +
+	// rp17Timeout; anything a SIGKILL still cuts off is left in
+	// keys_refresh_pending and retried by the next run.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stopSignals()
+	ctx, cancel := context.WithTimeout(sigCtx, envDuration("SCHEDULER_RUN_TIMEOUT", 180*time.Second))
 	defer cancel()
 
-	if err := outbox.ApplySchema(ctx, &pgmigrate.Runner{DSN: migrationDSN}); err != nil {
-		panic(fmt.Sprintf("outbox schema: %v", err))
-	}
-	if err := pgadapter.RunMigrations(ctx, migrationDSN, log); err != nil {
-		panic(fmt.Sprintf("domain migrations: %v", err))
+	// Migrations (§4.4/MIG-2 order inside pgadapter.Migrate) — skipped when
+	// RUN_MIGRATIONS=false (Helm: the migrate Job owns them).
+	if pgadapter.MigrationsEnabledFromEnv() {
+		if err := pgadapter.Migrate(ctx, migrationDSN, log); err != nil {
+			panic(fmt.Sprintf("migrate: %v", err))
+		}
 	}
 
 	// ── OpenBao ────────────────────────────────────────────────────────
@@ -133,6 +167,9 @@ func main() {
 		Addr:     mustEnv("OPENBAO_ADDR", appEnv, "https://openbao.iam.svc.cluster.local:8200"),
 		AuthRole: envOr("OPENBAO_ROLE", "iam-token-service"),
 		KVMount:  envOr("OPENBAO_KV_MOUNT", "iam"),
+		// Empty = the default ServiceAccount token path; Helm sets it to an
+		// OpenBao-audience projected token (openbao.tokenAudience).
+		KubernetesTokenPath: os.Getenv("OPENBAO_K8S_TOKEN_PATH"),
 	}, log)
 	if err != nil {
 		panic(fmt.Sprintf("init openbao client: %v", err))
@@ -146,6 +183,7 @@ func main() {
 	principalRepo := pgadapter.NewPrincipalRepository(appPool)
 	credentialRepo := pgadapter.NewCredentialRepository(appPool)
 	reconcilerRepo := pgadapter.NewReconcilerRepository(reconcilerPool)
+	keysRefreshRepo := pgadapter.NewKeysRefreshRepository(appPool, reconcilerPool)
 
 	enqueueCodec, err := eventbusadapter.NewValidatingCodec(eventbusadapter.NoopCodec{})
 	if err != nil {
@@ -158,19 +196,33 @@ func main() {
 		WithCadenceDays(envInt("ROTATION_DEFAULT_CADENCE_DAYS", domain.DefaultCadenceDays))
 	instrumentedCredentialSvc := metrics.NewInstrumentedCredentialService(credentialSvc)
 
-	rpClient := realmprovisioner.New(
+	// platform_dependency_request_seconds{dependency="realm_provisioner"}
+	rpClient := metrics.NewInstrumentedRealmProvisionerClient(realmprovisioner.New(
 		mustEnv("REALM_PROVISIONER_BASE_URL", appEnv, "http://iam-realm-provisioner.iam.svc.cluster.local:8080"),
 		log,
-	)
+	))
 
 	// ── Run the due-list scan once ──────────────────────────────────────
+	// First, RP-17 refreshes a previous run (of this job or cmd/rotator)
+	// owed but never completed (keys_refresh_pending); a failure there is
+	// counted as a failed cadence rotation — Keycloak may be on a stale key
+	// set.
 	scanCtx, endScan := startJobSpan(ctx, cfg.ServiceName, "cadence_scan")
-	result := runCadenceScan(scanCtx, reconcilerRepo, instrumentedCredentialSvc, rpClient, log)
+	pending := retryPendingKeyRefreshes(scanCtx, keysRefreshRepo, rpClient, envInt("SCHEDULER_BATCH_LIMIT", 500), log)
+	log.Info("pending keys refresh retry complete", fieldsWithTrace(scanCtx, map[string]interface{}{
+		"refreshed": pending.Refreshed, "failed": pending.Failed, "dropped": pending.Dropped, "deferred": pending.Deferred,
+	}))
+	result := runCadenceScan(scanCtx, reconcilerRepo, instrumentedCredentialSvc, keysRefreshRepo, rpClient,
+		defaultOverlapSecondsFromEnv(), envInt("SCHEDULER_BATCH_LIMIT", 500), log)
 	log.Info("cadence scan complete", fieldsWithTrace(scanCtx, map[string]interface{}{
-		"rotated": result.Rotated, "skipped": result.Skipped, "failed": result.Failed,
+		"rotated": result.Rotated, "skipped": result.Skipped, "failed": result.Failed, "deferred": result.Deferred,
 	}))
 	endScan()
+	result.Failed += pending.Failed
 	recordCadenceScanMetric(result)
+	if sigCtx.Err() != nil {
+		log.Warn("scheduler: terminated by signal — remaining work deferred to the next run", nil)
+	}
 
 	// Run-to-completion CronJob Pod (no Pushgateway in this deployment) —
 	// same brief-scrape-window pattern as cmd/rotator.
@@ -202,7 +254,7 @@ func main() {
 // container exits).
 func serveMetricsBriefly(log port.Logger, grace time.Duration) {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", gincommon.MetricsHandler())
 	srv := &http.Server{Addr: ":" + envOr("METRICS_PORT", "9090"), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	errCh := make(chan error, 1)
@@ -260,4 +312,24 @@ func mustEnv(key, appEnv, devDefault string) string {
 		return devDefault
 	}
 	panic(fmt.Sprintf("startup aborted — required env var %s is not set", key))
+}
+
+// defaultOverlapSecondsFromEnv reads ROTATION_DEFAULT_OVERLAP_SECONDS (the
+// overlap applied when TS-1 omits overlap_seconds, §12) and fails startup
+// when it is outside [0, 900] (TS-CONFIG-4) instead of silently clamping a
+// misconfiguration.
+func defaultOverlapSecondsFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("ROTATION_DEFAULT_OVERLAP_SECONDS"))
+	if raw == "" {
+		return domain.DefaultOverlapSeconds
+	}
+	// Parsed here rather than with envInt, which ignores 0 and bad values:
+	// 0 is a legitimate hard cutover (§6.2), and anything unparseable or out
+	// of range must fail startup, not silently become 300.
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < domain.MinOverlapSeconds || v > domain.MaxOverlapSeconds {
+		panic(fmt.Sprintf("startup aborted — ROTATION_DEFAULT_OVERLAP_SECONDS=%q must be an integer in [%d, %d] (TS-CONFIG-4)",
+			raw, domain.MinOverlapSeconds, domain.MaxOverlapSeconds))
+	}
+	return v
 }

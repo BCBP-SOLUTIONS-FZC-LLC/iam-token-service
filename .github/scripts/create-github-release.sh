@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Creates the GitHub release with versioned assets attached.
 #
-# This service ships THREE binaries (see prepare-release-binary.sh), so
+# This service ships FOUR binaries (see prepare-release-binary.sh), so
 # release-asset.name holds one line per binary (the linux/amd64 build of
-# each), and every platform build for all three binaries is attached via
+# each), and every platform build for all four binaries is attached via
 # the shared `iam-token-service-*` glob.
 set -euo pipefail
 
@@ -37,7 +37,7 @@ for ASSET_NAME in "${ASSET_NAMES[@]}"; do
   done
 done
 
-# Aggregate per-binary checksums (server, consumer, rotator, all platforms)
+# Aggregate per-binary checksums (server, consumer, rotator, scheduler, all platforms)
 # into a single verifiable file.
 # Format matches `sha256sum --check checksums.txt`.
 BINARY_FILES=()
@@ -49,6 +49,8 @@ for f in iam-token-service-*; do
 done
 sha256sum "${BINARY_FILES[@]}" > checksums.txt
 
+# A '-' suffix (v1.1.0-rc.1) is a pre-release: release.yml skips its
+# production schema registration and deploy for the same test.
 PRERELEASE_FLAG=""
 if echo "$RELEASE_TAG" | grep -q -- '-'; then
   PRERELEASE_FLAG="--prerelease"

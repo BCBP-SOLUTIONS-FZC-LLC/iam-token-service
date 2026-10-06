@@ -30,13 +30,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -44,9 +44,11 @@ jobs:
             go.mod
 
       - name: Configure private module access
+        env:
+          GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
         run: |
           git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          echo "https://x-access-token:${GO_PRIVATE_TOKEN}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
 
       - name: Download modules
@@ -97,7 +99,7 @@ jobs:
       #              SET LOCAL (pgcommon.WithGUCSet/GUCSetFromContext), never
       #              a session-scoped SET.
       #   gincommon-obs — logs/metrics/traces enter only via platform-gincommon
-      #              (Zap logger.NewLogger, MetricsRegisterer, InitTracingFromEnv).
+      #              (Zap logger.NewLogger, MetricsRegisterer, InitTracingWithConfig).
       #   metrics-taxonomy — every metric this service defines complies with
       #              the Enterprise Platform Observability Standard's
       #              namespace classification (platform_/iam_ prefix) and
@@ -105,6 +107,12 @@ jobs:
       #              service name leaked into a shared metric name).
       - name: Invariant gates (no-gocloak, no-secret-log, SET-LOCAL-only, gincommon-obs, metrics-taxonomy)
         run: make gates
+
+      # platform-gincommon's own metricslint: registry compliance and label
+      # vocabulary on a real scrape, legacy/unregistered names in alert rules
+      # and runbooks, and docs/observability/metric-registry.md drift.
+      - name: Observability standard lint (metricslint)
+        run: make metrics-lint
 
       - name: Vulnerability check
         run: |

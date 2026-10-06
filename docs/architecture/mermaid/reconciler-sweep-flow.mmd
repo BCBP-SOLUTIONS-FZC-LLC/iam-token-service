@@ -3,43 +3,67 @@
 %% cross-tenant enumeration, then opens normal RLS-scoped
 %% serviceaccount_app transactions for the actual per-tenant writes
 %% (§4.3/RLS-7) — reconciler_jobs may not depend on the service layer.
+%% Order: owed RP-17 retry pass, overlap sweep (per-tenant RP-17 inline),
+%% orphan reconciler, prune — each budget-checked (TS-D22).
 flowchart TD
-    START(["CronJob fires<br/>(one binary invocation)"])
-    START --> SWEEP
+    START(["CronJob fires<br/>(one binary invocation, ROTATOR_RUN_TIMEOUT 180s)"])
+    START --> RETRY
 
-    subgraph SWEEP["1. Overlap-expiry sweep (§8.3)"]
-        S1["ReconcilerRepository.ListExpiredRotating()<br/>BYPASSRLS — cross-tenant, status=rotating<br/>AND expires_at < now()"]
-        S2["for each row: open serviceaccount_app tx,<br/>UPDATE status=revoked, delete OpenBao material"]
-        S3["metrics.RotationSweepTotal{result}"]
-        S1 --> S2 --> S3
+    subgraph RETRY["0. Owed RP-17 retry pass (TS-D22/23)"]
+        Q1["KeysRefreshRepository.ListPending()<br/>committed markers + intent markers past intent_until,<br/>oldest first, up to ROTATOR_BATCH_LIMIT"]
+        Q2["per tenant, within at most half the run budget:<br/>RP-17 RefreshKeys (detached ctx, 10s),<br/>then Clear(tenant, requested_at observed)"]
+        Q3["RP-17 fails: marker kept, Failed<br/>(tenant has no principal left: marker dropped)"]
+        Q1 --> Q2 --> Q3
     end
 
-    SWEEP --> RECON
+    RETRY --> SWEEP
+
+    subgraph SWEEP["1. Overlap-expiry sweep (§8.3)"]
+        S1["ReconcilerRepository.ListExpiredRotating(ROTATOR_BATCH_LIMIT 500)<br/>BYPASSRLS — cross-tenant, status=rotating<br/>AND expires_at < now(), grouped by tenant"]
+        S2{"≥ 30s budget left<br/>and not signalled?"}
+        S3["per row, one serviceaccount_app tx:<br/>re-read, OpenBao delete (material-first),<br/>UPDATE status=revoked, MarkPending marker,<br/>enqueue ServiceAccountCredentialRevoked<br/>(already revoked / lock conflict → Skipped)"]
+        S4["tenant's RP-17 RefreshKeys inline (detached ctx, 10s)<br/>ok → Clear marker up to the newest value written → Revoked<br/>fails → marker kept, Failed (pages, next run retries)"]
+        S5["remaining tenants → Deferred"]
+        S1 --> S2
+        S2 -->|yes| S3 --> S4 --> S2
+        S2 -->|no| S5
+    end
+
+    SWEEP --> METRIC["metrics.RotationSweepTotal{ok | error}<br/>(retry-pass failures count as error)"]
+    METRIC --> RECON
 
     subgraph RECON["2. Orphan-material reconciler (§8.6)"]
-        R1["ReconcilerRepository.ListPrincipalMaterialStates()<br/>BYPASSRLS — every principal's committed<br/>credential versions across all tenants"]
-        R2["OpenBao List(tenant/client prefix)<br/>enumerate actual KV v2 entries"]
+        R1["ReconcilerRepository.ListPrincipalMaterialStates()<br/>BYPASSRLS — every principal's credential rows,<br/>started at a per-run rotating offset"]
+        R2["per principal (≥ 20s budget left):<br/>OpenBao List under the current client prefix<br/>and every stored path's prefix"]
         R3{"material vs registry"}
-        R4["orphan_deleted:<br/>OpenBao path with no matching<br/>committed version → Delete"]
-        R5["missing_material:<br/>committed version with no<br/>OpenBao entry → page (data loss)"]
-        R6["ok: match"]
+        R4["revoked row whose material survived → Delete"]
+        R5["no row: deleteOrphanUnderLock —<br/>LockForUpdate(principal), re-check no row,<br/>Delete (5s bound) → orphan_deleted"]
+        R6["live row, no material: IsCredentialLive pre-filter,<br/>then confirmMissingUnderLock — under the lock,<br/>re-read the row and List its prefix →<br/>missing_material (page, data loss)"]
+        R7["live row with material → ok"]
+        R8["lock busy (55P03) or principal gone → Skipped"]
         R1 --> R2 --> R3
-        R3 -->|extra in OpenBao| R4
-        R3 -->|missing in OpenBao| R5
-        R3 -->|consistent| R6
-        R4 & R5 & R6 --> R7["metrics.MaterialReconcileTotal{result}"]
+        R3 -->|stale material| R4
+        R3 -->|extra in OpenBao| R5
+        R3 -->|missing in OpenBao| R6
+        R3 -->|consistent| R7
+        R5 -.-> R8
+        R6 -.-> R8
+        R4 & R5 & R6 & R7 --> R9["metrics.MaterialReconcileTotal{result}"]
     end
 
     RECON --> PRUNE
 
-    subgraph PRUNE["3. Retention prune"]
-        P1["processed_events.Prune(ttlDays, limit)<br/>batched DELETE, > 8-day SQS lifetime"]
-        P2["outbox prune via platform-events"]
-        P1 --> P2
+    subgraph PRUNE["3. Retention prune (each step needs ≥ 5s budget)"]
+        P1["processed_events via platform-events inbox<br/>(inbox.Store.Prune, PROCESSED_EVENTS_TTL_DAYS 8)"]
+        P2["outbox prune via platform-events<br/>(PrunePublished, OUTBOX_PRUNE_OLDER_THAN 168h)"]
+        P3["rls_violation_log via prune_rls_violation_log()<br/>(serviceaccount_app, RLS_VIOLATION_LOG_TTL_DAYS 30, min 7)"]
+        P1 --> P2 --> P3
+        P4["out of budget or signalled → Deferred, not Failed"]
     end
 
-    PRUNE --> DONE(["Exit — Kubernetes recreates the Pod<br/>on the next schedule"])
+    PRUNE --> DONE(["serve /metrics for ROTATOR_METRICS_SCRAPE_GRACE (15s),<br/>then exit 1 on any Failed or missing_material,<br/>exit 0 otherwise (Deferred alone is a success)"])
 
     style S1 fill:#e8f4fc,stroke:#2980b9
     style R1 fill:#e8f4fc,stroke:#2980b9
-    style R5 fill:#fce8e6,stroke:#c0392b
+    style R6 fill:#fce8e6,stroke:#c0392b
+    style S4 fill:#fff4e0,stroke:#e67e22

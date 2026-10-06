@@ -57,6 +57,20 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		assert.Equal(t, expiresPrior.Format(time.RFC3339), *body.ExpiresPriorAt)
 	})
 
+	t.Run("private-key responses are never cacheable", func(t *testing.T) {
+		for _, replayed := range []bool{false, true} {
+			svc := &fakeCredentialService{issueResult: &service.IssueOrRotateResult{
+				Version: 1, Secret: "s3cr3t", Replayed: replayed,
+			}}
+			r := newCredentialTestRouter(svc)
+			rec := doJSON(t, r, http.MethodPost, path, sysHeaders(tenantID),
+				issueOrRotateRequestBody{RotationID: rotationID.String()}, nil)
+			require.Less(t, rec.Code, 300)
+			assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+			assert.Equal(t, "no-cache", rec.Header().Get("Pragma"))
+		}
+	})
+
 	t.Run("200 on rotation_id replay", func(t *testing.T) {
 		svc := &fakeCredentialService{issueResult: &service.IssueOrRotateResult{
 			Version: 1, Secret: "s3cr3t", Replayed: true,
@@ -71,6 +85,7 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, path, map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -126,6 +141,21 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		assert.Equal(t, 0, gotReqs[1].OverlapSeconds)
 	})
 
+	t.Run("omitted overlap_seconds uses the configured default", func(t *testing.T) {
+		var gotReq service.IssueOrRotateRequest
+		svc := &fakeCredentialService{issueFn: func(_ context.Context, _, _ uuid.UUID, req service.IssueOrRotateRequest, _ uuid.UUID) (*service.IssueOrRotateResult, error) {
+			gotReq = req
+			return &service.IssueOrRotateResult{Version: 1, Secret: "s"}, nil
+		}}
+		h := NewCredentialHandler(svc).WithDefaultOverlapSeconds(120)
+		r := newTenantScopedTestRouter(func(g *gin.RouterGroup) {
+			g.POST("/service-accounts/:principal_id/credentials", h.IssueOrRotate)
+		})
+
+		doJSON(t, r, http.MethodPost, path, sysHeaders(tenantID), issueOrRotateRequestBody{RotationID: rotationID.String()}, nil)
+		assert.Equal(t, 120, gotReq.OverlapSeconds, "ROTATION_DEFAULT_OVERLAP_SECONDS replaces the built-in 300s")
+	})
+
 	t.Run("maps every domain error from the service", func(t *testing.T) {
 		cases := []struct {
 			name       string
@@ -169,6 +199,7 @@ func TestCredentialHandler_Revoke(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, base+"/1/revoke", nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {

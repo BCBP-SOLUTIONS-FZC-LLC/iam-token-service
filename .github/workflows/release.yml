@@ -1,20 +1,38 @@
 # Triggered by version tags (e.g. v1.0.0 or v1.1.0-rc.1).
-# Pipeline: validate -> build (tag/CHANGELOG gate + cross-compiled binaries)
-# -> docker (build/push/scan/sign/SBOM/provenance) -> deploy-gate (skip
-# unless a cluster is configured) -> publish (GitHub Release).
+# Pipeline: preflight (ref must be a v* tag) -> validate -> build (tag/CHANGELOG gate + cross-compiled binaries)
+# -> docker (candidate push/scan/SBOM/provenance/smoke, then sign and publish
+# the release tags) -> register-schemas (production Glue registration) ->
+# deploy-gate (skip unless a cluster is configured) -> publish (GitHub
+# Release).
 #
-# This service ships THREE binaries from ONE image (see ci.yml's header
-# comment): /iam-token-service-server (HTTP API TS-1..TS-4 + outbox runner,
+# Pre-release tags (any '-' suffix, e.g. v1.1.0-rc.1) still build, scan,
+# sign and publish the image (no `latest`, no vX.Y / vX moving tags) and
+# create a GitHub pre-release, but SKIP register-schemas and deploy-gate:
+# an rc must never write a schema version into the production Glue registry
+# or deploy to production.
+#
+# workflow_dispatch must be started from the tag itself ("Use workflow
+# from" -> the tag), with the same tag as the input. Cosign verification
+# requires a refs/tags/ signing identity and every job checks out
+# github.sha, so a run dispatched from a branch would sign the branch tip
+# and then fail verification; preflight refuses it up front instead.
+#
+# This service ships FOUR binaries from ONE image (see ci.yml's header
+# comment): /iam-token-service-server (HTTP API TS-1..TS-6 + outbox runner,
 # the default ENTRYPOINT), /iam-token-service-consumer (offboarding
-# cascade), and /iam-token-service-rotator (overlap-expiry sweep /
-# orphan-material reconciler / prune). build/docker/smoke-testing below
-# handle all three, mirroring how ci.yml's smoke job runs
+# cascade), /iam-token-service-rotator (overlap-expiry sweep /
+# orphan-material reconciler / prune), and /iam-token-service-scheduler
+# (cadence rotation). build/docker/smoke-testing below handle all four, mirroring how ci.yml's smoke job runs
 # .github/scripts/smoke-tests.sh once per binary rather than assuming a
 # single entrypoint.
 #
-# AWS access for the schema-registry workflow is via OIDC (§13.5 — "no
-# long-lived keys"); this release workflow itself needs no AWS access at
-# all (image push is GHCR, not AWS).
+# register-schemas calls schema-registry.yml (workflow_call) for the
+# production Glue registry BEFORE deploy-gate: the image's GlueCodec resolves
+# every produced schema at startup and refuses to start on an unregistered
+# one, and a release this workflow creates with GITHUB_TOKEN never fires
+# schema-registry.yml's own `release: published` trigger. Its AWS access is
+# via OIDC (§13.5 — "no long-lived keys"), configured by the production
+# environment's vars; the image push itself is GHCR, not AWS.
 #
 # deploy-gate is gated on the vars.DEPLOY_GATE_ENABLED repository/environment
 # variable (default unset -> skipped, not run). `secrets` can't be read in a
@@ -50,24 +68,56 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # preflight guarantees github.ref is refs/tags/<this tag> on every run,
+  # dispatched or pushed.
+  RELEASE_TAG: ${{ github.ref_name }}
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/bcbp-solutions-fzc-llc/iam-token-service
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # Fails a run whose ref is not a v* tag (a workflow_dispatch from a
+  # branch), or whose dispatch input names a different tag than the ref it
+  # was started from — see this file's header comment.
+  preflight:
+    name: Preflight (tag ref)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a v* tag ref
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          case "$REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "::error title=Not a tag ref::Release must run from a v* tag, got ${REF}. For workflow_dispatch, pick the tag under 'Use workflow from' (not a branch) — a branch run signs the branch tip and fails cosign's refs/tags/ identity check."
+              exit 1
+              ;;
+          esac
+          if [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$REF_NAME" ]; then
+            echo "::error title=Tag mismatch::Input tag ${INPUT_TAG} differs from the ref the workflow was started from (${REF_NAME}). Dispatch from ${INPUT_TAG} itself."
+            exit 1
+          fi
+          case "$REF_NAME" in
+            *-*) echo "Pre-release ${REF_NAME}: register-schemas and deploy-gate will be skipped." ;;
+          esac
+
   validate-test:
     name: Validate / Test
+    needs: preflight
     uses: ./.github/workflows/validate-test.yml
     with:
-      ref: ${{ github.event.inputs.tag || github.ref }}
+      ref: ${{ github.ref }}
     secrets: inherit
 
   validate-quality:
     name: Validate / Quality
+    needs: preflight
     uses: ./.github/workflows/validate-quality.yml
     with:
-      ref: ${{ github.event.inputs.tag || github.ref }}
+      ref: ${{ github.ref }}
     secrets: inherit
 
   build:
@@ -76,16 +126,16 @@ jobs:
     needs: [validate-test, validate-quality]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Verify release tag matches checkout
         run: bash .github/scripts/verify-release-tag.sh
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -93,17 +143,17 @@ jobs:
       - name: Verify CHANGELOG entry exists
         run: bash .github/scripts/verify-changelog-entry.sh
 
-      # Cross-compiles all three binaries (server + consumer + rotator) for
+      # Cross-compiles all four binaries (server + consumer + rotator + scheduler) for
       # all target platforms and writes per-binary .sha256 files. No `make
       # build` step — the script owns the full build for release assets.
       # This service is deployed exclusively as a container carrying all
       # three entrypoints — these binaries are a convenience for local/
       # non-Docker runs, not the primary distribution artifact.
-      - name: Prepare release binaries (all three binaries, all platforms)
+      - name: Prepare release binaries (all four binaries, all platforms)
         run: bash .github/scripts/prepare-release-binary.sh
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ env.RELEASE_TAG }}
           path: |
@@ -128,7 +178,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
@@ -137,7 +187,7 @@ jobs:
         run: bash .github/scripts/set-source-date-epoch.sh
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -145,7 +195,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
           # Produces: vMAJOR.MINOR.PATCH, vMAJOR.MINOR, vMAJOR (non-pre-releases).
@@ -157,11 +207,15 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build and push
+      # Pushed ONLY under a candidate tag. The release tags (vX.Y.Z, vX.Y,
+      # vX, latest) are applied by "Publish release tags" at the end of this
+      # job, after the CVE scan, signing and smoke tests pass — a consumer
+      # pinning a release tag can never pull an image that failed them.
+      - name: Build and push (candidate)
         id: pushed
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -171,7 +225,7 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.IMAGE_NAME }}:candidate-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BUILD_VERSION=${{ env.RELEASE_TAG }}
@@ -185,7 +239,7 @@ jobs:
           # a supply-chain artifact that's actually present.
 
       - name: Cache Trivy DB
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/trivy-cache
           key: trivy-db-${{ runner.os }}
@@ -196,9 +250,9 @@ jobs:
       # findings fail the release — a known-vulnerable image must not be
       # tagged as a release that consuming services will pin.
       - name: Scan image for CVEs
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
           format: sarif
           output: trivy-results.sarif
           ignore-unfixed: true
@@ -208,7 +262,7 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         if: always()
         continue-on-error: true
         with:
@@ -216,23 +270,23 @@ jobs:
 
       # CycloneDX SBOM — full component inventory for compliance / audit.
       - name: Generate SBOM
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
           format: cyclonedx
           output: sbom.cyclonedx.json
           exit-code: "0"
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ env.RELEASE_TAG }}
           path: sbom.cyclonedx.json
           retention-days: 90
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Export SLSA provenance
         env:
@@ -240,27 +294,11 @@ jobs:
         run: bash .github/scripts/export-image-provenance.sh
 
       - name: Upload provenance artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: provenance-${{ env.RELEASE_TAG }}
           path: provenance.slsa.json
           retention-days: 90
-
-      # Keyless signing via Sigstore OIDC — no long-lived key to rotate or
-      # leak. Mirrors ci.yml's push job exactly (same cosign-installer
-      # version and invocation), just against the tagged image instead of
-      # main.
-      - name: Sign image with Cosign
-        run: |
-          cosign sign --yes \
-            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
-
-      - name: Verify image signature
-        run: |
-          cosign verify \
-            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/tags/.*$" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
 
       # smoke-tests.sh needs the image present locally: `docker image
       # inspect` doesn't auto-pull the way `docker run` does, and this job
@@ -288,6 +326,67 @@ jobs:
           ENTRYPOINT: /iam-token-service-rotator
         run: bash .github/scripts/smoke-tests.sh
 
+      - name: Smoke tests (scheduler)
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+          BINARY: scheduler
+          ENTRYPOINT: /iam-token-service-scheduler
+        run: bash .github/scripts/smoke-tests.sh
+
+      # Keyless signing via Sigstore OIDC — no long-lived key to rotate or
+      # leak. Signed only after the CVE scan AND the smoke tests pass, since
+      # admission policies trust a signature: a digest that failed either
+      # gate must never carry one. Mirrors ci.yml's push job (same
+      # cosign-installer version and invocation), against the release
+      # candidate instead of main.
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --yes \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/tags/.*$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      # Every gate above passed: point the release tags at the scanned,
+      # signed digest. imagetools copies the manifest list by digest, so the
+      # tags resolve to exactly what was scanned (attestations included).
+      - name: Publish release tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE: ${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}
+        run: |
+          args=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=(--tag "$t")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$SOURCE"
+
+  # Production Glue Schema Registry registration (schema-registry.yml's
+  # production job, via workflow_call). Runs for every release, deploy gate
+  # or not: whoever deploys this version (deploy-gate below or a GitOps
+  # controller) needs its schemas registered first, so publish requires it
+  # too. The production environment (approvals, AWS_ROLE_ARN, registry name)
+  # is applied by the called job's own `environment: production` — a job
+  # that calls a reusable workflow cannot set `environment` itself.
+  # Skipped for pre-release tags (job-level `if` cannot read `env`, so the
+  # tag is read from github.ref_name, which preflight pinned to the tag).
+  register-schemas:
+    name: Register schemas (production)
+    needs: [build, docker]
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/schema-registry.yml
+    permissions:
+      contents: write   # schema changelog commit to main
+      id-token: write   # AWS OIDC role assumption
+    with:
+      environment: production
+      release_tag: ${{ github.ref }}
+    secrets: inherit
+
   # Post-deploy health gate — skipped unless vars.DEPLOY_GATE_ENABLED is
   # "true" (see this file's header comment). When enabled: deploys the image
   # with Helm, waits for rollout of both Deployments (server + consumer —
@@ -295,33 +394,38 @@ jobs:
   # with one process handling everything), verifies the deployed digest
   # matches what was pushed, then checks the error rate for 2 minutes. On
   # failure, automatically rolls back and fails the release.
-  # Requires: KUBECONFIG_B64 secret, K8S_NAMESPACE var (optional), PROMETHEUS_URL var (optional).
+  # Requires: KUBECONFIG_B64 and HELM_VALUES_B64 secrets, K8S_NAMESPACE var (optional), PROMETHEUS_URL var (optional).
   deploy-gate:
     name: Post-deploy health gate
     runs-on: ubuntu-latest
-    needs: [build, docker]
-    if: vars.DEPLOY_GATE_ENABLED == 'true'
+    needs: [build, docker, register-schemas]
+    # Never for a pre-release tag (register-schemas is skipped then too).
+    if: ${{ vars.DEPLOY_GATE_ENABLED == 'true' && !contains(github.ref_name, '-') }}
     environment: production
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify KUBECONFIG_B64 is configured
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
-          if [ -z "${{ secrets.KUBECONFIG_B64 }}" ]; then
+          if [ -z "${KUBECONFIG_B64}" ]; then
             echo "::error::KUBECONFIG_B64 secret is not set. Configure the kubeconfig for the production cluster before tagging releases."
             exit 1
           fi
 
       - name: Configure kubectl
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "${KUBECONFIG_B64}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       # Deploy the just-published image via Helm so the gate is never a
       # no-op, regardless of whether a GitOps controller is configured.
@@ -329,14 +433,32 @@ jobs:
       # iam-token-service-secrets already exists in the target namespace —
       # this chart's secret.yaml template hard-fails the render otherwise
       # (see deploy/helm/values.yaml).
+      # HELM_VALUES_B64 holds the environment's values file (base64): the
+      # settings the chart refuses to render without — networkPolicy
+      # namespace selectors and egress CIDRs, events.topicArn, the SQS queue
+      # URL, per-workload IRSA annotations. The image is deployed by the
+      # digest that was scanned and signed, never by a mutable tag.
+      - name: Write environment values
+        env:
+          HELM_VALUES_B64: ${{ secrets.HELM_VALUES_B64 }}
+        run: |
+          if [ -z "$HELM_VALUES_B64" ]; then
+            echo "::error::HELM_VALUES_B64 secret is not set. Configure the production Helm values (networkPolicy, events, IRSA) before enabling the deploy gate."
+            exit 1
+          fi
+          echo "$HELM_VALUES_B64" | base64 -d > "$RUNNER_TEMP/values-env.yaml"
+
       - name: Deploy with Helm
         run: |
           helm upgrade iam-token-service ./deploy/helm \
             --install \
             --wait \
-            --timeout=5m \
+            --wait-for-jobs \
+            --timeout=10m \
             --namespace="${{ vars.K8S_NAMESPACE || 'default' }}" \
+            -f "$RUNNER_TEMP/values-env.yaml" \
             --set image.tag="${{ needs.docker.outputs.version }}" \
+            --set image.digest="${{ needs.docker.outputs.digest }}" \
             --set existingSecret=iam-token-service-secrets \
             --atomic
 
@@ -359,7 +481,8 @@ jobs:
               fi
               echo "Digest verified: ${DEPLOY} matches published artifact."
             else
-              echo "::warning::Deployed image on ${DEPLOY} is not digest-pinned — cannot verify supply-chain integrity. Pin image digests in the Helm values."
+              echo "::error::Deployed image on ${DEPLOY} is not digest-pinned although image.digest was set — check the chart's image helper."
+              exit 1
             fi
           done
 
@@ -372,7 +495,10 @@ jobs:
           done
 
       # status_class="5xx" is emitted by platform-gincommon's Gin
-      # middleware on http_requests_total.
+      # middleware on platform_http_requests_total (Enterprise Platform
+      # Observability Standard; metric_status: proposed in the registry —
+      # the pre-standard name is no longer emitted). domain="iam" pins the
+      # gate to this service's own series.
       - name: Health gate — error rate < 1% for 2 minutes
         run: |
           PROM_URL="${{ vars.PROMETHEUS_URL }}"
@@ -380,7 +506,7 @@ jobs:
             echo "PROMETHEUS_URL not set — skipping error-rate check"
             exit 0
           fi
-          QUERY='sum(rate(http_requests_total{job=~".*iam-token-service.*",status_class="5xx"}[2m]))/sum(rate(http_requests_total{job=~".*iam-token-service.*"}[2m]))'
+          QUERY='sum(rate(platform_http_requests_total{domain="iam",job=~".*iam-token-service.*",status_class="5xx"}[2m]))/sum(rate(platform_http_requests_total{domain="iam",job=~".*iam-token-service.*"}[2m]))'
           # Sleep AFTER confirming Prometheus is configured so the 2-minute window
           # only runs when there is actually something to measure.
           sleep 120
@@ -403,16 +529,23 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-latest
     # deploy-gate must succeed OR be legitimately skipped (vars.DEPLOY_GATE_ENABLED
-    # unset — no cluster configured yet). A *failed* gate (it ran and the
-    # health check or digest verification tripped) still blocks publish —
-    # only skip vs. fail are treated differently here.
-    needs: [build, docker, deploy-gate]
-    if: needs.build.result == 'success' && needs.docker.result == 'success' && (needs.deploy-gate.result == 'success' || needs.deploy-gate.result == 'skipped')
+    # unset — no cluster configured yet — or a pre-release tag). A *failed*
+    # gate (it ran and the health check or digest verification tripped)
+    # still blocks publish — only skip vs. fail are treated differently here.
+    # register-schemas may be skipped only for a pre-release tag.
+    needs: [build, docker, register-schemas, deploy-gate]
+    if: >-
+      ${{ always()
+      && needs.build.result == 'success'
+      && needs.docker.result == 'success'
+      && (needs.register-schemas.result == 'success'
+          || (needs.register-schemas.result == 'skipped' && contains(github.ref_name, '-')))
+      && (needs.deploy-gate.result == 'success' || needs.deploy-gate.result == 'skipped') }}
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -428,25 +561,27 @@ jobs:
       # has no other way to know this wasn't verified against a live deploy.
       - name: Note skipped deploy-gate in release notes
         if: needs.deploy-gate.result == 'skipped'
+        env:
+          WHY: ${{ contains(github.ref_name, '-') && 'pre-release tag — schemas not registered in production Glue, not deployed' || '`vars.DEPLOY_GATE_ENABLED` unset' }}
         run: |
           {
             echo ""
             echo "---"
-            echo "⚠️ **Not deployed/health-checked** — \`deploy-gate\` was skipped (\`vars.DEPLOY_GATE_ENABLED\` unset). This release was not verified against a live deployment."
+            echo "⚠️ **Not deployed/health-checked** — \`deploy-gate\` was skipped (${WHY}). This release was not verified against a live deployment."
           } >> release-notes.md
 
       - name: Download SBOM
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: sbom-${{ env.RELEASE_TAG }}
 
       - name: Download provenance
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: provenance-${{ env.RELEASE_TAG }}
 
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: binary-${{ env.RELEASE_TAG }}
           path: .

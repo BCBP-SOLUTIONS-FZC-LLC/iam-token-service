@@ -6,7 +6,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -90,6 +90,19 @@ func (r *CredentialRepository) FindActive(ctx context.Context, tenantID, princip
 		return nil, err
 	}
 	return out, nil
+}
+
+// MaxVersion returns the highest version ever committed for the principal,
+// any status (0 when none) — TS-1's next-version basis (uq_sac_version).
+func (r *CredentialRepository) MaxVersion(ctx context.Context, tenantID, principalID uuid.UUID) (int, error) {
+	var maxVersion int
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(MAX(version), 0) FROM service_account_credentials
+			WHERE tenant_id = $1 AND principal_id = $2`,
+			tenantID, principalID).Scan(&maxVersion)
+	})
+	return maxVersion, err
 }
 
 // FindByRotationID returns the credential row already created for

@@ -132,7 +132,7 @@ info:
     email: platform@bcbpsolutions.com
     name: BCBP Solutions IAM Team
   description: |-
-    Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-4).
+    Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-6 plus the EXT-6 JWKS route).
 
     **Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).
     **Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).
@@ -147,7 +147,10 @@ paths:
       description: Looks up a principal by its Keycloak sub rather than this service's
         own internal id (AUTH-9) — the signal another service needs to answer "does
         this subject resolve to a service_account-typed Keycloak principal" without
-        ever generating principal_sub itself (TS-INV-1).
+        ever generating principal_sub itself (TS-INV-1). Requires x-user-id = the
+        fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID;
+        any other value is 401 missing_identity_headers) and x-tenant-id equal to
+        the {id} path segment (else 403 tenant_path_mismatch).
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -176,6 +179,10 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "404":
           description: principal_not_found
           schema:
@@ -184,10 +191,13 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-5 — Find service-account principal by Keycloak sub
       tags:
       - ServiceAccounts
@@ -195,8 +205,12 @@ paths:
       consumes:
       - application/json
       description: Registers the per-tenant platform-automation service-account principal.
-        Idempotent on (tenant_id, keycloak_client_id) — repeating an already-registered
-        request returns 200 with the existing record instead of erroring.
+        Idempotent on (tenant_id, principal_type) — repeating an already-registered
+        request returns 200 with the existing record, and a re-mint (new principal_sub/keycloak_client_id)
+        updates it in place, keeping principal_id. Requires x-user-id = the fixed
+        iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID;
+        any other value is 401 missing_identity_headers) and x-tenant-id equal to
+        the {id} path segment (else 403 tenant_path_mismatch).
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -229,6 +243,19 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "409":
+          description: rotation_in_flight (retryable; the principal row is locked
+            by a concurrent credential write)
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "415":
+          description: unsupported_media_type
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "500":
           description: Internal Server Error
           schema:
@@ -238,9 +265,8 @@ paths:
           schema:
             $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-4 — Register service-account principal
       tags:
       - ServiceAccounts
@@ -248,7 +274,9 @@ paths:
     get:
       description: Returns principal metadata and a summary of every credential version
         (status, OpenBao path, issued/expires timestamps) — never the credential plaintext
-        itself (§5.6).
+        itself (§5.6). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1
+        (domain.SystemPrincipalID; any other value is 401 missing_identity_headers)
+        and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -277,6 +305,10 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "404":
           description: principal_not_found
           schema:
@@ -285,10 +317,13 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-3 — Read service-account principal
       tags:
       - ServiceAccounts
@@ -296,13 +331,19 @@ paths:
     post:
       consumes:
       - application/json
-      description: Issues the principal's first credential (version=1, 201) or rotates
+      description: 'Issues the principal''s first credential (version=1, 201) or rotates
         to a new version (201) when one already exists. A rotation_id replay of an
         already-committed request returns the stored result (200) instead of generating
-        new material (§9.2). Returns a PEM-encoded RSA private key exactly once —
-        it is never retrievable again (TS-INV-2); the matching public key is served
-        at the principal's JWKS endpoint (EXT-6, §2.5) once RP-17 refreshes Keycloak's
-        keys cache.
+        new material (§9.2) — only within ROTATION_REPLAY_WINDOW (default 15m) of
+        the credential''s issue; later it is 409 credential_replay_expired, and 409
+        credential_replay_revoked once that version is revoked. Success responses
+        carry Cache-Control: no-store and Pragma: no-cache. Returns a PEM-encoded
+        RSA private key exactly once — it is never retrievable again (TS-INV-2); the
+        matching public key is served at the principal''s JWKS endpoint (EXT-6, §2.5)
+        once RP-17 refreshes Keycloak''s keys cache. Requires x-user-id = the fixed
+        iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID;
+        any other value is 401 missing_identity_headers) and x-tenant-id equal to
+        the {id} path segment (else 403 tenant_path_mismatch).'
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -342,26 +383,43 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "404":
           description: principal_not_found
           schema:
             $ref: '#/definitions/http.ErrorResponse'
         "409":
-          description: rotation_in_flight OR optimistic_lock_conflict
+          description: rotation_in_flight (retryable; incl. principal lock wait timeout)
+            | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired
+            — details.version on the replay codes
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "415":
+          description: unsupported_media_type
           schema:
             $ref: '#/definitions/http.ErrorResponse'
         "422":
           description: principal_revoked
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "502":
           description: secret_store_unavailable
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-1 — Issue or rotate credential
       tags:
       - Credentials
@@ -370,7 +428,9 @@ paths:
       description: 'Revokes one credential version — deletes its OpenBao material
         and marks it revoked. keycloak_invalidation is always "caller_responsibility":
         this service never invalidates the token at Keycloak itself (two-halves invariant,
-        TS-INV-7).'
+        TS-INV-7). Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1
+        (domain.SystemPrincipalID; any other value is 401 missing_identity_headers)
+        and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).'
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -404,22 +464,38 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "404":
           description: principal_not_found
           schema:
             $ref: '#/definitions/http.ErrorResponse'
         "409":
-          description: optimistic_lock_conflict
+          description: rotation_in_flight (retryable; principal lock wait timeout)
+            | optimistic_lock_conflict
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "415":
+          description: unsupported_media_type (only when a body is sent)
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
+        "500":
+          description: Internal Server Error
           schema:
             $ref: '#/definitions/http.ErrorResponse'
         "502":
           description: secret_store_unavailable
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-2 — Revoke credential version
       tags:
       - Credentials
@@ -430,7 +506,10 @@ paths:
         (e.g. Workflow's connector callbacks). principal_sub is stable across credential
         rotation but changes when RP-3 (convert) or RP-4 (revert-conversion) re-mints
         the client in another realm; principal_id is stable across both. Never returns
-        credential metadata or material.
+        credential metadata or material. Requires x-user-id = the fixed iam-system
+        principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID;
+        any other value is 401 missing_identity_headers) and x-tenant-id equal to
+        the {id} path segment (else 403 tenant_path_mismatch).
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -453,6 +532,10 @@ paths:
           description: missing_identity_headers
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "403":
+          description: tenant_path_mismatch
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
         "404":
           description: principal_not_found
           schema:
@@ -466,9 +549,8 @@ paths:
           schema:
             $ref: '#/definitions/http.ErrorResponse'
       security:
-      - SystemRole: []
       - TenantID: []
-      - UserID: []
+        UserID: []
       summary: TS-6 — Read the tenant's platform-automation principal
       tags:
       - ServiceAccounts
@@ -476,10 +558,14 @@ paths:
     get:
       description: Public JWK Set for the tenant's platform-automation principal —
         the keys Keycloak's client-jwt authenticator fetches to verify that principal's
-        client_assertion (§2.5). Always 200 with a (possibly empty) keys array; an
-        unknown tenant or absent principal is never distinguished from a principal
-        with zero live keys, since this route has no caller identity to authorize
-        a 404 against.
+        client_assertion (§2.5). 200 with a (possibly empty) keys array; an unknown
+        tenant or absent principal is never distinguished from a principal with zero
+        live keys, since this route has no caller identity to authorize a 404 against.
+        503 jwks_keys_unavailable when the ACTIVE key, or every live key, failed to
+        read from OpenBao (so Keycloak keeps its cached keys rather than caching a
+        set without the current key); a set missing only overlap (rotating) keys is
+        served as 200. No identity headers; rate-limited per tenant, and tenant ids
+        with no live credential share a small separate bucket.
       parameters:
       - description: Tenant UUID
         format: uuid
@@ -506,16 +592,15 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/http.ErrorResponse'
+        "503":
+          description: jwks_keys_unavailable (active key, or every live key, unreadable)
+            | db_unavailable
+          schema:
+            $ref: '#/definitions/http.ErrorResponse'
       summary: EXT-6 — Platform-automation JWKS
       tags:
       - ServiceAccounts
 securityDefinitions:
-  SystemRole:
-    description: Must contain "iam-system". Injected by the API gateway / mesh; never
-      set by callers directly.
-    in: header
-    name: x-tenant-roles
-    type: apiKey
   TenantID:
     description: Tenant UUID injected by the API gateway. Must match the :id path
       segment (§5.1).
@@ -523,8 +608,8 @@ securityDefinitions:
     name: x-tenant-id
     type: apiKey
   UserID:
-    description: Caller identity injected by the API gateway — recorded as the actor
-      on any mutation.
+    description: Must be the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1
+      (domain.SystemPrincipalID); anything else is 401 missing_identity_headers.
     in: header
     name: x-user-id
     type: apiKey

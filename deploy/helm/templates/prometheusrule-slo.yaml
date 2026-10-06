@@ -1,0 +1,219 @@
+{{- /*
+Helm-rendered twin of deploy/monitoring/slo-rules.yml (SLO recording rules
+and burn-rate alerts). Keep both in sync; only the job labels are templated.
+*/ -}}
+{{- if .Values.serviceMonitor.enabled }}
+{{- $job := include "iam-token-service.fullname" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "iam-token-service.fullname" . }}-slo
+  labels:
+    {{- include "iam-token-service.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # ── SLI recording ───────────────────────────────────────────────────────
+    - name: iam-token-service.slo.records
+      interval: 30s
+      rules:
+        # TS-1 issue/rotate latency histogram → error budget window.
+        # platform_http_request_duration_seconds' `route` label is the Gin route
+        # template (never the raw path), so it matches the TS-1 route below.
+        - record: iam_token_service:ts1_latency_sli:ratio_rate_5m
+          expr: |
+            sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+              job={{ printf "%s-server" $job | quote }},
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+              le="0.5"
+            }[5m]))
+            /
+            clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+              job={{ printf "%s-server" $job | quote }},
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+            }[5m])), 0.001)
+
+        - record: iam_token_service:ts1_latency_sli:ratio_rate_1h
+          expr: |
+            sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+              job={{ printf "%s-server" $job | quote }},
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials",
+              le="0.5"
+            }[1h]))
+            /
+            clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+              job={{ printf "%s-server" $job | quote }},
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id/credentials"
+            }[1h])), 0.001)
+
+        # TS-3 read latency (LLD §11: p99 ≤ 100 ms).
+        - record: iam_token_service:ts3_latency_sli:ratio_rate_5m
+          expr: |
+            sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+              job={{ printf "%s-server" $job | quote }},
+              method="GET",
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id",
+              le="0.1"
+            }[5m]))
+            /
+            clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+              job={{ printf "%s-server" $job | quote }},
+              method="GET",
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id"
+            }[5m])), 0.001)
+
+        - record: iam_token_service:ts3_latency_sli:ratio_rate_1h
+          expr: |
+            sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_bucket{
+              job={{ printf "%s-server" $job | quote }},
+              method="GET",
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id",
+              le="0.1"
+            }[1h]))
+            /
+            clamp_min(sum by (domain, service, environment) (rate(platform_http_request_duration_seconds_count{
+              job={{ printf "%s-server" $job | quote }},
+              method="GET",
+              route="/api/v1/internal/tenants/:id/service-accounts/:principal_id"
+            }[1h])), 0.001)
+
+        # Write-path error rate (5xx only — 4xx like credential_replay_revoked
+        # 409 or optimistic_lock_conflict are intentional, §17).
+        - record: iam_token_service:write_error_rate:ratio_rate_5m
+          expr: |
+            sum by (domain, service, environment) (rate(platform_http_requests_total{
+              job={{ printf "%s-server" $job | quote }},
+              method=~"POST|PUT|PATCH|DELETE",
+              status_class="5xx"
+            }[5m]))
+            /
+            clamp_min(sum by (domain, service, environment) (rate(platform_http_requests_total{
+              job={{ printf "%s-server" $job | quote }},
+              method=~"POST|PUT|PATCH|DELETE"
+            }[5m])), 0.001)
+
+        # Rotation sweep success ratio (§8.3) — result label matches
+        # IAMTokenServiceRotationSweepFailures' iam_token_service_rotation_sweep_total.
+        # Counts RUNS, not a rate: every rotator run is its own short-lived pod
+        # whose counter is incremented once (result ok|error) and stays constant
+        # while scrapeable, so rate() over it is always 0 and the old rate ratio
+        # read 0 → the SLO fired permanently. max_over_time per pod series is 1
+        # for that run's result; summing over pods counts runs in the hour. The
+        # record name is kept for dashboard compatibility.
+        - record: iam_token_service:sweep_success_rate:ratio_rate_1h
+          expr: |
+            sum by (domain, service, environment) (max_over_time(iam_token_service_rotation_sweep_total{
+              job={{ printf "%s-rotator" $job | quote }},
+              result="ok"
+            }[1h]))
+            /
+            clamp_min(sum by (domain, service, environment) (max_over_time(iam_token_service_rotation_sweep_total{
+              job={{ printf "%s-rotator" $job | quote }}
+            }[1h])), 1)
+
+    # ── SLO burn-rate alerts (multi-window) ─────────────────────────────────
+    - name: iam-token-service.slo.burn
+      interval: 1m
+      rules:
+        # SLO-1: fast burn on TS-1 latency (2% budget in 1h → page).
+        - alert: IAMTokenServiceSLO1_TS1LatencyFastBurn
+          expr: |
+            (1 - iam_token_service:ts1_latency_sli:ratio_rate_5m) > (14.4 * (1 - 0.99))
+            and
+            (1 - iam_token_service:ts1_latency_sli:ratio_rate_1h) > (14.4 * (1 - 0.99))
+          for: 2m
+          labels:
+            severity: page
+            slo: SLO-1
+            team: platform
+            metric_status: proposed  # platform_http_* awaits registry ratification
+          annotations:
+            summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 above 500 ms (LLD §11)"
+            description: |
+              TS-1 (issue/rotate) is missing the 500 ms target (LLD §11) for
+              {{ "{{ $value | humanizePercentage }}" }} of requests over the last
+              5m + 1h windows. Check
+              iam_token_service_openbao_call_duration_seconds{op} first (§6.2
+              material-first write) and Postgres query latency second.
+
+        # SLO-1: slow burn (5% budget in 24h → ticket).
+        - alert: IAMTokenServiceSLO1_TS1LatencySlowBurn
+          expr: |
+            (1 - iam_token_service:ts1_latency_sli:ratio_rate_1h) > (6 * (1 - 0.99))
+          for: 15m
+          labels:
+            severity: ticket
+            slo: SLO-1
+            team: platform
+            metric_status: proposed  # platform_http_* awaits registry ratification
+          annotations:
+            summary: "SLO-1 slow-burn: TS-1 p99 above 500 ms for 15m+ (LLD §11)"
+
+        # SLO-2: write-path 5xx spike.
+        - alert: IAMTokenServiceSLO2_WriteErrorRateFastBurn
+          expr: iam_token_service:write_error_rate:ratio_rate_5m > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: page
+            slo: SLO-2
+            team: platform
+            metric_status: proposed  # platform_http_* awaits registry ratification
+          annotations:
+            summary: "SLO-2 fast-burn: write-path 5xx burning the 99.9% budget (LLD §11)"
+            description: |
+              {{ "{{ $value | humanizePercentage }}" }} of mutating requests are
+              returning 5xx. Likely Postgres or OpenBao failure — cross-reference
+              IAMTokenServiceOpenBaoCallLatencyHigh and /readyz.
+
+        # SLO-3: rotation sweep success ratio degraded.
+        - alert: IAMTokenServiceSLO3_SweepSuccessRateLow
+          expr: iam_token_service:sweep_success_rate:ratio_rate_1h < 0.99
+          for: 20m
+          labels:
+            severity: ticket
+            slo: SLO-3
+            team: platform
+          annotations:
+            summary: "SLO-3: §8.3 overlap-expiry sweep success ratio below 99% (operational proxy)"
+            description: |
+              Sweep success ratio = {{ "{{ $value | humanizePercentage }}" }} over the
+              last hour (for 20m+). Check the rotator CronJob logs — this
+              complements IAMTokenServiceRotationSweepFailures (app-alerts.yml),
+              which fires on any single error rather than a sustained ratio.
+
+        # SLO-4: fast burn on TS-3 read latency (2% budget in 1h → page).
+        - alert: IAMTokenServiceSLO4_TS3LatencyFastBurn
+          expr: |
+            (1 - iam_token_service:ts3_latency_sli:ratio_rate_5m) > (14.4 * (1 - 0.99))
+            and
+            (1 - iam_token_service:ts3_latency_sli:ratio_rate_1h) > (14.4 * (1 - 0.99))
+          for: 2m
+          labels:
+            severity: page
+            slo: SLO-4
+            team: platform
+            metric_status: proposed  # platform_http_* awaits registry ratification
+          annotations:
+            summary: "SLO-4 fast-burn: TS-3 read p99 above 100 ms (LLD §11)"
+            description: |
+              TS-3 (read principal + credential metadata) is missing the 100 ms
+              target for {{ "{{ $value | humanizePercentage }}" }} of requests over the
+              last 5m + 1h windows. TS-3 never calls OpenBao: check
+              platform_db_query_duration_seconds and
+              platform_db_pool_acquire_duration_seconds{pool="default"}.
+
+        # SLO-4: slow burn (5% budget in 24h → ticket).
+        - alert: IAMTokenServiceSLO4_TS3LatencySlowBurn
+          expr: |
+            (1 - iam_token_service:ts3_latency_sli:ratio_rate_1h) > (6 * (1 - 0.99))
+          for: 15m
+          labels:
+            severity: ticket
+            slo: SLO-4
+            team: platform
+            metric_status: proposed  # platform_http_* awaits registry ratification
+          annotations:
+            summary: "SLO-4 slow-burn: TS-3 p99 above 100 ms for 15m+ (LLD §11)"
+{{- end }}

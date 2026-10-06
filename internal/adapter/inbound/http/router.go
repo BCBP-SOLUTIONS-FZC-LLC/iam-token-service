@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -20,9 +19,9 @@ type Pinger interface {
 }
 
 // DocsConfig controls whether the Swagger (OpenAPI, §5.5) and AsyncAPI
-// (§7.3) docs surfaces are exposed — always mounted outside production,
-// opt-in via Enabled in production, optionally bearer-token-locked
-// (§12.1).
+// (§7.3) docs surfaces are exposed — always mounted in a development
+// environment (local, dev, test), opt-in via Enabled everywhere else, and
+// bearer-token-locked there when AuthToken is set (§12.1).
 type DocsConfig struct {
 	Environment string
 	Enabled     bool
@@ -30,7 +29,23 @@ type DocsConfig struct {
 }
 
 func (d DocsConfig) active() bool {
-	return d.Environment != "production" || d.Enabled
+	return !d.Restricted() || d.Enabled
+}
+
+// Restricted reports whether Environment is anything but a development
+// environment (local, dev, test — the platform observability vocabulary):
+// staging, prod, a stale "production", an unknown value, or none at all.
+// Restricted environments get production docs gating (TS-D23): staging
+// used to mount the docs unconditionally and ignore DOCS_AUTH_TOKEN, and
+// staging carries real tenant ids and the same internal API shape. Unknown
+// and empty values are restricted so a typo can never expose the docs.
+// cmd/server's startup check uses it too (enabled without a token fails).
+func (d DocsConfig) Restricted() bool {
+	switch strings.ToLower(strings.TrimSpace(d.Environment)) {
+	case "local", "dev", "test":
+		return false
+	}
+	return true
 }
 
 // Handlers bundles the Gin handler methods NewRouter wires onto routes.
@@ -61,8 +76,10 @@ type Router struct {
 func (r *Router) Handler() http.Handler { return r.engine }
 
 // NewRouter builds and wires every route this service exposes: the
-// unauthenticated infra probes and the mesh-only /api/v1/internal/*
-// credential-lifecycle API (TS-1..TS-6, §5.1).
+// unauthenticated infra probes, the docs surface, the EXT-6 JWKS route
+// (unauthenticated by header, outside the protected group — §5.6) and the
+// mesh-only, header-authenticated /api/v1/internal/* credential-lifecycle
+// API (TS-1..TS-6, §5.1).
 func NewRouter(cfg RouterConfig) *Router {
 	errorLogger = cfg.GinConfig.Logger
 
@@ -76,7 +93,6 @@ func NewRouter(cfg RouterConfig) *Router {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 		c.Next()
 	})
-	r.Use(gincommon.TimeoutMiddleware(30 * time.Second))
 	r.Use(gincommon.ObservabilityMiddlewares(cfg.GinConfig)...)
 
 	registerInfraRoutes(r, cfg)
@@ -173,7 +189,7 @@ func registerDocsRoutes(r *gin.Engine, cfg RouterConfig) {
 	}
 
 	var authMiddleware gin.HandlerFunc = func(c *gin.Context) { c.Next() }
-	if cfg.Docs.Environment == "production" && cfg.Docs.AuthToken != "" {
+	if cfg.Docs.Restricted() && cfg.Docs.AuthToken != "" {
 		expected := []byte("Bearer " + cfg.Docs.AuthToken)
 		authMiddleware = func(c *gin.Context) {
 			// Constant-time compare — a plain != leaks how many leading
@@ -224,13 +240,15 @@ func registerJWKSRoutes(r *gin.Engine, cfg RouterConfig) {
 func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 	h := cfg.Handlers
 
-	protected := append(
-		gincommon.ProtectedMiddlewares(cfg.GinConfig),
-		GUCBridgeMiddleware(),
-		RequireJSONContentType(),
-	)
-	// Every route in this service lives under /api/v1/internal — there is
-	// no public/tenant-facing surface at MVP (§5.1/§5.6).
+	// RequireIdentityHeaders first: it answers a missing/invalid identity
+	// header with the frozen missing_identity_headers code before gincommon's
+	// RequireAuth can answer it with a generic message.
+	protected := []gin.HandlerFunc{RequireIdentityHeaders()}
+	protected = append(protected, gincommon.ProtectedMiddlewares(cfg.GinConfig)...)
+	protected = append(protected, GUCBridgeMiddleware(), RequireJSONContentType())
+	// Every API route lives under /api/v1/internal (§5.1). The one route
+	// there NOT in this group is the EXT-6 JWKS route (registerJWKSRoutes),
+	// which carries no identity headers by design (§5.6).
 	internal := r.Group("/api/v1/internal", protected...)
 
 	tenantScoped := internal.Group("/tenants/:id", RequireTenantPathMatch())

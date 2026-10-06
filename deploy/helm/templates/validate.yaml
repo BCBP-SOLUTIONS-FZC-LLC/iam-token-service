@@ -1,0 +1,52 @@
+{{/*
+Render-time guards that span several templates. Renders nothing; each check
+fails the install/upgrade with a message saying what to set and why. The
+per-template guards (networkPolicy selectors, secretValues) stay next to the
+resource they protect.
+
+"Non-dev" means appEnv is not one of local | dev | test — i.e. staging and
+prod, the environments that must carry the production safety posture.
+*/}}
+{{- $devEnvs := list "local" "dev" "test" }}
+{{- $nonDev := not (has .Values.appEnv $devEnvs) }}
+
+{{- /* Finding: Keycloak/Workflow could forge the system principal. NetworkPolicy
+admits their namespaces to the whole HTTP port, and the only identity check on
+the API routes is the reserved x-user-id header, which any caller can set. The
+Istio AuthorizationPolicy is what restricts them to their one route each. */}}
+{{- /* Not gated on networkPolicy.enabled: with NetworkPolicy off every pod in
+the cluster reaches the port, which is strictly worse. */}}
+{{- if and $nonDev (not .Values.authorizationPolicy.enabled) }}
+{{- fail (printf "authorizationPolicy.enabled must be true when appEnv=%q (not local/dev/test): NetworkPolicy (when enabled) admits the Keycloak (and Workflow) namespaces to the server's whole HTTP port, and the API routes authenticate only by the x-user-id header, which any pod there can set — so without the Istio AuthorizationPolicy a pod in the Keycloak namespace can call TS-1/TS-2/TS-4 as the system principal. Enable authorizationPolicy (Keycloak must be in the mesh) and set its meshNamespaces/keycloakNamespaces. See values.yaml." .Values.appEnv) }}
+{{- end }}
+{{- if .Values.authorizationPolicy.enabled }}
+{{- if not .Values.authorizationPolicy.meshNamespaces }}
+{{- fail "authorizationPolicy.meshNamespaces is required when authorizationPolicy.enabled is true — it lists the namespaces of the Realm Provisioner, O&M and the operator gateway, the only callers allowed on every route; without it the ALLOW policy denies them all. See values.yaml." }}
+{{- end }}
+{{- if not .Values.authorizationPolicy.keycloakNamespaces }}
+{{- fail "authorizationPolicy.keycloakNamespaces is required when authorizationPolicy.enabled is true — without it Keycloak's JWKS fetch (EXT-6) is denied and every platform-automation client-jwt login fails. Keycloak must also be in the mesh (mTLS), since source.namespaces matches only authenticated peers. See values.yaml." }}
+{{- end }}
+{{- end }}
+
+{{- /* Production-required values: an empty value here silently degrades to a
+no-op publisher / a consumer that cannot start, or exposes unauthenticated
+docs. */}}
+{{- if $nonDev }}
+{{- if not .Values.events.topicArn }}
+{{- fail (printf "events.topicArn is required when appEnv=%q (not local/dev/test) — without SNS_TOPIC_ARN the server publishes credential-lifecycle events to a no-op publisher and they are lost. See values.yaml." .Values.appEnv) }}
+{{- end }}
+{{- if not .Values.sqs.queueUrl }}
+{{- fail (printf "sqs.queueUrl is required when appEnv=%q (not local/dev/test) — without SQS_QUEUE_URL the consumer cannot read TenantMembershipsPurged and tenant offboarding never revokes credentials. See values.yaml." .Values.appEnv) }}
+{{- end }}
+{{- if and .Values.docs.enabled (not .Values.docs.authEnabled) }}
+{{- fail (printf "docs.enabled requires docs.authEnabled when appEnv=%q (not local/dev/test) — the Swagger/AsyncAPI docs would otherwise be served unauthenticated (the server also refuses to start without DOCS_AUTH_TOKEN). Set docs.authEnabled: true and provide DOCS_AUTH_TOKEN in the Secret, or disable docs. See values.yaml." .Values.appEnv) }}
+{{- end }}
+{{- end }}
+
+{{- /* One shared ServiceAccount means one IRSA role for every workload:
+per-workload annotations would be silently dropped. The migrate hook Job
+always has its own ServiceAccount (serviceaccount.yaml), so a `migrate` key
+still applies and is ignored here. */}}
+{{- if and (not .Values.serviceAccount.perWorkload) (omit (.Values.serviceAccount.workloadAnnotations | default dict) "migrate") }}
+{{- fail "serviceAccount.workloadAnnotations is set but serviceAccount.perWorkload is false — every workload then shares one ServiceAccount, so per-workload annotations (IRSA roles) cannot apply. Put the union IRSA role in serviceAccount.annotations and remove workloadAnnotations, or set perWorkload: true. See values.yaml." }}
+{{- end }}

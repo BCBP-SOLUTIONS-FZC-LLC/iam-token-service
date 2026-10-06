@@ -9,14 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // errorLogger is the shared gincommon-backed Logger, set once by NewRouter.
@@ -74,36 +73,75 @@ func writeInvalidRequest(c *gin.Context, field, reason string) {
 func HandleError(c *gin.Context, err error) {
 	var de *domain.Error
 	if errors.As(err, &de) {
+		// A 5xx domain error (secret_store_unavailable, db_unavailable, …)
+		// carries its cause only in the error text — log it, or an outage
+		// leaves nothing but a status code behind. 4xx are expected
+		// business outcomes and stay quiet. Messages never contain secret
+		// material (TS-INV-2): adapters wrap op names and SDK errors only.
+		if de.Status() >= http.StatusInternalServerError {
+			logRequestError(c, "request failed: "+string(de.Code), err)
+		}
 		writeError(c, string(de.Code), de.Status(), de.Details)
 		return
 	}
-	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) {
-		if errorLogger != nil {
-			fields := map[string]interface{}{"error_type": fmt.Sprintf("%T", err), "error": err.Error()}
-			if tid := gincommon.TraceIDFromContext(c); tid != "" {
-				fields["trace_id"] = tid
-			}
-			errorLogger.Error("database unavailable", fields)
-		}
+	// The request context ended (client disconnect, or the request deadline
+	// whose 503 gincommon's TimeoutMiddleware already wrote): whatever the
+	// database returned is a consequence, not a database outage.
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		c.Abort()
+		return
+	}
+	// Defense in depth, like the 503 branch below: the postgres adapter maps
+	// SQLSTATE 55P03 (lock_timeout on a principal row another credential
+	// write holds) to rotation_in_flight, and a leaked one must still be the
+	// retryable 409, not a 500.
+	if isLockNotAvailable(err) {
+		writeError(c, string(domain.ErrRotationInFlight), http.StatusConflict, nil)
+		return
+	}
+	if isUnavailableSQLState(err) {
+		logRequestError(c, "database unavailable", err)
 		writeError(c, string(domain.ErrDBUnavailable), http.StatusServiceUnavailable, nil)
 		return
 	}
-	if errorLogger != nil {
-		fields := map[string]interface{}{"error_type": fmt.Sprintf("%T", err), "error": err.Error()}
-		if tid := gincommon.TraceIDFromContext(c); tid != "" {
-			fields["trace_id"] = tid
-		}
-		errorLogger.Error("unhandled 500 error", fields)
-	}
+	logRequestError(c, "unhandled 500 error", err)
 	writeError(c, "internal_error", http.StatusInternalServerError, nil)
 }
 
-// isOperatorOrSystemErrorSQLState reports SQLSTATE class 57/58 without
-// importing pgconn — pgcommon v1.3.0 covers 08/53 but not these two.
-func isOperatorOrSystemErrorSQLState(err error) bool {
-	if !pgcommon.IsPgError(err) {
+func logRequestError(c *gin.Context, msg string, err error) {
+	if errorLogger == nil {
+		return
+	}
+	fields := map[string]interface{}{"error_type": fmt.Sprintf("%T", err), "error": err.Error()}
+	if tid := gincommon.TraceIDFromContext(c); tid != "" {
+		fields["trace_id"] = tid
+	}
+	if tenantID := c.Param("id"); tenantID != "" {
+		fields["tenant_id"] = tenantID
+	}
+	if route := c.FullPath(); route != "" {
+		fields["route"] = route
+	}
+	errorLogger.Error(msg, fields)
+}
+
+// isUnavailableSQLState is defense in depth for a *pgconn.PgError that
+// escaped the repository layer's wrapConnErr: SQLSTATE class 08/53/57/58,
+// matched on the code, never on error text.
+func isUnavailableSQLState(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
+	switch pgErr.Code[:2] {
+	case "08", "53", "57", "58":
+		return true
+	}
+	return false
+}
+
+// isLockNotAvailable reports SQLSTATE 55P03 (lock_not_available).
+func isLockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }

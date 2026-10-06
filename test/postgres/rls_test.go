@@ -19,9 +19,9 @@ import (
 
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/test/dbseed"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
+	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
@@ -256,13 +256,14 @@ func TestReconcilerRoleIsEnumerationOnly(t *testing.T) {
 	assert.Contains(t, err.Error(), "permission denied")
 }
 
-// outbox_events / processed_events are RLS-exempt (§4.3).
+// The operational tables (outbox_events, processed_events, rls_violation_log,
+// keys_refresh_pending) are RLS-exempt (§4.3).
 func TestRLS_OperationalTablesExempt(t *testing.T) {
 	t.Parallel()
 	_, _, rawPool := setupTestDB(t)
 	ctx := context.Background()
 
-	for _, tbl := range []string{"outbox_events", "processed_events"} {
+	for _, tbl := range []string{"outbox_events", "processed_events", "rls_violation_log", "keys_refresh_pending"} {
 		var rls, force bool
 		err := rawPool.QueryRow(ctx, `
 			SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, tbl).Scan(&rls, &force)

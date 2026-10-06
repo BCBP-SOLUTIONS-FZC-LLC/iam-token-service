@@ -20,26 +20,24 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	consumeradapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/consumer"
 	eventbusadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/eventbus"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/openbao"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/postgres"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 
-	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // buildVersion is injected by -ldflags at build time (see Dockerfile / Makefile).
@@ -56,22 +54,55 @@ func main() {
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
-	shutdownTracing := gincommon.InitTracingFromEnv()
 
 	cfg := gincommon.Config{
 		Logger:       log,
 		ServiceName:  envOr("APP_NAME", "iam-token-service"),
 		BuildVersion: envOr("BUILD_VERSION", buildVersion),
+		// Observability identity (Enterprise Platform Observability
+		// Standard): domain "iam" (OBSERVABILITY_DOMAIN overrides it) and the
+		// environment label, which must be one of local/dev/test/staging/prod
+		// — ObservabilityMiddlewares panics on anything else (e.g. "production").
+		Domain:      envOr("OBSERVABILITY_DOMAIN", metrics.ObservabilityDomain),
+		Environment: appEnv,
+		// RequestTimeout appends gincommon's TimeoutMiddleware as the
+		// innermost observability handler, so metrics, the access log and the
+		// server span record the same 503 the client receives. As an outer
+		// r.Use it ran before observability, which recorded 200.
+		RequestTimeout: 30 * time.Second,
+	}
+
+	// Tracing with the SAME identity as metrics (service, version, domain,
+	// environment) — InitTracingFromEnv read OTEL_SERVICE_NAME and the
+	// domain/environment from the environment on its own, so traces could
+	// disagree with metrics. Always installs gincommon's TracerProvider so
+	// in-process spans get valid trace IDs even with no OTLP endpoint (dev);
+	// ObservabilityMiddlewares' EnsureInitTelemetry is then a no-op.
+	shutdownTracing, err := gincommon.InitTracingWithConfig(gincommon.TracingConfig{
+		ServiceName:  cfg.ServiceName,
+		BuildVersion: cfg.BuildVersion,
+		Domain:       cfg.Domain,
+		Environment:  cfg.Environment,
+		Logger:       log,
+	})
+	if err != nil {
+		panic("init tracing: " + err.Error())
 	}
 	// ObservabilityMiddlewares is gincommon's public metrics-init API. Call
 	// it here (before any collector registration) so business metrics land
-	// on gincommon.MetricsRegisterer with matching {service, version} const
+	// on gincommon.MetricsRegisterer with matching {domain, service, environment} const
 	// labels. The health engine below applies the same middleware slice so
 	// probe traffic gets Zap access logs / HTTP metrics / HTTP traces.
 	_ = gincommon.ObservabilityMiddlewares(cfg)
+	// platform-events' (outbox/publish/consume/SQS/SNS) and platform-pgcommon's
+	// (platform_db_*) metrics share gincommon's registerer and identity so one
+	// /metrics scrape serves HTTP + business + messaging + DB collectors. Must
+	// run before NewPool (pool gauges are registered by NewPool) and before
+	// metrics.Register (which records into platform-events' shared collectors).
+	if err := metrics.InitLibraryMetrics(log); err != nil {
+		panic(fmt.Sprintf("init library metrics: %v", err))
+	}
 	metrics.Register(appEnv)
-	events.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
-	pgmetrics.InitWithRegisterer(cfg.ServiceName, cfg.BuildVersion, gincommon.MetricsRegisterer())
 
 	// ── 2. Database ────────────────────────────────────────────────────────
 	pgCfg, pgWarnings := pgcommon.ConfigFromEnv()
@@ -84,22 +115,22 @@ func main() {
 	pgCfg.DSN = dsn
 	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
 	pgCfg.Logger = pgadapter.NewLoggerAdapter(log)
-	pgCfg.Tracer = pgadapter.NewOTelTracer(cfg.ServiceName)
+	pgCfg.Tracer = gincommon.NewSpanTracer(cfg.ServiceName)
 	pool, err := pgcommon.NewPool(context.Background(), pgCfg)
 	if err != nil {
 		panic(fmt.Sprintf("connect to postgres: %v", err))
 	}
 	defer pool.Close()
-	gincommon.MetricsRegisterer().MustRegister(pgmetrics.NewPoolStatsCollector(pool, cfg.ServiceName))
 
 	ctx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
 
-	if err := outbox.ApplySchema(ctx, &pgmigrate.Runner{DSN: migrationDSN}); err != nil {
-		panic(fmt.Sprintf("outbox schema: %v", err))
-	}
-	if err := pgadapter.RunMigrations(ctx, migrationDSN, log); err != nil {
-		panic(fmt.Sprintf("domain migrations: %v", err))
+	// Migrations (§4.4/MIG-2 order inside pgadapter.Migrate) — skipped when
+	// RUN_MIGRATIONS=false (Helm: the migrate Job owns them).
+	if pgadapter.MigrationsEnabledFromEnv() {
+		if err := pgadapter.Migrate(ctx, migrationDSN, log); err != nil {
+			panic(fmt.Sprintf("migrate: %v", err))
+		}
 	}
 
 	// ── 3. OpenBao KV v2 secret store (§6.3, §10.5) ──────────────────────
@@ -107,6 +138,9 @@ func main() {
 		Addr:     mustEnv("OPENBAO_ADDR", appEnv, "https://openbao.iam.svc.cluster.local:8200"),
 		AuthRole: envOr("OPENBAO_ROLE", "iam-token-service"),
 		KVMount:  envOr("OPENBAO_KV_MOUNT", "iam"),
+		// Empty = the default ServiceAccount token path; Helm sets it to an
+		// OpenBao-audience projected token (openbao.tokenAudience).
+		KubernetesTokenPath: os.Getenv("OPENBAO_K8S_TOKEN_PATH"),
 	}, log)
 	if err != nil {
 		panic(fmt.Sprintf("init openbao client: %v", err))
@@ -116,26 +150,25 @@ func main() {
 	// cmd/server's outbox.Runner drains the shared outbox_events table) ───
 	principalRepo := pgadapter.NewPrincipalRepository(pool)
 	credentialRepo := pgadapter.NewCredentialRepository(pool)
-	processedEventsRepo := pgadapter.NewProcessedEventsRepository(pool)
-
 	enqueueCodec, err := eventbusadapter.NewValidatingCodec(eventbusadapter.NoopCodec{})
 	if err != nil {
 		panic(fmt.Sprintf("init validating codec: %v", err))
 	}
 	outboxPublisher := eventbusadapter.New(cfg.ServiceName, enqueueCodec).WithLogger(log)
-	txRunner := pgadapter.NewTxRunner(pool, outboxPublisher)
+	// platform-events' inbox over processed_events: the claim, the cascade's
+	// writes and its outbox events commit in one transaction (§9.2).
+	inboxRepo := pgadapter.NewInboxRepository(pool, outboxPublisher)
 
 	instrumentedSecrets := metrics.NewInstrumentedSecretStore(openbaoClient) // iam_token_service_openbao_call_duration_seconds
 	offboardingConsumer := consumeradapter.NewOffboardingConsumer(
-		principalRepo, credentialRepo, instrumentedSecrets, processedEventsRepo, txRunner, log,
+		principalRepo, credentialRepo, instrumentedSecrets, inboxRepo, log,
 	)
 
-	// handleWithMetrics wraps offboardingConsumer.Handle to record both the
-	// legacy iam_token_service_offboarding_cascade_total{result} (§8.4,
-	// §11.2) and the registry-proposed iam_offboarding_cascade_total{outcome}
-	// (Enterprise Platform Observability Standard Tier 2, dual-emitted
-	// during the compatibility period) around every delivery, success or
-	// failure.
+	// handleWithMetrics wraps offboardingConsumer.Handle to record
+	// iam_token_service_offboarding_cascade_total{result} (§8.4, §11.2)
+	// around every delivery, success or failure. (The proposed Tier-2
+	// iam_offboarding_cascade_total is not emitted until it is ratified in
+	// the Platform Observability Registry.)
 	// validated runs the consumed-schema check (inbound_schema.go) before
 	// the cascade; a violation is counted as a failed cascade too.
 	validated := validateConsumed(offboardingConsumer.Handle, enqueueCodec, log)
@@ -148,16 +181,11 @@ func main() {
 		if metrics.OffboardingCascadeTotal != nil {
 			metrics.OffboardingCascadeTotal.WithLabelValues(result).Inc()
 		}
-		if metrics.IAMOffboardingCascadeTotal != nil {
-			metrics.IAMOffboardingCascadeTotal.WithLabelValues(result).Inc()
-		}
 		return err
 	}
 
-	// ── 5. SQS consumer (§7.1, §12) — platform-events config.LoadSQS,
-	// matching iam-user-profile. SQS_OFFBOARDING_QUEUE_URL /
-	// SQS_OFFBOARDING_CONCURRENCY remain accepted aliases so existing Helm
-	// values keep working until they also set the library's canonical names.
+	// ── 5. SQS consumer (§7.1, §12) — platform-events config.LoadSQS
+	// (canonical SQS_* names only, see loadSQSEnv).
 	// Pipeline, outermost first: DLQ router (dlq.go — permanent rejects
 	// straight to the -dlq + ack) → cascade metrics → consumed-schema
 	// validation → OffboardingConsumer.Handle; GlueDecoder strips the Glue
@@ -174,10 +202,13 @@ func main() {
 		panic(fmt.Sprintf("build offboarding consumer: %v", err))
 	}
 
+	// If the receive loop ends on its own (a startup DLQ check, an
+	// unrecoverable SQS error), the pod must not stay Ready while consuming
+	// nothing: consumerDone ends main, which exits non-zero so Kubernetes
+	// restarts the pod.
+	consumerDone := make(chan error, 1)
 	go func() {
-		if err := sqsConsumer.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("offboarding consumer stopped", map[string]interface{}{"error": err.Error()})
-		}
+		consumerDone <- sqsConsumer.Start(ctx)
 	}()
 
 	// ── 6. Health + metrics servers ────────────────────────────────────────
@@ -187,26 +218,11 @@ func main() {
 	// stdlib mux — scrapes must not share a listener with probes, matching
 	// cmd/server's METRICS_PORT split.
 	health := gin.New()
-	health.Use(gincommon.TimeoutMiddleware(30 * time.Second))
 	health.Use(gincommon.ObservabilityMiddlewares(cfg)...)
 	health.GET("/healthz", gincommon.HealthHandler())
-	health.GET("/readyz", func(c *gin.Context) {
-		checkCtx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		defer cancel()
-		dbHealthy := pool.Health(checkCtx).Healthy
-		baoHealthy := openbaoClient.Health(checkCtx) == nil
-		if dbHealthy && baoHealthy {
-			c.JSON(http.StatusOK, gin.H{"status": "ready"})
-			return
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "not ready",
-			"checks": gin.H{
-				"database": healthLabel(dbHealthy),
-				"openbao":  healthLabel(baoHealthy),
-			},
-		})
-	})
+	health.GET("/readyz", readyzHandler(&draining,
+		func(ctx context.Context) bool { return pool.Health(ctx).Healthy },
+		openbaoClient.Health))
 	healthServer := &http.Server{
 		Addr:              ":" + envOr("APP_PORT", "8080"),
 		Handler:           health,
@@ -214,7 +230,7 @@ func main() {
 	}
 
 	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsMux.Handle("/metrics", gincommon.MetricsHandler())
 	metricsServer := &http.Server{
 		Addr:              ":" + envOr("METRICS_PORT", "9090"),
 		Handler:           metricsMux,
@@ -238,8 +254,7 @@ func main() {
 		}
 	}()
 
-	<-quit
-	log.Info("shutdown signal received — draining", nil)
+	exitCode := awaitStop(quit, consumerDone, &draining, envDuration("SHUTDOWN_DRAIN_DELAY", 5*time.Second), time.Sleep, log)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -260,6 +275,79 @@ func main() {
 	if err := gincommon.Shutdown(log); err != nil {
 		log.Error("logger/tracer flush error", map[string]interface{}{"error": err.Error()})
 	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+// awaitStop blocks until either a shutdown signal or the end of the SQS
+// receive loop, flips draining in both cases, and returns the process exit
+// code.
+//
+// On a signal, draining is set BEFORE the SHUTDOWN_DRAIN_DELAY wait, so
+// /readyz is already 503 while the endpoint removal propagates; exit 0.
+//
+// If consumerDone fires first, nothing has cancelled the consumer's ctx
+// yet, so any return — with or without an error — means the receive loop
+// died on its own (a startup DLQ check, an unrecoverable SQS error). The
+// pod must not stay Ready consuming nothing: exit 1 so Kubernetes restarts
+// it. No drain delay there — there is no traffic to drain.
+func awaitStop(quit <-chan os.Signal, consumerDone <-chan error, draining *atomic.Bool, drainDelay time.Duration, sleep func(time.Duration), log port.Logger) int {
+	select {
+	case <-quit:
+		draining.Store(true)
+		log.Info("shutdown signal received — draining", map[string]interface{}{"drain_delay": drainDelay.String()})
+		sleep(drainDelay)
+		return 0
+	case err := <-consumerDone:
+		draining.Store(true)
+		log.Error("offboarding consumer stopped — exiting so the pod restarts", map[string]interface{}{"error": errString(err)})
+		return 1
+	}
+}
+
+// readinessCheckTimeout bounds the /readyz dependency checks server-side.
+// It sits below the readinessProbe's timeoutSeconds (3, Helm) so the
+// handler answers 503 itself instead of the kubelet timing the probe out
+// while a hung Postgres/OpenBao call keeps running.
+const readinessCheckTimeout = 2 * time.Second
+
+// readyzHandler is the consumer's /readyz: 503 "draining" as soon as
+// draining is set (SIGTERM or a dead receive loop) without touching the
+// dependencies, otherwise ready only when Postgres and OpenBao both answer.
+func readyzHandler(draining *atomic.Bool, dbHealthy func(context.Context) bool, baoHealth func(context.Context) error) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if draining.Load() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "draining"})
+			return
+		}
+		checkCtx, cancel := context.WithTimeout(c.Request.Context(), readinessCheckTimeout)
+		defer cancel()
+		db := dbHealthy(checkCtx)
+		bao := baoHealth(checkCtx) == nil
+		if db && bao {
+			c.JSON(http.StatusOK, gin.H{"status": "ready"})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "not ready",
+			"checks": gin.H{
+				"database": healthLabel(db),
+				"openbao":  healthLabel(bao),
+			},
+		})
+	}
+}
+
+// draining is set on SIGTERM or when the consumer loop has ended; /readyz
+// fails while it is.
+var draining atomic.Bool
+
+func errString(err error) string {
+	if err == nil {
+		return "consumer returned without error"
+	}
+	return err.Error()
 }
 
 func healthLabel(ok bool) string {
@@ -315,23 +403,54 @@ func mustEnv(key, appEnv, devDefault string) string {
 }
 
 // loadSQSEnv reads SQS consumer config through platform-events
-// (SQS_QUEUE_URL / SQS_MAX_MESSAGES / SQS_WAIT_SECONDS /
-// SQS_VISIBILITY_TIMEOUT / SQS_CONCURRENCY), matching iam-user-profile.
-// Service-specific aliases keep existing Helm/compose values working:
-// SQS_OFFBOARDING_QUEUE_URL fills an empty SQS_QUEUE_URL, and
-// SQS_OFFBOARDING_CONCURRENCY fills SQS_CONCURRENCY when that var is
-// unset. Visibility timeout defaults to 60s (this consumer's LLD value)
-// when SQS_VISIBILITY_TIMEOUT is unset — LoadSQS's library default is 30s.
+// (config.LoadSQS: SQS_QUEUE_URL, SQS_CONCURRENCY, SQS_MAX_MESSAGES,
+// SQS_WAIT_SECONDS, SQS_VISIBILITY_TIMEOUT, SQS_DRAIN_TIMEOUT,
+// SQS_HANDLER_TIMEOUT, SQS_QUEUE_DEPTH_INTERVAL), matching
+// iam-org-membership. SQS_QUEUE_URL is required outside dev. Service
+// defaults apply when a variable is unset:
+//   - concurrency 2;
+//   - visibility timeout 60s (this consumer's LLD value; the library's is 30s);
+//   - handler timeout 45s, below the visibility timeout, so a hung cascade
+//     (the OpenBao deletes run inside the inbox transaction) fails and is
+//     redelivered instead of hiding its message forever;
+//   - drain timeout 15s, inside the 30s terminationGracePeriodSeconds;
+//   - queue-depth sampling every 60s ("0s" disables), feeding
+//     platform_queue_depth / platform_dlq_depth.
 func loadSQSEnv(appEnv string) eventcfg.SQSConfigEnv {
 	env := eventcfg.LoadSQS()
 	if env.QueueURL == "" {
-		env.QueueURL = mustEnv("SQS_OFFBOARDING_QUEUE_URL", appEnv, "http://localhost:4566/000000000000/tenant-lifecycle-tokensvc-q")
+		if !isDevEnv(appEnv) {
+			// Named Helm value, not just the env var: the operator fixing
+			// this edits values.yaml, never the Deployment's env directly.
+			panic("startup aborted — required env var SQS_QUEUE_URL is not set: the tenant-lifecycle-tokensvc-q URL, without which no TenantMembershipsPurged is ever consumed; set Helm value sqs.queueUrl")
+		}
+		env.QueueURL = "http://localhost:4566/000000000000/tenant-lifecycle-tokensvc-q"
 	}
 	if os.Getenv("SQS_CONCURRENCY") == "" {
-		env.Concurrency = envInt("SQS_OFFBOARDING_CONCURRENCY", 2)
+		env.Concurrency = 2
 	}
 	if os.Getenv("SQS_VISIBILITY_TIMEOUT") == "" {
 		env.VisibilityTimeout = 60 * time.Second
+	}
+	if os.Getenv("SQS_HANDLER_TIMEOUT") == "" {
+		env.HandlerTimeout = 45 * time.Second
+	}
+	if os.Getenv("SQS_DRAIN_TIMEOUT") == "" {
+		env.DrainTimeout = 15 * time.Second
+	}
+	if os.Getenv("SQS_QUEUE_DEPTH_INTERVAL") == "" {
+		env.QueueDepthInterval = 60 * time.Second
+	}
+	// Exponential redelivery backoff (platform-events v2.1.0): a failed
+	// cascade (OpenBao or Postgres down) is hidden 60s·2^(n-1) after its n-th
+	// delivery — 1m, 2m, 4m, 8m — instead of reappearing every 60s, so the
+	// queue's maxReceiveCount=5 spans ~15 minutes of outage rather than ~5
+	// before a tenant's erasure lands in the DLQ. "0s" turns it off.
+	if os.Getenv("SQS_RETRY_BACKOFF") == "" {
+		env.RetryBackoff = 60 * time.Second
+	}
+	if os.Getenv("SQS_MAX_RETRY_BACKOFF") == "" {
+		env.MaxRetryBackoff = 15 * time.Minute
 	}
 	return env
 }

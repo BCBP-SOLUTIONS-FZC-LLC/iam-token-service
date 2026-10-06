@@ -1,60 +1,87 @@
-# AWS IAM policy for iam-token-service
+# AWS IAM policies for iam-token-service
 
-This directory holds the reference IAM policy that must be attached to the
-service's IRSA role. The application does not create the role itself — that is
-managed by platform Terraform. Copy the JSON in `policy.json` into the
-Terraform module or apply it directly via `aws iam create-policy` /
-`aws iam put-role-policy`.
+This directory holds the reference IAM policies for the service's IRSA
+roles. The application does not create the roles itself; platform Terraform
+manages them. `policy.tf.example` shows the wiring.
 
-The role is assumed by the service's Kubernetes ServiceAccount via IRSA
-(OIDC — no long-lived keys, §13.5). Wire the ARN into Helm via
-`serviceAccount.annotations`:
+Each binary runs under its own Kubernetes ServiceAccount
+(`serviceAccount.perWorkload: true`, the chart default:
+`<fullname>-server`, `-consumer`, `-rotator`, `-scheduler`, `-migrate`).
+Only two of them call AWS, so only two roles exist:
+
+| Workload | Role | Policy |
+|---|---|---|
+| `cmd/server` | `iam-token-service-server` | `policy-server.json`: SNS publish (outbox relay) + Glue read (`GlueCodec` startup resolution) |
+| `cmd/consumer` | `iam-token-service-consumer` | `policy-consumer.json`: offboarding queue consume + DLQ send/depth |
+| `cmd/rotator`, `cmd/scheduler`, migrate Job | none | No AWS calls: they only enqueue outbox rows, which `cmd/server` publishes |
+
+Wire each ARN into Helm through `serviceAccount.workloadAnnotations`:
 
 ```yaml
 serviceAccount:
   create: true
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/iam-token-service
+  perWorkload: true
+  workloadAnnotations:
+    server:   {eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/iam-token-service-server}
+    consumer: {eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/iam-token-service-consumer}
 ```
 
-The SAME role is assumed by all three workloads this chart creates: the
-`cmd/server` Deployment (publishes to the `iam-serviceaccount-events` SNS
-topic; reads the Glue Schema Registry), the `cmd/consumer` Deployment
-(consumes the offboarding queue — enqueue-only, no AWS credentials strictly
-required beyond SQS receive/delete), and the `cmd/rotator` CronJob (no AWS
-calls at all today, but shares the ServiceAccount/role with the other two
-per §13.1's "one ServiceAccount, shared by every pod this chart creates").
+With `serviceAccount.perWorkload: false`, the server, consumer, rotator and
+scheduler share one ServiceAccount (`<fullname>`), so they can only have one
+role: attach both policies (the union) to it, trust
+`system:serviceaccount:<namespace>:<fullname>`, and set it in
+`serviceAccount.annotations`. The chart fails the render if
+`workloadAnnotations` is set in that mode. The OpenBao role must bind the
+shared name too (`deploy/openbao/role.tf.example`). The migrate hook Job
+always keeps its own `<fullname>-migrate` ServiceAccount, with no role.
 
-Note: this role has **no** OpenBao permissions — OpenBao access is a
-separate authentication path (Kubernetes auth method against the same
-ServiceAccount's projected JWT, not IRSA/STS, §10.5, TS-CONFIG-3). See
+Each role's trust policy is bound to exactly one ServiceAccount in exactly
+one namespace (`system:serviceaccount:<namespace>:<fullname>-<component>`).
+Use one role per environment, so a staging pod can never assume the
+production role.
+
+These roles have **no** OpenBao permissions. OpenBao access uses a separate
+authentication path: OpenBao's Kubernetes auth method, with a projected
+ServiceAccount token whose audience is `openbao` (§10.5, TS-CONFIG-3). See
 `deploy/openbao/`.
 
-Unlike a sibling IAM service with a realm-export step, this service has
-**no S3 or KMS grant** — it has no artifact to write to S3 (TS-1..TS-4 issue/
-rotate/revoke credential material that lives entirely in OpenBao and
-Postgres, never S3).
+There is **no S3, KMS or CloudWatch Logs grant**. Credential material lives
+only in OpenBao and Postgres. Logs go to stdout and are collected by the
+cluster's log pipeline, not written to CloudWatch by the application.
 
 ## Grants breakdown
 
-| Action | Purpose | LLD ref |
+| Action | Role | Purpose | LLD ref |
+|---|---|---|---|
+| `sns:Publish` | server | Outbox → SNS `iam-serviceaccount-events` (this service's 5 published events) | §7.3.1 |
+| `glue:GetSchemaByDefinition` (+ read-only siblings) on the registry and its `schema/<registry>/*` ARNs | server | `GlueCodec` resolves each schema's version ID once at startup by definition. Schema ARNs are `arn:aws:glue:<region>:<account>:schema/<registry>/<schema>`, not children of the registry ARN, so both resources are needed | §13.4 |
+| `sqs:ReceiveMessage` / `DeleteMessage` / `GetQueueAttributes` / `ChangeMessageVisibility` | consumer | The single inbound consumer on the offboarding queue (`TenantMembershipsPurged`, §7.1). `GetQueueAttributes` also feeds `platform_queue_depth` and reads the `RedrivePolicy` that names the DLQ | §7.1 |
+| `sqs:SendMessage` / `GetQueueAttributes` on the DLQ | consumer | `cmd/consumer`'s DLQ router sends a permanently rejected `TenantMembershipsPurged` straight to the DLQ (`DLQReason=schema_violation` or `invalid_envelope_id`); `GetQueueAttributes` feeds `platform_dlq_depth`. The consumer never receives from the DLQ: redrive and triage are operator actions under their own role | §7.1, §11.5 |
+
+## CI role (schema registry workflows)
+
+`policy.tf.example` section 3 also defines a GitHub-OIDC role per environment
+(`iam-token-service-ci-schema-registry-<env>`), assumable only from that
+GitHub environment. It is not used by any pod.
+
+| Action | Used by | Scope |
 |---|---|---|
-| `sns:Publish` | Outbox → SNS `iam-serviceaccount-events` topic (this service's 5 published events) | §7.3.1 |
-| `sqs:ReceiveMessage` / `DeleteMessage` / `GetQueueAttributes` / `ChangeMessageVisibility` | The single inbound consumer on the offboarding queue (`TenantMembershipsPurged`, §7.1) | §7.1 |
-| `sqs:GetQueueAttributes` / `ReceiveMessage` on the offboarding DLQ | Ops visibility into DLQ depth — read-only for triage, not a consume-and-delete grant | §11.5 |
-| `sqs:SendMessage` on the offboarding DLQ (`OffboardingDLQPermanentRejects`) | `cmd/consumer`'s DLQ router sends a `TenantMembershipsPurged` whose payload fails its embedded schema straight to the DLQ (`DLQReason=schema_violation`) instead of burning `maxReceiveCount` retries. The DLQ URL comes from the queue's own `RedrivePolicy`, read with the queue's existing `sqs:GetQueueAttributes` grant | §7.1 |
-| `glue:GetSchemaByDefinition` (+ read-only siblings) | `GlueCodec` resolves each schema's version ID once at startup by definition (this build's embedded schema) — no periodic refresh | §13.4 |
-| `logs:CreateLogStream` / `PutLogEvents` | Container stdout to CloudWatch (if not using an OTel collector for logs) | — |
+| Glue read + `CreateSchema` / `RegisterSchemaVersion` (and siblings) | `schema-registry.yml` register, diff, usage-check | the `iam-serviceaccount-events` registry and its `schema/<registry>/*` ARNs |
+| `glue:DeleteSchema` | `schema-prune.yml` execute mode (`dry_run=false`, manual dispatch only) | same registry/schema ARNs, in its own `GlueSchemaPrune` statement |
+| `cloudwatch:PutMetricData` | `schema-gov metrics` | `*` (the action has no resource-level permissions) |
+| `cloudwatch:PutMetricAlarm` | `schema-gov metrics --alarm-sns-arn` (creates/updates its alarms) | alarms in this account and region (`alarm:*`); narrow to schema-gov's alarm-name prefix once confirmed |
+
+Without `DeleteSchema`, a prune run in execute mode fails at the delete;
+without `PutMetricAlarm`, the metrics step fails to
+create its alarms.
 
 ## Least-privilege scoping
 
-The SNS topic policy and the SQS queue policy should independently
-restrict `Publish`/`ReceiveMessage` to this role and to the actual
-publishing service (Org & Membership, for `TenantMembershipsPurged`)
-respectively — that is managed by platform infrastructure and is not
-represented here.
+The SNS topic policy and the SQS queue policy should independently restrict
+`Publish`/`ReceiveMessage` to these roles and to the actual publishing
+service (Org & Membership, for `TenantMembershipsPurged`). Platform
+infrastructure manages those policies; they are not represented here.
 
 This service's `iam-serviceaccount-events` Glue registry is
-**single-producer** (unlike a sibling service's shared registry) — every
-schema name in it belongs to this service, so there is no cross-service
-exclusion concern for the read-only Glue grants above.
+**single-producer**: every schema name in it belongs to this service, so the
+read-only Glue grants raise no cross-service exclusion concern.

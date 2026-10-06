@@ -9,10 +9,14 @@ services:
       - "9090:9090"
     environment: &common-env
       APP_ENV: dev
+      OBSERVABILITY_DOMAIN: iam
       APP_NAME: iam-token-service
       APP_PORT: "8080"
       METRICS_PORT: "9090"
       LOG_LEVEL: debug
+      # No collector in this stack: "none" disables OTLP export (gincommon
+      # v1.6.0) but keeps in-process trace IDs.
+      OTEL_EXPORTER_OTLP_ENDPOINT: none
       PG_HOST: pgbouncer
       PG_PORT: "5432"
       PG_USER: serviceaccount_app
@@ -22,6 +26,8 @@ services:
       PG_MAX_CONNS: "20"
       PG_MIN_CONNS: "0"
       PG_BOUNCER_MODE: "true"
+      PG_STATEMENT_TIMEOUT: "5s"
+      PG_LOCK_TIMEOUT: "2s"
       MIGRATION_DATABASE_URL: postgres://serviceaccount_migrator:devpassword@postgres:5432/serviceaccount?sslmode=disable
       RECONCILER_DATABASE_URL: postgres://serviceaccount_reconciler:devpassword@postgres:5432/serviceaccount?sslmode=disable
       # OpenBao (§6.3, §10.5, TS-CONFIG-3) — this service's client ONLY
@@ -47,7 +53,6 @@ services:
       # unlike LocalStack Community which gates it behind Pro).
       GLUE_REGISTRY_NAME: iam-serviceaccount-events
       SNS_TOPIC_ARN: "arn:aws:sns:ap-south-1:000000000000:iam-serviceaccount-events"
-      SNS_TOPIC_SERVICEACCOUNT_ARN: "arn:aws:sns:ap-south-1:000000000000:iam-serviceaccount-events"
       OUTBOX_POLL_INTERVAL: "500ms"
       OUTBOX_BATCH_SIZE: "50"
       OUTBOX_MAX_ATTEMPTS: "5"
@@ -59,6 +64,10 @@ services:
       ROTATION_DEFAULT_OVERLAP_SECONDS: "300"
       ROTATION_DEFAULT_CADENCE_DAYS: "90"
       DOCS_ENABLED: "true"
+      JWKS_RATE_LIMIT_PER_TENANT_RPS: "5"
+      JWKS_RATE_LIMIT_PER_TENANT_BURST: "10"
+      # Shorter than the 5s default: no load balancer to drain locally.
+      SHUTDOWN_DRAIN_DELAY: "1s"
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -66,12 +75,9 @@ services:
         condition: service_healthy
       openbao:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    # No healthcheck: the runtime image is distroless (no shell, no wget),
+    # so any in-container probe command can never run. Probe from the host
+    # instead: curl -fsS http://localhost:<port>/readyz
 
   # The offboarding-cascade consumer (§7.1/§8.4) — a separate process from
   # `server` sharing the same image, entrypoint overridden per
@@ -90,12 +96,13 @@ services:
     environment:
       <<: *common-env
       SQS_QUEUE_URL: "http://floci:4566/000000000000/tenant-lifecycle-tokensvc-q"
-      SQS_OFFBOARDING_QUEUE_URL: "http://floci:4566/000000000000/tenant-lifecycle-tokensvc-q"
       SQS_CONCURRENCY: "2"
-      SQS_OFFBOARDING_CONCURRENCY: "2"
       SQS_MAX_MESSAGES: "10"
       SQS_WAIT_SECONDS: "20"
       SQS_VISIBILITY_TIMEOUT: "60s"
+      SQS_QUEUE_DEPTH_INTERVAL: "60s"
+      SQS_RETRY_BACKOFF: "60s"
+      SQS_MAX_RETRY_BACKOFF: "15m"
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -103,12 +110,9 @@ services:
         condition: service_healthy
       openbao:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    # No healthcheck: the runtime image is distroless (no shell, no wget),
+    # so any in-container probe command can never run. Probe from the host
+    # instead: curl -fsS http://localhost:<port>/readyz
 
   # The overlap-expiry sweep + orphan-material reconciler + prune (§8.3/§8.6,
   # cmd/rotator's package doc comment) — run-to-completion, exits when done,
@@ -125,6 +129,8 @@ services:
     environment:
       <<: *common-env
       PROCESSED_EVENTS_TTL_DAYS: "8"
+      RLS_VIOLATION_LOG_TTL_DAYS: "30"
+      ROTATOR_BATCH_LIMIT: "500"
       # cmd/rotator now calls RP-17 after every automatic revoke too
       # (TS-D15) — same "no reachable target in this compose stack" caveat
       # as -scheduler's identical setting below.
@@ -155,6 +161,7 @@ services:
     profiles: ["scheduler"]
     environment:
       <<: *common-env
+      SCHEDULER_BATCH_LIMIT: "500"
       REALM_PROVISIONER_BASE_URL: "http://iam-realm-provisioner:8080"
     depends_on:
       pgbouncer:

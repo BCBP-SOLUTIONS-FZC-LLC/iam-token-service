@@ -57,12 +57,5 @@ graph LR
     cmd --> observability
     cmd --> reconciler_jobs
 
-    %% Two rules most worth calling out: reconciler_jobs may NOT depend
-    %% on service — cmd/rotator drives postgres/openbao directly under
-    %% BYPASSRLS, never through the RLS-scoped service layer. cmd/scheduler
-    %% (§16 TSQ-6 Resolved) is the opposite case: it uses the same
-    %% BYPASSRLS pool for its own cross-tenant due-list scan, but lives
-    %% under `cmd` (not `reconciler_jobs`) because it DOES depend on
-    %% `service` for every actual rotation write.
     style reconciler_jobs fill:#fce8e6,stroke:#c0392b
     style service fill:#e8f4fc,stroke:#2980b9

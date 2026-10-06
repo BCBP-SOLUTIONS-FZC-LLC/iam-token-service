@@ -1,18 +1,37 @@
-# Terraform snippet — attach the reference policy in deploy/iam/policy.json to
-# an IRSA role. This file is *illustrative*, not applied by the application.
-# Platform Terraform owns the authoritative version of this resource.
+# Terraform snippet — attaches the reference policies in this directory to
+# per-workload IRSA roles. This file is *illustrative*, not applied by the
+# application. Platform Terraform owns the authoritative version.
 #
-# The SAME role must be assumable by every workload this chart creates —
-# cmd/server (publishes to iam-serviceaccount-events, reads the Glue
-# registry), cmd/consumer (consumes the offboarding queue), and
-# cmd/rotator (no AWS calls today, but shares the ServiceAccount) — one
-# ServiceAccount, one role (see deploy/helm/values.yaml's
-# serviceAccount.annotations, which all three workloads reference via the
-# same serviceAccountName helper).
+# One role per AWS-calling workload, each trusted by exactly one
+# ServiceAccount (the chart's serviceAccount.perWorkload: true names them
+# <fullname>-<component>). cmd/rotator, cmd/scheduler and the migrate Job
+# make no AWS calls and get no role. Instantiate once per environment, so a
+# staging ServiceAccount can never assume the production role.
 
-# 1. Trust policy — the ServiceAccount `iam-token-service` in namespace
-#    `iam` assumes this role via IRSA.
+variable "namespace" { default = "iam" }
+variable "environment" {} # dev | staging | prod
+
+locals {
+  oidc_host = replace(aws_iam_openid_connect_provider.eks.url, "https://", "")
+  workloads = {
+    server = templatefile("${path.module}/policy-server.json", {
+      serviceaccount_events_topic_arn = aws_sns_topic.iam_serviceaccount_events.arn
+      glue_registry_arn               = aws_glue_registry.iam_serviceaccount_events.arn
+      glue_registry_name              = aws_glue_registry.iam_serviceaccount_events.registry_name
+      aws_region                      = data.aws_region.current.name
+      aws_account_id                  = data.aws_caller_identity.current.account_id
+    })
+    consumer = templatefile("${path.module}/policy-consumer.json", {
+      offboarding_queue_arn = aws_sqs_queue.offboarding.arn
+      offboarding_dlq_arn   = aws_sqs_queue.offboarding_dlq.arn
+    })
+  }
+}
+
+# 1. Trust policies — ServiceAccount iam-token-service-<component> in
+#    var.namespace assumes role iam-token-service-<component>-<environment>.
 data "aws_iam_policy_document" "iam_token_service_trust" {
+  for_each = local.workloads
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
@@ -21,38 +40,29 @@ data "aws_iam_policy_document" "iam_token_service_trust" {
     }
     condition {
       test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
-      values   = ["system:serviceaccount:iam:iam-token-service"]
+      variable = "${local.oidc_host}:sub"
+      values   = ["system:serviceaccount:${var.namespace}:iam-token-service-${each.key}"]
     }
     condition {
       test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud"
+      variable = "${local.oidc_host}:aud"
       values   = ["sts.amazonaws.com"]
     }
   }
 }
 
 resource "aws_iam_role" "iam_token_service" {
-  name               = "iam-token-service"
-  assume_role_policy = data.aws_iam_policy_document.iam_token_service_trust.json
+  for_each           = local.workloads
+  name               = "iam-token-service-${each.key}-${var.environment}"
+  assume_role_policy = data.aws_iam_policy_document.iam_token_service_trust[each.key].json
 }
 
-# 2. Permission policy — templated from deploy/iam/policy.json.
-resource "aws_iam_policy" "iam_token_service" {
-  name = "iam-token-service"
-  policy = templatefile("${path.module}/policy.json", {
-    serviceaccount_events_topic_arn = aws_sns_topic.iam_serviceaccount_events.arn
-    offboarding_queue_arn           = aws_sqs_queue.offboarding.arn
-    offboarding_dlq_arn             = aws_sqs_queue.offboarding_dlq.arn
-    glue_registry_arn               = aws_glue_registry.iam_serviceaccount_events.arn
-    aws_region                      = data.aws_region.current.name
-    aws_account_id                  = data.aws_caller_identity.current.account_id
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "iam_token_service" {
-  role       = aws_iam_role.iam_token_service.name
-  policy_arn = aws_iam_policy.iam_token_service.arn
+# 2. Permission policies — templated from policy-<component>.json.
+resource "aws_iam_role_policy" "iam_token_service" {
+  for_each = local.workloads
+  name     = "iam-token-service-${each.key}"
+  role     = aws_iam_role.iam_token_service[each.key].id
+  policy   = each.value
 }
 
 # 3. OIDC role for the schema-registry GitHub Actions workflow (§13.5 — "AWS
@@ -74,19 +84,21 @@ data "aws_iam_policy_document" "iam_token_service_ci_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:BCBP-SOLUTIONS-FZC-LLC/iam-token-service:*"]
+      # Only the protected environment that runs schema-registry.yml — not
+      # every branch, fork PR or workflow in the repo.
+      values   = ["repo:BCBP-SOLUTIONS-FZC-LLC/iam-token-service:environment:${var.environment}"]
     }
   }
 }
 
 resource "aws_iam_role" "iam_token_service_ci" {
-  name               = "iam-token-service-ci-schema-registry"
+  name               = "iam-token-service-ci-schema-registry-${var.environment}"
   assume_role_policy = data.aws_iam_policy_document.iam_token_service_ci_trust.json
 }
 
-# Glue read/write for schema registration + CloudWatch metrics emission
-# (schema-registry.yml's register/prune/metrics steps) — narrower than the
-# runtime role's read-only Glue grant above, since CI also registers new
+# Glue read/write for schema registration and pruning + CloudWatch metrics
+# and alarms (schema-registry.yml's register/metrics steps, schema-prune.yml) — narrower than the
+# runtime server role's read-only Glue grant above, since CI also registers new
 # schema versions.
 data "aws_iam_policy_document" "iam_token_service_ci_permissions" {
   statement {
@@ -106,14 +118,43 @@ data "aws_iam_policy_document" "iam_token_service_ci_permissions" {
     ]
     resources = [
       aws_glue_registry.iam_serviceaccount_events.arn,
-      "${aws_glue_registry.iam_serviceaccount_events.arn}/*",
+      "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:schema/${aws_glue_registry.iam_serviceaccount_events.registry_name}/*",
     ]
   }
+  # schema-prune.yml in execute mode (dry_run=false, a deliberate
+  # workflow_dispatch) archives a retired schema, then deletes it. Separate
+  # from the statement above so the destructive grant is easy to find, and
+  # limited to this single-producer registry's schemas — never another
+  # service's. Glue authorizes DeleteSchema against the registry and the
+  # schema ARN, hence both resources.
+  statement {
+    sid     = "GlueSchemaPrune"
+    effect  = "Allow"
+    actions = ["glue:DeleteSchema"]
+    resources = [
+      aws_glue_registry.iam_serviceaccount_events.arn,
+      "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:schema/${aws_glue_registry.iam_serviceaccount_events.registry_name}/*",
+    ]
+  }
+  # PutMetricData has no resource-level permissions: only "*" is valid (a
+  # cloudwatch:namespace condition can narrow it once schema-gov's metric
+  # namespace is pinned).
   statement {
     sid       = "CloudWatchMetrics"
     effect    = "Allow"
     actions   = ["cloudwatch:PutMetricData"]
     resources = ["*"]
+  }
+  # `schema-gov metrics --alarm-sns-arn` creates/updates its CloudWatch alarms
+  # (orphan count, registration spike, unused events). PutMetricAlarm does
+  # support alarm ARNs, so this is limited to alarms in this account and
+  # region; narrow `alarm:*` to schema-gov's alarm-name prefix once confirmed
+  # for your platform-schemagov version.
+  statement {
+    sid       = "CloudWatchSchemaGovAlarms"
+    effect    = "Allow"
+    actions   = ["cloudwatch:PutMetricAlarm"]
+    resources = ["arn:aws:cloudwatch:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:alarm:*"]
   }
 }
 

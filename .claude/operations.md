@@ -9,239 +9,389 @@ points here; the LLD is still the tie-breaker on any conflict.
 
 ### Tenant isolation (three layers)
 
-1. The reserved `iam-system` principal + target `x-tenant-id` on every
-   internal route (RLS-5) — a request missing either is `401` before any
-   DB checkout.
+1. The reserved `iam-system` principal (`x-user-id`
+   `00000000-0000-0000-0000-0000000000a1`) + `x-tenant-id` equal to the
+   path tenant on every internal route (RLS-5) — otherwise `401`/`403`
+   before any DB checkout.
 2. `FORCE ROW LEVEL SECURITY` + default-deny on both tenant-scoped tables,
    keyed on the transaction-local `app.tenant_id` GUC (`SET LOCAL`, never
    plain `SET` — RLS-6).
 3. The composite FK `(principal_id, tenant_id)` — a cross-tenant credential
    row is structurally impossible.
 
-### Network isolation
+### Network and mesh isolation
 
-Mesh-mTLS only. `networkPolicy.ingressNamespaceSelector` (Helm) is a
-**required** value — the render fails closed if left unset rather than
-falling back to an unrestricted `{}` selector, which would match every
-namespace in the cluster. `networkPolicy.keycloakNamespaceSelector`
-(TS-D15) is a second, separately-required value with the identical
-fail-closed posture — Keycloak's own outbound JWKS fetch (EXT-6) carries
-no caller identity, so it must be admitted at the network layer instead
-of by header, and it may not run in the same namespace as the
-RP/O&M/operator mesh `ingressNamespaceSelector` covers.
+The API authenticates callers only by the `x-user-id` header, which any
+pod could set, so the caller restriction lives in the platform:
+
+- **Istio `AuthorizationPolicy`** (`authorizationPolicy.*`) — required
+  outside local/dev/test (`templates/validate.yaml` fails the render):
+  `meshNamespaces` (RP, O&M, operator gateway) on every route,
+  `keycloakNamespaces` on the JWKS route only, `workflowNamespaces` on TS-6
+  only, and `/healthz`, `/readyz`, `/metrics` for probes/scrapes. Keycloak
+  must be in the mesh. With it enabled the server and consumer are
+  force-injected (native sidecars by default, `nativeSidecar`), and
+  `strictMTLS` adds a STRICT `PeerAuthentication`.
+- **NetworkPolicy** (`networkPolicy.enabled`, one policy per workload plus
+  the migrate Job) — the render fails without `ingressNamespaceSelector`,
+  `keycloakNamespaceSelector` (Keycloak's JWKS fetch, EXT-6),
+  `monitoringNamespaceSelector` (metrics ingress from the monitoring
+  namespace only) and `egress.postgresCIDRs`. Egress: DNS, Postgres
+  (`postgresPort`, plus `postgresDirectPort` for direct DSNs), OpenBao,
+  OTel, istiod (`istiodNamespaceSelector`/`istiodPort`), optional CIDR
+  lists, and the Realm Provisioner (`realmProvisionerPort`) for the
+  rotator and scheduler only. `workflowNamespaceSelector` optionally admits
+  the Workflow Service for TS-6.
 
 ### Input validation
 
-`rotation_id` must be a UUID; `overlap_seconds` clamped to `[0, 900]`
-server-side regardless of what the caller sends; `principal_sub` must be a
-UUID; `keycloak_client_id` validated against the frozen `platform-automation`
-value. Path params typed-parsed; malformed → `400` before any DB checkout.
+`rotation_id` must be a UUID; `overlap_seconds` clamped to `[0, 900]`;
+`principal_sub` must be a UUID; `keycloak_client_id` must be
+`platform-automation` or `platform-automation-<tenant_id>`. Path params
+typed-parsed (`400`); request bodies capped at 1 MiB; a POST body must be
+`application/json` (`415`).
 
 ### Authorization matrix
 
 | Route | Callers |
 |---|---|
 | TS-4 register | Realm Provisioner |
-| TS-1 issue/rotate | Realm Provisioner, operators, `cmd/scheduler` (§16 TSQ-6 Resolved, TS-D14) |
-| TS-2 revoke | operators, the offboarding cascade |
+| TS-1 issue/rotate | Realm Provisioner (issue at provisioning), operators / O&M tooling (rotate). `cmd/scheduler` rotates in-process through `CredentialService.IssueOrRotate`, not over HTTP (§16 TSQ-6 Resolved, TS-D14) |
+| TS-2 revoke | Operators / O&M tooling (incl. break-glass, §8.7) |
 | TS-3 read | Org & Membership, operators |
 | TS-5 find-by-sub | Org & Membership (AUTH-9 non-member defense-in-depth, TS-D16) |
-| TS-6 read platform-automation | Workflow Service connector workers (TS-D17). Admitted by the optional `networkPolicy.workflowNamespaceSelector` when outside the mesh namespaces |
-| JWKS (unauthenticated) | Keycloak's own outbound client-jwt fetch (EXT-6) — the one route not on this list's system-principal model |
+| TS-6 read platform-automation | Workflow Service connector workers (TS-D17) |
+| JWKS (no header auth) | Keycloak's outbound client-jwt fetch (EXT-6), limited by the AuthorizationPolicy and rate limiters |
 
-`cmd/rotator` never calls TS-1 and calls no HTTP route at all — it drives
-Postgres/OpenBao directly (RLS-7). All *other* routes require the reserved
-`iam-system` principal — no route accepts a tenant-facing principal, and
-the automation principal itself holds no roles (TS-INV-4).
+`cmd/rotator` and the offboarding consumer call no HTTP route — they drive
+Postgres/OpenBao directly (RLS-7). No route accepts a tenant-facing
+principal, and the automation principal holds no roles (TS-INV-4).
 
 ### Secret handling
 
 OpenBao KV v2 is the **only** home for private-key plaintext
 (`iam/serviceaccount/<tenant_id>/<keycloak_client_id>/v<version>`, frozen
-§25); Kubernetes-auth-only login (no static token field exists in
-`openbao.Config`); TS-1 returns the plaintext private key exactly once,
-never re-readable (TS-3 is metadata-only); this service never writes
-Keycloak (TS-INV-1, CI-enforced via `no-gocloak`). Since **EXT-6** (rev
-1.3), the public half is served directly by this service's own JWKS route
-rather than handed to the Realm Provisioner — RP never receives key
-material at all, only triggers Keycloak's key-cache refresh
-(`ClearServiceAccountKeysCache`, RP-17) after every rotate/revoke.
+§25). Kubernetes-auth login only (`openbao.Config` has no token field),
+using `OPENBAO_K8S_TOKEN_PATH` — under Helm a projected ServiceAccount
+token with audience `openbao` (`openbao.tokenAudience`); the OpenBao role
+is bound to the four workload ServiceAccounts (`deploy/openbao/`).
+`BAO_CACERT` (`openbao.caCertSecret`) for a private CA. The client
+single-flights logins (detached from the caller's ctx), renews at
+`lease - min(30s, lease/2)`, and re-logs in once on a 403. TS-1 returns
+the private key only on issue or a replay inside `ROTATION_REPLAY_WINDOW`
+(TS-3 is metadata-only); each replay is logged and counted. This service
+never writes Keycloak (TS-INV-1, `no-gocloak` gate); the public half is
+served by its own JWKS route (EXT-6). The `no-secret-log` gate (TS-INV-2)
+rejects credential/secret/private-key names or a `-----BEGIN` literal in
+log, fmt, error-constructor and span-attribute sinks, and runs its own
+self-test first.
 
 ## 11. Observability
 
+Service-level detail (identity, tiers, registration order, CI checks,
+SLOs) and the alert runbooks live in
+[`docs/observability/`](../docs/observability/README.md); its
+`metric-registry.md` is generated (`make metrics-inventory`) and
+drift-checked by `make metrics-lint`.
+
 ### SLOs
 
-Not latency-critical (Keycloak is the hot token-issuance path, not this
-service). Internal API availability 99.9% monthly; TS-1 p99 ≤ 500ms
-excluding the OpenBao round-trip; TS-3 p99 ≤ 100ms.
+Recording rules + multi-window burn-rate alerts in
+`deploy/monitoring/slo-rules.yml`, rendered in Helm as
+`prometheusrule-slo.yaml`:
+
+| SLO | Target | Note |
+|---|---|---|
+| SLO-1 | TS-1 issue/rotate p99 ≤ 500 ms | Fast/slow burn; the SLI includes the OpenBao write |
+| SLO-2 | 99.9% write-path availability (TS-1/TS-2/TS-4 non-5xx) | Fast burn |
+| SLO-3 | Overlap-expiry sweep success ≥ 99% | Operational proxy |
+| SLO-4 | TS-3 read p99 ≤ 100 ms | Fast/slow burn |
 
 ### Metrics — Enterprise Platform Observability Standard
 
-Three-tier taxonomy. `metrics.Register(environment)` centrally injects
-`domain`/`service`/`environment` — instrumentation call sites never set
-them. `make gates` → `metrics-taxonomy` enforces naming compliance in CI.
+Every collector carries gincommon's `domain`/`service`/`environment`
+const labels — call sites never set them. Registration order in every
+binary: `InitTracingWithConfig` → `ObservabilityMiddlewares` →
+`metrics.InitLibraryMetrics` (`events.InitMetrics`,
+`pgmetrics.InitWithIdentity`) → `metrics.Register` (adopts platform-events'
+shared collectors via `registerShared`) → pools.
+`test/unit/metricsstandard` asserts the order and the identity labels.
 
-**Tier 3 (`iam_token_service_*`, frozen §25):**
+**Tier 3 (`iam_token_service_*`):**
 
-| Metric | Type | Labels |
-|---|---|---|
-| `credentials_issued_total` | counter | `op` (issue/rotate/revoke) |
-| `rotation_overlap_active` | gauge | — |
-| `openbao_call_duration_seconds` | histogram | `op` (write/delete) — legacy, see Tier 1 below |
-| `offboarding_cascade_total` | counter | `result` (ok/error) — legacy, see Tier 2 below |
-| `rotation_sweep_total` | counter | `result` |
-| `material_reconcile_total` | counter | `result` (orphan_deleted/missing_material/ok/error) |
-| `cadence_rotation_total` | counter | `result` (rotated/skipped/failed) — `cmd/scheduler`, §16 TSQ-6 Resolved |
-| `jwks_key_errors_total` | counter | — (no label; exactly one outcome) — EXT-6 JWKS route, TS-D15 |
-| `processed_events_duplicates_total` | counter | `consumer` — legacy, see Tier 1 below |
-| `unknown_event_acknowledged_total` | counter | `consumer`, `event_type` |
-| `consumed_schema_violations_total` | counter | `consumer`, `event_type` — inbound payload failed its embedded consumed schema and was sent straight to the DLQ (`cmd/consumer/inbound_schema.go`); pages via `IAMTokenServiceConsumedSchemaViolation` |
-
-**Tier 1/Tier 2 (registry-proposed, dual-emitted alongside the legacy
-metric above — not yet ratified, see `docs/observability-registry-proposals.md`):**
-
-| Metric | Tier | Labels | Parallels |
+| Metric | Type | Labels | Source |
 |---|---|---|---|
-| `platform_dependency_request_seconds` | 1 | `domain,service,environment,dependency,operation` | `openbao_call_duration_seconds` |
-| `platform_duplicate_messages_total` | 1 | `domain,service,environment,queue` | `processed_events_duplicates_total` |
-| `iam_offboarding_cascade_total` | 2 | `service,environment,outcome` | `offboarding_cascade_total` |
+| `credentials_issued_total` | counter | `op` (issue/rotate/revoke) | credential-service decorator |
+| `credential_replays_total` | counter | `result` (served/expired/revoked) | TS-1 replays (TS-D23) |
+| `rotation_overlap_active` | gauge | — | server exporter |
+| `openbao_call_duration_seconds` | histogram | `op` (write/delete) | dual-emitted with the Tier 1 dependency histogram |
+| `offboarding_cascade_total` | counter | `result` (ok/error) | consumer, every message incl. rejects |
+| `rotation_sweep_total` | counter | `result` (ok/error) — one per rotator run | rotator |
+| `material_reconcile_total` | counter | `result` (orphan_deleted/missing_material/ok/error) | rotator |
+| `cadence_rotation_total` | counter | `result` (rotated/skipped/failed) | scheduler |
+| `keys_refresh_pending` | gauge | — | rows in `keys_refresh_pending`, intents included (server exporter) |
+| `keys_refresh_oldest_age_seconds` | gauge | — | age of the oldest marker (server exporter) |
+| `jwks_key_errors_total` | counter | — | unreadable live keys on the JWKS route |
+| `jwks_rate_limited_total` | counter | — | any JWKS 429 |
+| `jwks_rate_limited_by_bucket_total` | counter | `bucket` (tenant/global/unknown) | which limiter refused |
+| `processed_events_duplicates_total` | counter | `consumer` | authoritative duplicate signal |
+| `unknown_event_acknowledged_total` | counter | `consumer`, `event_type` (closed set, else `other`) | `ackUnknown` |
+| `consumed_schema_violations_total` | counter | `consumer`, `event_type` | `validateConsumed` |
+| `consumer_dlq_rejects_total` | counter | `reason` (schema_violation/invalid_envelope_id) | DLQ router |
 
-Shared-library metrics: `http_request_duration_seconds`/`http_requests_total`
-(`platform-gincommon`), `outbox_*`/`sqs_*`/`events_*` (`platform-events`),
-`pgcommon_pool_*` (`platform-pgcommon`, wired for both the app pool and the
-`-reconciler`-suffixed BYPASSRLS pool). These predate the Standard and
-carry a domain+service-combined `service` label — a known gap fixable only
-in the shared library itself.
+**Tier 1/Tier 2 (see `docs/observability-registry-proposals.md`):**
+
+| Metric | Tier | Labels | Status |
+|---|---|---|---|
+| `platform_dependency_request_seconds` | 1 | `dependency,operation,outcome` | Owned by platform-events; the service adds `dependency="openbao"` (write/delete/read/list) and `dependency="realm_provisioner",operation="refresh_keys"` |
+| `platform_duplicate_messages_total` | 1 | `queue,event_type` | Counted only by platform-events' inbox |
+| `iam_rls_violations_total` | 2 | `violation_type` (`cross_tenant_access`/`missing_or_invalid_guc`/`other`) | Emitted by `cmd/server`'s RLS exporter from `rls_violation_log`; every replica counts the same rows, so use `max`, not `sum` |
+| `iam_offboarding_cascade_total` | 2 | `service,environment,outcome` | Proposed; not emitted until ratified |
+
+Shared-library metrics: `platform_http_*` (`platform-gincommon`),
+`platform_messages_*` / `platform_outbox_*` / `platform_dlq_messages_total`
+/ `platform_queue_depth` / `platform_dlq_depth` (`platform-events`; the
+consumer samples queue depth every `SQS_QUEUE_DEPTH_INTERVAL`), and
+`platform_db_*` (`platform-pgcommon`, `pool` label `default` for the app
+pool, `reconciler` for the BYPASSRLS pool). One identity
+`{domain="iam", service="iam-token-service", environment=APP_ENV}` set on
+`gincommon.Config` (`OBSERVABILITY_DOMAIN`). Pre-standard names were
+removed; map old queries with platform-gincommon's
+`docs/observability/migration.md`.
 
 ### Tracing
 
-OTel spans `credential.issue_rotate`, `credential.revoke` (attrs
-`tenant_id`/`principal_id`/`version`/`op`), `trace_id` propagated onto the
-produced event envelope.
+`gincommon.InitTracingWithConfig` in all four binaries (service name from
+`APP_NAME`; `OTEL_EXPORTER_OTLP_ENDPOINT=none` keeps trace IDs but
+disables export). HTTP spans from `ObservabilityMiddlewares`; DB spans
+from `gincommon.NewSpanTracer`; spans `credential.issue_rotate`,
+`credential.revoke`, `consumer.offboarding`, `rotator.overlap_sweep`,
+`rotator.orphan_material`, `rotator.prune`, `scheduler.cadence_scan`,
+`exporter.rotation_overlap`, `exporter.rls_violations`,
+`exporter.keys_refresh_pending`; outbound RP-17 calls get client spans
+and `traceparent` via `httpx`. `trace_id` goes onto produced event
+envelopes and into job logs.
 
 ### Structured logs
 
-`slog` JSON via `platform-gincommon`. Every operation logs
-`tenant_id`/`principal_id`/`version`/`op`/`result`. **No credential field
-is ever a log attribute** — CI gate `check-no-secret-log.py` (paren-matched,
-case-insensitive, catches a multi-line log-call argument or a capitalized
-Go identifier like `Secret`, not just a lowercase JSON-style key).
+Zap JSON via `platform-gincommon` (`LOG_LEVEL`, `LOG_SAMPLING`). No
+credential field is ever a log attribute (`no-secret-log` gate, above).
 
 ### Alerts
 
-OpenBao failure-rate, stuck `rotating` versions, `material_reconcile_total{result="missing_material"}` > 0
-(page — irrecoverable per-version data loss), `cadence_rotation_total{result="failed"}` > 0
-(page — may mean `IssueOrRotate` committed but the RP-17 key-refresh
-failed, TS-D15; will not self-heal since `next_rotation_at` already
-advanced), `jwks_key_errors_total` > 0 (page — a live credential the JWKS
-route couldn't serve, i.e. a real per-credential Keycloak auth outage,
-TS-D15), `consumed_schema_violations_total` > 0 (page — a
-`TenantMembershipsPurged` failed its embedded schema and went straight to
-the DLQ, so that tenant's cascade did not run), offboarding-cascade DLQ depth, `outbox_pending_total` growth
-(both a warning-stage backlog alert and the later DLQ-depth alert),
-`pgcommon_pool_empty_acquire_total` growth (pool exhaustion, either pool),
-offboarding-queue message age (dormant until a CloudWatch exporter is
-deployed — SQS depth/age isn't available in-process). Defined in
-`deploy/monitoring/app-alerts.yml`, mirrored in
-`deploy/helm/templates/prometheusrule.yaml` (kept in sync by hand).
+`deploy/monitoring/app-alerts.yml`, mirrored by hand in
+`deploy/helm/templates/prometheusrule.yaml` (29 alerts each); one runbook
+per alert in `docs/observability/runbooks.md`. Several carry
+`metric_status: proposed`.
+
+| Alert | Severity | Fires on |
+|---|---|---|
+| `ServerDown` / `ConsumerDown` / `ServerReplicasMissing` | critical / warning / warning | scrape `up`, replica count |
+| `RotatorNotRunning` / `SchedulerNotRunning` | warning | no successful CronJob run for 15 min |
+| `CronJobRunFailed` | warning | the last scheduled rotator/scheduler run did not succeed |
+| `HighErrorRate` / `HighLatency` | warning | server 5xx ratio > 5% / `platform_http_*` latency |
+| `OpenBaoCallLatencyHigh` / `OpenBaoErrors` | warning | OpenBao latency / error ratio |
+| `OffboardingCascadeFailures` | warning | `offboarding_cascade_total{result="error"}` |
+| `ConsumedSchemaViolation` | critical | `consumed_schema_violations_total` > 0 |
+| `OffboardingInvalidEnvelopeRejected` | critical | `consumer_dlq_rejects_total{reason="invalid_envelope_id"}` > 0 (tenant erasure not run — redrive) |
+| `RotationSweepFailures` | warning | `rotation_sweep_total{result="error"}` |
+| `OrphanMaterialMissing` | critical | `material_reconcile_total{result="missing_material"}` > 0 |
+| `CadenceRotationFailures` | critical | `cadence_rotation_total{result="failed"}` > 0 (often an RP-17 failure; self-heals via the marker) |
+| `JWKSKeyErrors` | critical | `jwks_key_errors_total` > 0 |
+| `JWKSRateLimited` | warning | `jwks_rate_limited_by_bucket_total{bucket!="unknown"}` increase |
+| `RotationOverlapStuck` | warning | `rotation_overlap_active` > 0 for 1h |
+| `KeysRefreshBacklog` | warning | `keys_refresh_oldest_age_seconds` > 900 for 5m |
+| `OutboxStuck` / `OutboxBacklogGrowing` | warning | `platform_outbox_*` |
+| `SQSReceiveErrors` | warning | `platform_dependency_request_seconds{dependency="sqs",operation="receive_message",outcome="error"}` |
+| `PostgresPoolExhaustion` | warning | `platform_db_pool_empty_acquires_total` growth, per `pool` |
+| `OffboardingQueueBacklogGrowing` | warning | CloudWatch oldest-message age (needs an exporter) |
+| `OffboardingQueueStalled` / `OffboardingDLQBacklog` | warning | `platform_queue_depth` > 0 for 15m / `platform_dlq_depth` > 0 for 30m |
+| `RLSCrossTenantAccess` / `RLSMissingGUC` | critical / warning | `iam_rls_violations_total` increase |
+
+All names are prefixed `IAMTokenService`. Schema-registry governance
+alerts live separately in `deploy/monitoring/schema-registry-alerts.yml`.
 
 ## 12. Configuration
 
-Key env vars — see `.env-example` for the complete, currently-accurate
-list:
+`.env-example` covers local development; the table below is the full
+set the binaries read (directly or through the shared libraries). Helm
+sets every one it needs from `values.yaml`.
 
-| Var | Purpose |
-|---|---|
-| `APP_ENV`, `APP_PORT`, `METRICS_PORT` | Environment / API port / dedicated metrics port |
-| `PG_HOST`/`PORT`/`USER`/`PASSWORD`/`DBNAME`/`SSLMODE`, `PG_MAX_CONNS`, `PG_BOUNCER_MODE` | App pool (`platform-pgcommon`) |
-| `MIGRATION_DATABASE_URL` | Direct-port DSN, bypasses PgBouncer (session-scoped `pg_advisory_lock`) |
-| `RECONCILER_DATABASE_URL` | `serviceaccount_reconciler` (BYPASSRLS, SELECT-only) pool for `cmd/rotator` and `cmd/scheduler` |
-| `OPENBAO_ADDR`, `OPENBAO_ROLE`, `OPENBAO_KV_MOUNT` | Kubernetes-auth login + KV v2 mount |
-| `AWS_REGION`, `AWS_ENDPOINT_URL`, `GLUE_REGISTRY_NAME`, `SNS_TOPIC_SERVICEACCOUNT_ARN` (or `SNS_TOPIC_ARN` alias) | Produced events |
-| `SQS_OFFBOARDING_QUEUE_URL`, `SQS_OFFBOARDING_CONCURRENCY` | The one inbound subscription |
-| `ROTATION_DEFAULT_OVERLAP_SECONDS`, `ROTATION_DEFAULT_CADENCE_DAYS` | Rotation tuning (`overlap_seconds` still server-clamped to `[0,900]` regardless) |
-| `REALM_PROVISIONER_BASE_URL` | RP-17 target for `cmd/rotator`'s and `cmd/scheduler`'s `ClearServiceAccountKeysCache` call (EXT-6, TS-D14/15); required outside dev |
-| `JWKS_RATE_LIMIT_RPS`, `JWKS_RATE_LIMIT_BURST` | Process-wide token-bucket rate limit on the unauthenticated-by-header JWKS route (TS-D15); default 20/40 |
-| `PROCESSED_EVENTS_TTL_DAYS` | Dedup-ledger retention (must exceed SQS message lifetime) |
-| `DOCS_ENABLED`, `DOCS_AUTH_TOKEN` | Swagger/AsyncAPI viewer gating |
+| Var | Read by | Purpose (default) |
+|---|---|---|
+| `APP_ENV`, `APP_NAME`, `BUILD_VERSION`, `OBSERVABILITY_DOMAIN` | all | Environment (`dev`) / identity (`iam-token-service`, `iam`). Outside local/dev/development/test, `OPENBAO_ADDR`, `REALM_PROVISIONER_BASE_URL` (CronJobs), `GLUE_REGISTRY_NAME`, `SNS_TOPIC_ARN` (server) and `SQS_QUEUE_URL` (consumer) are required |
+| `APP_PORT`, `METRICS_PORT` | server, consumer / all | API or health port (`8080`) / metrics port (`9090`) |
+| `DATABASE_URL` or `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` | all | App pool (`serviceaccount_app`) |
+| `PG_MAX_CONNS`, `PG_MIN_CONNS`, `PG_BOUNCER_MODE`, `PG_SLOW_QUERY_THRESHOLD` (+ other `PG_*` pool settings in platform-pgcommon) | all | Pool sizing; copied into the reconciler pool |
+| `PG_STATEMENT_TIMEOUT`, `PG_LOCK_TIMEOUT` | all | Per-transaction `SET LOCAL` on the app and reconciler pools, never the migration DSN. Helm: statement 5s server/consumer, 60s CronJobs; lock 2s |
+| `RECONCILER_DATABASE_URL` | server, rotator, scheduler | `serviceaccount_reconciler` (BYPASSRLS, SELECT-only) pool; falls back to the app DSN with a warning |
+| `MIGRATION_DATABASE_URL` | all (when migrating) | Direct-port migrator DSN, bypasses PgBouncer (`pg_advisory_lock`) |
+| `RUN_MIGRATIONS` (`true`), `MIGRATE_ONLY` (`false`) | all / server | Migrate at startup / migrate then exit. Helm: hook Job with `MIGRATE_ONLY=true`, `RUN_MIGRATIONS=false` on workloads |
+| `SHUTDOWN_DRAIN_DELAY` (`5s`) | server, consumer | `/readyz` 503 for this long after SIGTERM before shutting down |
+| `OPENBAO_ADDR`, `OPENBAO_ROLE` (`iam-token-service`), `OPENBAO_KV_MOUNT` (`iam`) | server, consumer, rotator, scheduler | Kubernetes-auth login + KV v2 mount |
+| `OPENBAO_K8S_TOKEN_PATH`, `BAO_CACERT` | same | Login JWT path (default the pod SA token; Helm: projected `openbao`-audience token) / private CA (read by the OpenBao SDK) |
+| `AWS_REGION` (`ap-south-1`), `AWS_ENDPOINT_URL` | server, consumer | AWS SDK region / local endpoint (Floci) |
+| `GLUE_REGISTRY_NAME`, `SNS_TOPIC_ARN` | server | Produced events (empty = no-op codec / publisher; required outside dev) |
+| `OUTBOX_POLL_INTERVAL` (`500ms`), `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_PUBLISH_CONCURRENCY` (`4`), `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_STARTUP_JITTER` (`2s`), `OUTBOX_CLAIM_LEASE_DURATION` (`10m`) | server | platform-events outbox runner (service defaults in parentheses) |
+| `SQS_QUEUE_URL`, `SQS_CONCURRENCY` (`2`), `SQS_MAX_MESSAGES`, `SQS_WAIT_SECONDS`, `SQS_VISIBILITY_TIMEOUT` (`60s`), `SQS_HANDLER_TIMEOUT` (`45s`), `SQS_DRAIN_TIMEOUT` (`15s`), `SQS_QUEUE_DEPTH_INTERVAL` (`60s`, `0s` disables), `SQS_RETRY_BACKOFF` (`60s`, `0s` off) / `SQS_MAX_RETRY_BACKOFF` (`15m`) | consumer | The one inbound subscription (platform-events `config.LoadSQS`) |
+| `ROTATION_DEFAULT_OVERLAP_SECONDS` (`300`) | server, scheduler | TS-1 default overlap / scheduler overlap; startup fails outside `[0,900]` |
+| `ROTATION_DEFAULT_CADENCE_DAYS` (`90`) | server, scheduler | Stamped into `next_rotation_at` |
+| `ROTATION_REPLAY_WINDOW` (`15m`, `0` = unlimited) | server | TS-1 replay window → `409 credential_replay_expired`; startup fails on a bad value |
+| `JWKS_RATE_LIMIT_RPS`/`_BURST` (`20`/`40`) | server | Global bucket, known tenants |
+| `JWKS_RATE_LIMIT_PER_TENANT_RPS`/`_BURST` (`5`/`10`) | server | Per-tenant buckets (LRU 10,000) |
+| `JWKS_RATE_LIMIT_UNKNOWN_TENANT_RPS`/`_BURST` (`2`/`5`) | server | Shared bucket for tenants not known |
+| `JWKS_KNOWN_TENANTS_REFRESH` (`15s`) | server | Known-tenant DB reload; startup fails on a bad value |
+| `ROTATION_OVERLAP_GAUGE_INTERVAL` (`30s`), `RLS_VIOLATION_EXPORTER_INTERVAL` (`1m`), `KEYS_REFRESH_EXPORTER_INTERVAL` (`30s`) | server | Exporter cadences |
+| `DOCS_ENABLED` (`false`), `DOCS_AUTH_TOKEN` | server | Docs routes outside local/dev/test only when enabled; startup fails if enabled there without a token |
+| `REALM_PROVISIONER_BASE_URL` | rotator, scheduler | RP-17 target |
+| `ROTATOR_RUN_TIMEOUT`/`SCHEDULER_RUN_TIMEOUT` (`180s`) | rotator / scheduler | In-process run budget (below `activeDeadlineSeconds` 240) |
+| `ROTATOR_BATCH_LIMIT`/`SCHEDULER_BATCH_LIMIT` (`500`) | rotator / scheduler | Rows per sweep / scan and markers per retry pass |
+| `ROTATOR_METRICS_SCRAPE_GRACE`/`SCHEDULER_METRICS_SCRAPE_GRACE` (`15s`) | rotator / scheduler | Post-run `/metrics` window |
+| `PROCESSED_EVENTS_TTL_DAYS` (`8`), `PRUNE_BATCH_LIMIT` (`10000`), `OUTBOX_PRUNE_OLDER_THAN` (`168h`), `RLS_VIOLATION_LOG_TTL_DAYS` (`30`, function minimum 7) | rotator | Retention prunes |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (`none` disables export), `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_TRACES_SAMPLER_RATIO`, `OTEL_PROPAGATOR_BAGGAGE`, `OTEL_TRACES_IGNORE_REMOTE_PARENT_SAMPLED` | all | gincommon tracing (`OTEL_SERVICE_NAME` is not used — `APP_NAME` is) |
+| `LOG_LEVEL`, `LOG_SAMPLING` | all | gincommon logging |
+| `GOMEMLIMIT` | all (Helm) | Per-workload `goMemLimit` |
+
+Not configurable: OpenBao HTTP timeout 8s, in-lock OpenBao bound 5s,
+RP-17 client 3s × 2 attempts, readiness checks 2s, HTTP request timeout
+30s.
 
 ## 13. Deployment and scaling
 
-**Topology:** `Deployment` × 2 (server, consumer — HA not load), `CronJob` × 2
-(rotator, scheduler — each a singleton). `server`/`consumer` connect as
-`serviceaccount_app` (RLS-scoped); `rotator` and `scheduler` both connect
-as `serviceaccount_reconciler` (BYPASSRLS, read-only) for their own
-cross-tenant enumeration (`idx_sac_overlap`/`idx_sac_next_rotation`
-respectively), then open ordinary `serviceaccount_app` transactions for
-the writes each makes — `scheduler`'s write is
-`CredentialService.IssueOrRotate` itself, not a direct SQL statement
-(§16 TSQ-6 Resolved, TS-D14). Both CronJobs also call out to the Realm
-Provisioner (RP-17) after every rotate/revoke (TS-D15) — the NetworkPolicy
-chart's `-rotator`/`-scheduler` blocks each carry that one extra egress
-rule `-consumer` doesn't need, and `-server`'s ingress rule separately
-admits Keycloak's own outbound JWKS fetch
-(`networkPolicy.keycloakNamespaceSelector`, required, no safe default —
-same fail-closed posture as `ingressNamespaceSelector`).
+**Topology:** one distroless image, four binaries. `Deployment` × 2
+(server, consumer — `replicaCount: 2` for HA, PDB `minAvailable: 1`),
+`CronJob` × 2 (rotator, scheduler — `*/5 * * * *`, `concurrencyPolicy:
+Forbid`, `activeDeadlineSeconds: 240`, in-process run timeout 180s so the
+graceful exit always wins), and a pre-install/pre-upgrade migrate hook
+`Job` (server image, `MIGRATE_ONLY=true`, weight 0). Its prerequisites —
+the migrate ServiceAccount, the chart Secret and the migrate NetworkPolicy
+— are hooks at weight -10 (`before-hook-creation`, kept afterwards).
+`server`/`consumer` connect as `serviceaccount_app`; the server also opens
+the reconciler pool (exporters, JWKS known tenants); `rotator`/`scheduler`
+enumerate as `serviceaccount_reconciler` and write as `serviceaccount_app`.
 
-**CronJob tuning:** `activeDeadlineSeconds: 240s` on both, deliberately
-shorter than the 5-minute schedule so a run never eats into the next tick
-under `concurrencyPolicy: Forbid`. Each binary's own in-process run
-timeout (`ROTATOR_RUN_TIMEOUT`/`SCHEDULER_RUN_TIMEOUT`) defaults to 180s —
-deliberately *shorter* than `activeDeadlineSeconds`, not just shorter than
-the schedule interval (TS-D15: a 5-minute in-process default was
-previously *longer* than the k8s deadline, so a run using its full budget
-could never reach its own graceful-exit/metrics/pool-drain path before
-Kubernetes SIGKILLs the Pod first).
+**Grace and probes:** server `terminationGracePeriodSeconds` 80, consumer
+60, CronJobs 45 (SIGTERM finishes the current tenant). Probes use
+`timeoutSeconds: 3`; readiness checks run with a 2s deadline. Pod
+anti-affinity is required at a fixed replica count and preferred when the
+HPA (`autoscaling.enabled`, default false; RPS rule in
+`deploy/monitoring/prometheus-adapter-rule.yaml`) is on.
 
-**Migration safety:** direct-port DSN bypasses PgBouncer for migrations.
-The down migration's `REVOKE ... FROM admin_readonly` is guarded to match
-the up migration's grant guard — `admin_readonly` is infra-provisioned
-ahead of the migration in prod and may not exist in dev/CI.
+**Identity:** `serviceAccount.perWorkload` (default true:
+`<fullname>-server/-consumer/-rotator/-scheduler/-migrate`) with
+`workloadAnnotations.<component>` for IRSA. Only the server
+(`deploy/iam/policy-server.json`: SNS publish, Glue read) and consumer
+(`policy-consumer.json`: queue consume, DLQ `SendMessage`) need AWS
+roles; rotator, scheduler and migrate need none. The OpenBao role is bound
+to the four workload ServiceAccounts with audience `openbao`.
+
+**Istio:** with `authorizationPolicy.enabled`, server and consumer are
+force-injected (native sidecars by default); CronJob pods get a sidecar
+only with `cronjobs.istioInject` (default false, then a native sidecar);
+the migrate Job is never injected.
+
+**Monitoring:** ServiceMonitor for server/consumer and a PodMonitor
+(`serviceMonitor.podMonitorInterval`, 5s) for the CronJob pods, both with
+`honorLabels: true`; `PrometheusRule` for alerts and a second one for SLOs.
+
+**Helm values (`deploy/helm/values.yaml`):** `image.{repository,tag,digest}`
+(deploy by digest); `server`/`consumer`/`rotator`/`scheduler`
+`{replicaCount|schedule, terminationGracePeriodSeconds, goMemLimit,
+resources}`, `rotator`/`scheduler.{runTimeout, metricsScrapeGrace,
+batchLimit, activeDeadlineSeconds}`, `rotator.{pruneBatchLimit,
+outboxPruneOlderThan}`; `migrations.{enabled, backoffLimit,
+activeDeadlineSeconds}`; `shutdown.drainDelay`; `cronjobs.istioInject`;
+`exporters.{rotationOverlapInterval, rlsViolationInterval,
+keysRefreshInterval}`; `networkPolicy.*` and `authorizationPolicy.*` (see
+§10); `database.{pgBouncerMode, existingSecretName, pool.{maxConns,
+minConns, slowQueryThreshold, lockTimeout, statementTimeout,
+jobStatementTimeout}}`; `openbao.{addr, authRole, kvMount, tokenAudience,
+caCertSecret}`; `realmProvisioner.baseUrl`;
+`rotation.{defaultOverlapSeconds, defaultCadenceDays, replayWindow}`;
+`jwks.{rateLimitRPS, rateLimitBurst, perTenantRPS, perTenantBurst,
+unknownTenantRPS, unknownTenantBurst, knownTenantsRefresh}`;
+`events.{glueRegistryName, topicArn, awsRegion}`; `outbox.*`;
+`sqs.{queueUrl, concurrency, maxMessages, waitSeconds,
+visibilityTimeoutSeconds, queueDepthInterval, handlerTimeout,
+drainTimeout}`; `processedEvents.ttlDays`; `rlsViolationLog.ttlDays`;
+`docs.{enabled, authEnabled}`; `otel.*`; `appEnv`, `observabilityDomain`,
+`logLevel`, `logSampling`; `serviceMonitor.*`; `ingress.*` (HTTPRoute +
+optional Envoy `securityPolicy`); `autoscaling.*`; `podDisruptionBudget.*`;
+`existingSecret`/`secretValues`/`rotationEpoch` (bump to roll pods after
+an external secret rotation).
+
+**Render guards** (`templates/validate.yaml`, outside local/dev/test):
+`authorizationPolicy.enabled` with `meshNamespaces` and
+`keycloakNamespaces`; `events.topicArn`; `sqs.queueUrl`; `docs.enabled`
+requires `docs.authEnabled`. Always: `perWorkload: false` with
+`workloadAnnotations` (other than `migrate`) is rejected. The
+NetworkPolicy selectors/CIDRs and `secretValues` are guarded in their own
+templates.
+
+**Release (CI):** `release.yml` must run from a tag: candidate image →
+scan → smoke → sign → publish tags; `schema-registry.yml` (workflow_call)
+registers schemas before the deploy gate (pre-releases skip both); deploy
+is by digest with `HELM_VALUES_B64`. All actions are SHA-pinned;
+Dependabot is enabled.
 
 ## 14. Testing strategy
 
 | Suite | Location | Proves |
 |---|---|---|
-| Unit | `internal/**/*_test.go`, `test/unit/**` | Business logic, hand-written fakes, no I/O |
-| Contract | `test/contract` | Wire-shape/error-taxonomy conformance |
-| Postgres | `test/postgres` (`-tags=integration`) | Real Postgres via testcontainers-go — RLS-6/RLS-7, real SQLSTATE paths |
-| Integration | `test/integration` (`-tags=integration`) | Real OpenBao via testcontainers-go + fake Kubernetes TokenReview server |
-| E2E | `test/e2e` (`-tags=e2e`) | Full `cmd/*` composition-root wiring |
+| Unit | `test/unit/**` + white-box `*_test.go` in `cmd/*` and `internal/**` | Business logic with hand-written fakes, no I/O; `repository_errors_test.go` drives every driver-error branch with a fake `pgx.Tx` |
+| Contract | `test/contract` | No secret in any event payload |
+| Postgres | `test/postgres` (`-tags=integration`) | Real Postgres via testcontainers: RLS-6/RLS-7, lock timeouts and concurrency, migrations round-trip (incl. `000004`), inbox/consumer, RLS log, JWKS tenants, `keys_refresh_pending` |
+| Integration | `test/integration` (`-tags=integration`) | Real OpenBao + fake Kubernetes TokenReview server; Glue codec |
+| Metrics standard | `test/unit/metricsstandard` | Registration order, identity labels; writes the scrape for `metricslint` when `METRICS_SCRAPE_OUT` is set |
+| E2E | `test/e2e` (`-tags=e2e`, `make test-e2e`) | Real router + real Postgres |
+| Smoke | `make test-smoke` | A built image per binary |
 
-`make test-ci` = full parallel merged-coverage pipeline (`-coverpkg`
-scoped to `internal/...`/`pkg/...`, `cmd/` deliberately excluded — `main()`
-can't be unit-invoked, e2e proves it instead). Currently ~99.4% merged
-coverage; remaining gaps are documented-unreachable branches (a
-`crypto/rand` failure path, the OpenBao SDK's own 404-swallowing
-behavior, etc.) — see `internal/core/service/secret_generator_test.go`
-and `internal/adapter/outbound/openbao/client_test.go` for the specific
-reasoning on each.
+`make test-ci` = merged-coverage pipeline (`-coverpkg` over `internal/...`
+and `pkg/...`; `cmd/` excluded because `main()` can't be unit-invoked).
+CI fails below 98% (`coverage-gate.sh`).
+
+**CI** (`.github/workflows/validate-quality.yml`): fmt/tidy/vet, `make
+lint`, `make swag-check`, `make gates` (`no-gocloak`, `no-secret-log`,
+`set-local-only`, `gincommon-obs` — which also rejects
+`promhttp.Handler()`/`InitTracingFromEnv()` — and `metrics-taxonomy`),
+`make metrics-lint`, govulncheck, `gosec`, Dockerfile digest pin.
+`validate-test.yml`: `make test-ci` + coverage gate, `go-arch-lint`,
+swagger staleness, AsyncAPI → JSON schema sync, e2e. `make ci` rehearses
+the quality + test path locally.
 
 ## 18. Integration points
 
 | Service | Relationship |
 |---|---|
-| Realm Provisioner | Calls TS-4 (register), TS-1 (issue/rotate) — discards the returned private-key plaintext immediately (never needs it, EXT-6) and instead calls Keycloak's `ClearServiceAccountKeysCache` (RP-17) so Keycloak re-fetches this service's own JWKS (the "other half" of every credential transition) |
-| Org & Membership / operators | Call TS-3 (read metadata) and TS-5 (find-by-sub, AUTH-9 non-member defense-in-depth, TS-D16) |
-| Org & Membership / Core | Publishes `TenantMembershipsPurged` — this service's one inbound subscription |
-| Audit Log | Subscribes to `iam-serviceaccount-events` (5 events, audit-only — no authz consumer, the automation principal carries no roles) |
-| Keycloak | Fetches this service's own JWKS directly (EXT-6) — the one route Keycloak calls; otherwise indirect only, and this service never calls Keycloak itself (TS-INV-1) |
+| Realm Provisioner | Calls TS-4 and TS-1 (discards the private key, EXT-6); serves RP-17 (`POST …/tenants/:id/service-account/keys/refresh`), which this service's CronJobs call after their own revokes/rotations |
+| Org & Membership / operators | TS-3 (read metadata), TS-5 (find-by-sub, AUTH-9) |
+| Workflow Service | TS-6 (the tenant's automation `principal_sub`) |
+| O&M / Core | Publishes `TenantMembershipsPurged` — the one inbound subscription |
+| Audit Log | Subscribes to `iam-serviceaccount-events` (5 events, audit-only) |
+| Keycloak | Fetches this service's JWKS (EXT-6); this service never calls Keycloak (TS-INV-1) |
 
 ## 20. Operational considerations
 
-- **Outbox health:** `outbox_pending_total` is the primary bus-health
-  signal; sustained growth means the SNS relay is stalled (credential
+- **Outbox health:** `platform_outbox_pending_events` is the primary
+  bus-health signal; growth means the SNS relay is stalled (credential
   operations still succeed — only audit emission is delayed, EVT-4).
-- **Stuck `rotating` versions:** `rotation_overlap_active` should trend to
-  zero shortly after each rotation's `expires_at`; non-zero beyond one
-  sweep interval means `cmd/rotator` isn't running or is failing OpenBao
-  deletes.
-- **Concurrent-revoke races:** benign by design (LLD TS-D13) — both TS-2
-  and the sweep re-check after an optimistic-lock conflict and report the
-  already-achieved outcome, not a false failure.
+  Poison events land in `outbox_dead_letters`.
+- **Stuck `rotating` versions:** `rotation_overlap_active` should fall
+  back after each overlap; non-zero beyond a sweep interval means
+  `cmd/rotator` isn't running or is failing OpenBao deletes.
+- **RP-17 backlog:** `keys_refresh_pending` / oldest age > 15 min means
+  RP-17 keeps failing; revoked or superseded keys may still authenticate
+  at Keycloak until it clears. Before rolling back `000005`, trigger RP-17
+  by hand for every listed tenant.
+- **Concurrent-revoke races:** benign by design (TS-D13) — reported as
+  the already-achieved outcome or `Skipped`, not a failure.
+- **`rotation_in_flight` spikes:** another write held the principal lock
+  past `PG_LOCK_TIMEOUT`; callers retry.
 
 ## 21. Performance
 
-Trivially small service by design (§21 of the LLD) — 2 replicas cover HA,
-not load; no HPA at MVP. Scaling triggers, if ever needed, would be tenant
-count and rotation cadence, both far below any single-replica limit.
+Small service by design (§21 of the LLD) — 2 replicas cover HA, not load.
+The HPA is optional (`autoscaling.enabled`, default false). Scaling
+triggers, if ever needed, would be tenant count and rotation cadence;
+CronJob throughput is bounded per run by `*_BATCH_LIMIT` and the 180s
+budget, with the rest deferred to the next 5-minute tick.

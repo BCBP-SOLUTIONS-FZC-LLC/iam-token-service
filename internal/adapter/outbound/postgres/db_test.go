@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -40,13 +42,12 @@ func TestTxFromContext_NoTxSetReturnsFalse(t *testing.T) {
 func TestDSNFromEnv_UsesDatabaseURLVerbatim(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://app:pw@db:5432/serviceaccount?sslmode=require")
 	// DATABASE_URL takes precedence over PG_* vars in pgcommon.ConfigFromEnv
-	// and, per DSNFromEnv's doc comment, is returned as-is (ApplyStatementTimeout
-	// is skipped in this branch).
+	// and is returned as-is.
 	got := DSNFromEnv()
 	assert.Equal(t, "postgres://app:pw@db:5432/serviceaccount?sslmode=require", got)
 }
 
-func TestDSNFromEnv_BuildsFromPartsAndAppliesStatementTimeout(t *testing.T) {
+func TestDSNFromEnv_BuildsFromPartsWithoutTimeoutOptions(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("PG_HOST", "db")
 	t.Setenv("PG_PORT", "5432")
@@ -57,7 +58,8 @@ func TestDSNFromEnv_BuildsFromPartsAndAppliesStatementTimeout(t *testing.T) {
 	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
 	got := DSNFromEnv()
 	require.NotEmpty(t, got)
-	assert.Contains(t, got, "statement_timeout%3D5000")
+	assert.NotContains(t, got, "statement_timeout",
+		"the statement timeout is applied per transaction by pgcommon (Config.StatementTimeout), never baked into a DSN")
 }
 
 func TestMigrationDSNFromEnv(t *testing.T) {
@@ -86,31 +88,6 @@ func TestReconcilerDSNFromEnv(t *testing.T) {
 	})
 }
 
-// ── ApplyStatementTimeout ──────────────────────────────────────────────
-
-func TestApplyStatementTimeout(t *testing.T) {
-	cases := []struct {
-		name    string
-		dsn     string
-		timeout string
-		want    string
-	}{
-		{"empty dsn is untouched", "", "5s", ""},
-		{"unset timeout is a no-op", "postgres://x", "", "postgres://x"},
-		{"invalid duration is a no-op", "postgres://x", "not-a-duration", "postgres://x"},
-		{"zero duration is a no-op", "postgres://x", "0s", "postgres://x"},
-		{"negative duration is a no-op", "postgres://x", "-5s", "postgres://x"},
-		{"applies a valid duration", "postgres://x", "500ms", "postgres://x&options=-c%20statement_timeout%3D500"},
-		{"idempotent when already present", "postgres://x?options=-c%20statement_timeout%3D999", "5s", "postgres://x?options=-c%20statement_timeout%3D999"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("PG_STATEMENT_TIMEOUT", tc.timeout)
-			assert.Equal(t, tc.want, ApplyStatementTimeout(tc.dsn))
-		})
-	}
-}
-
 // ── SystemPoolConfig ───────────────────────────────────────────────────
 
 func TestSystemPoolConfig_ForcesPGBouncerMode(t *testing.T) {
@@ -126,6 +103,8 @@ func TestSystemPoolConfig_ForcesPGBouncerMode(t *testing.T) {
 	assert.Nil(t, cfg.Tracer, "Tracer is wired by the call site, not SystemPoolConfig")
 	assert.Nil(t, cfg.Logger, "nil log must leave Logger unset")
 	assert.Equal(t, int32(20), cfg.MaxConns, "reconciler pool inherits pool sizing from ConfigFromEnv")
+	assert.Equal(t, SystemPoolName, cfg.PoolName,
+		"reconciler pool needs its own platform_db_* pool label — same-named live pools share (sum) one gauge collector")
 }
 
 func TestSystemPoolConfig_NonNilLoggerWiresAdapter(t *testing.T) {
@@ -134,10 +113,20 @@ func TestSystemPoolConfig_NonNilLoggerWiresAdapter(t *testing.T) {
 	assert.NotNil(t, cfg.Logger, "non-nil port.Logger must be wrapped via NewLoggerAdapter")
 }
 
-func TestSystemPoolConfig_AppliesStatementTimeout(t *testing.T) {
+func TestSystemPoolConfig_InheritsTransactionTimeouts(t *testing.T) {
 	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	t.Setenv("PG_LOCK_TIMEOUT", "2s")
 	cfg := SystemPoolConfig("postgres://sys@host/db?sslmode=disable", nil)
-	assert.Contains(t, cfg.DSN, "statement_timeout%3D5000")
+	assert.Equal(t, "postgres://sys@host/db?sslmode=disable", cfg.DSN, "DSN is used verbatim")
+	assert.Equal(t, 5*time.Second, cfg.StatementTimeout)
+	assert.Equal(t, 2*time.Second, cfg.LockTimeout)
+}
+
+func TestMigrationDSNFromEnv_IgnoresStatementTimeout(t *testing.T) {
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://migrator:pw@db:5432/serviceaccount")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	assert.Equal(t, "postgres://migrator:pw@db:5432/serviceaccount", MigrationDSNFromEnv(),
+		"migrations must not inherit the API's statement timeout")
 }
 
 type fakePortLogger struct{}
@@ -219,4 +208,39 @@ func TestWrapConnErr(t *testing.T) {
 		got := wrapConnErr(src)
 		assert.Same(t, src, got)
 	})
+}
+
+// SQLSTATE 57014 is a DB problem only when the request is still live
+// (statement_timeout); when ctx ended (client disconnect, request deadline)
+// pgx cancelled the statement itself and it must not count as db_unavailable.
+func TestWrapConnErrCtx_QueryCanceled(t *testing.T) {
+	canceled := pgErr("57014")
+
+	t.Run("statement timeout on a live request is db_unavailable", func(t *testing.T) {
+		err := wrapConnErrCtx(context.Background(), canceled)
+		var de *domain.Error
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, domain.ErrDBUnavailable, de.Code)
+	})
+	t.Run("cancellation after ctx ended passes through unchanged", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		assert.Same(t, canceled, wrapConnErrCtx(ctx, canceled))
+	})
+	t.Run("other class 57 errors stay db_unavailable even after ctx ended", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var de *domain.Error
+		require.ErrorAs(t, wrapConnErrCtx(ctx, pgErr("57P01")), &de) // admin_shutdown
+		assert.Equal(t, domain.ErrDBUnavailable, de.Code)
+	})
+}
+
+// SQLSTATE 55P03 (lock_timeout) maps to the retryable 409 rotation_in_flight
+// wherever in the adapter it surfaces — never a raw PgError (a 500).
+func TestWrapConnErrCtx_LockNotAvailable(t *testing.T) {
+	var de *domain.Error
+	require.ErrorAs(t, wrapConnErr(fmt.Errorf("wrapped: %w", pgErr("55P03"))), &de)
+	assert.Equal(t, domain.ErrRotationInFlight, de.Code)
+	assert.Equal(t, 409, de.Status())
 }

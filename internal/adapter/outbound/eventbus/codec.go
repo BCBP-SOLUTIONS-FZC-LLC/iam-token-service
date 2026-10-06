@@ -1,6 +1,6 @@
 package eventbus
 
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 
 // Codec and NoopCodec are platform-events' events.Codec — the same types
 // iam-user-profile / iam-org-membership inject via events.WithCodec at

@@ -22,6 +22,12 @@ type CredentialRepository interface {
 	// any (§6.2 — at most one at a time, uq_sac_one_active).
 	FindActive(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.Credential, error)
 
+	// MaxVersion returns the highest version ever committed for the
+	// principal, whatever its status (0 when none). TS-1 issues max+1: the
+	// active row's version is not enough once the active version has been
+	// revoked (uq_sac_version would reject every later issue).
+	MaxVersion(ctx context.Context, tenantID, principalID uuid.UUID) (int, error)
+
 	// FindByRotationID returns the credential row already created for
 	// (principalID, rotationID), if any — TS-1's idempotency check
 	// (uq_sac_rotation_id, §9.2).

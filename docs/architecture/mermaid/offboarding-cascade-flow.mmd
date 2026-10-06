@@ -1,13 +1,16 @@
 %% TenantMembershipsPurged consumer (LLD §7.1, §8.4). One active inbound
-%% subscription. Idempotent via processed_events keyed on envelope id.
-%% Unknown event types and malformed envelope ids are acked, never
-%% retried (ackUnknown / dedup.go) — a producer schema addition must
-%% never DLQ-storm this queue. Before Handle, cmd/consumer's pipeline strips
-%% the Glue header (GlueDecoder) and validates the payload against the
-%% embedded consumed schema; a violation goes straight to the DLQ.
+%% subscription. Exactly-once via platform-events' inbox (pkg/inbox) over
+%% processed_events, keyed on envelope id: claim + cascade in one tx, with
+%% the tenant's principal rows locked (LockByTenant). Unknown event types
+%% are acked, never retried (ackUnknown / dedup.go) — a producer schema
+%% addition must never DLQ-storm this queue. A TenantMembershipsPurged with
+%% a missing/invalid envelope id is NOT acked: the DLQ router sends it to
+%% the DLQ (invalid_envelope_id), like a consumed-schema violation
+%% (schema_violation). Before Handle, cmd/consumer's pipeline strips the
+%% Glue header (GlueDecoder) and validates the payload.
 sequenceDiagram
     participant SQS as tenant-lifecycle-tokensvc-q
-    participant PIPE as cmd/consumer pipeline<br/>(GlueDecoder → DLQ router → metrics → validateConsumed)
+    participant PIPE as cmd/consumer pipeline<br/>(GlueDecoder, then DLQ router → cascade metrics → validateConsumed)
     participant DLQ as tenant-lifecycle-tokensvc-q-dlq
     participant C as OffboardingConsumer.Handle
     participant PE as processed_events
@@ -17,25 +20,27 @@ sequenceDiagram
     participant PUB as outbox_events
 
     SQS->>PIPE: TenantMembershipsPurged (Glue header stripped if dataschema set)
-    PIPE->>PIPE: validateConsumed — tenant_memberships_purged.json
+    PIPE->>PIPE: validateConsumed — tenant_memberships_purged.json<br/>(no embedded schema for the type → pass through)
     alt schema violation (e.g. tenant_id missing)
         PIPE->>DLQ: SendMessage(DLQReason=schema_violation) — then ack
-        Note over PIPE,DLQ: consumed_schema_violations_total++, cascade never runs,<br/>IAMTokenServiceConsumedSchemaViolation pages
+        Note over PIPE,DLQ: consumed_schema_violations_total++ and<br/>consumer_dlq_rejects_total{reason="schema_violation"}++<br/>IAMTokenServiceConsumedSchemaViolation pages
     end
     PIPE->>C: Handle(env) — valid payloads only
-    C->>C: validate envelope id (missing/invalid → ack, log, return nil)
     alt event type != TenantMembershipsPurged
-        C->>PE: ackUnknown: MarkProcessed + metric + info log
+        C->>PE: ackUnknown: inbox claim (empty fn) + metric + info log<br/>(invalid envelope id: log only, no claim)
         C-->>SQS: ack (forward-compat, no DLQ storm)
-    else known type
-        C->>PE: IsProcessed(envelope.id)?
-        alt already processed
-            PE-->>C: true
-            C-->>SQS: ack, no-op (idempotent redelivery)
-        else first delivery
-            PE-->>C: false
-            C->>C: bind GUC: tenant_id + SystemPrincipalID
-            C->>PRIN: ListByTenant(tenant_id)
+    else TenantMembershipsPurged with missing / non-UUID envelope id
+        C-->>PIPE: ErrInvalidEnvelopeID — erasure has NOT run
+        PIPE->>DLQ: SendMessage(DLQReason=invalid_envelope_id) — then ack
+        Note over PIPE,DLQ: consumer_dlq_rejects_total{reason="invalid_envelope_id"}++<br/>IAMTokenServiceOffboardingInvalidEnvelopeRejected pages.<br/>DLQ unresolvable or send fails → normal SQS redrive
+    else valid
+        C->>C: decode payload, bind GUC: tenant_id + SystemPrincipalID
+        C->>PE: inbox ProcessOnce — BEGIN, SET LOCAL app.tenant_id<br/>INSERT processed_events ON CONFLICT DO NOTHING (claim)
+        alt already claimed (redelivery, or a concurrent copy that committed first)
+            PE-->>C: duplicate — fn not run
+            C-->>SQS: ack, no-op
+        else claimed
+            C->>PRIN: LockByTenant(tenant_id) — FOR UPDATE, same tx<br/>(55P03 → rotation_in_flight → rollback, redelivered)
             PRIN-->>C: principals
             loop each principal
                 C->>CRED: ListByPrincipal(tenant_id, principal_id)
@@ -44,9 +49,11 @@ sequenceDiagram
             loop each collected path
                 C->>BAO: Delete(path) — material-first (§9.3, §15.2)
             end
-            C->>PRIN: RunInTx:<br/>DeleteByTenant (FK-cascades credentials)<br/>MarkProcessed(envelope.id)<br/>per-principal: enqueue ServiceAccountRevoked
-            PRIN-->>C: committed
+            C->>BAO: List + Delete the tenant's whole subtree<br/>(material of uncommitted TS-1 writes has no row)
+            C->>PRIN: DeleteByTenant (FK-cascades credentials)
+            C->>PUB: per-principal: enqueue ServiceAccountRevoked
+            C->>PE: COMMIT — claim + deletes + outbox events together
             C-->>SQS: ack
         end
     end
-    Note over BAO,PRIN: Delete-material-before-DB-commit is deliberate:<br/>once the principal row is gone, the §8.6 orphan reconciler<br/>(which enumerates the LIVE registry) can never find this<br/>tenant's material again — DB-first ordering could leak it forever.
+    Note over BAO,PRIN: Delete-material-before-DB-commit is deliberate:<br/>once the principal row is gone, the §8.6 orphan reconciler<br/>(which enumerates the LIVE registry) can never find this<br/>tenant's material again — DB-first ordering could leak it forever.<br/>Any failure rolls the claim back too, so the redelivery repeats<br/>the cascade (OpenBao Delete of a missing path is a no-op).

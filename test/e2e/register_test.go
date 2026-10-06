@@ -78,12 +78,11 @@ func TestRegister_IdempotentRepeat(t *testing.T) {
 }
 
 // TestRegister_MissingIdentityHeaders covers the 401 path when no identity
-// headers are sent at all — rejected by gincommon's own RequireAuth
-// middleware (platform-gincommon's generic "missing or invalid
-// authentication headers"), before this service's own GUCBridgeMiddleware
-// (and its missing_identity_headers code) ever runs. See
-// TestRegister_NonSystemPrincipalUserID for the case that DOES reach this
-// service's own check.
+// headers are sent at all. This service's RequireIdentityHeaders runs ahead
+// of gincommon's RequireAuth precisely so this case carries the frozen §17
+// missing_identity_headers code, not gincommon's generic message. See
+// TestRegister_NonSystemPrincipalUserID for headers that are present but
+// name the wrong principal.
 func TestRegister_MissingIdentityHeaders(t *testing.T) {
 	t.Parallel()
 	tenantID := newTenantID()
@@ -95,15 +94,16 @@ func TestRegister_MissingIdentityHeaders(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if er.Error == "" {
-		t.Fatal("error must be set")
+	if er.Error != "missing_identity_headers" {
+		t.Fatalf("error = %q, want missing_identity_headers", er.Error)
 	}
 }
 
 // TestRegister_NonSystemPrincipalUserID covers §5.2's single authorization
 // rule: headers are present and well-formed, but x-user-id is a real UUID
-// that is NOT the reserved iam-system principal — this passes gincommon's
-// own RequireAuth and reaches this service's own GUCBridgeMiddleware,
+// that is NOT the reserved iam-system principal — this passes
+// RequireIdentityHeaders and gincommon's RequireAuth and reaches this
+// service's own GUCBridgeMiddleware,
 // which rejects it with the service's own missing_identity_headers code
 // (internal/adapter/inbound/http/middleware.go).
 func TestRegister_NonSystemPrincipalUserID(t *testing.T) {

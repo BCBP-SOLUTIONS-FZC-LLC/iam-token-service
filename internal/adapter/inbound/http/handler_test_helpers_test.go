@@ -9,7 +9,7 @@ import (
 // testGinConfig is a minimal gincommon.Config for tests that need the real
 // ProtectedMiddlewares chain (RequireAuth + ContextMiddleware) ahead of
 // GUCBridgeMiddleware, matching router.go's actual wiring order.
-var testGinConfig = gincommon.Config{ServiceName: "iam-token-service-test"}
+var testGinConfig = gincommon.Config{ServiceName: "iam-token-service-test", Domain: "iam", Environment: "test"}
 
 // newTenantScopedTestRouter wires the real production middleware chain
 // (ProtectedMiddlewares -> GUCBridgeMiddleware -> RequireTenantPathMatch)
@@ -19,6 +19,7 @@ var testGinConfig = gincommon.Config{ServiceName: "iam-token-service-test"}
 // behavior is exercised through the real chain, not reimplemented.
 func newTenantScopedTestRouter(register func(g *gin.RouterGroup)) *gin.Engine {
 	r := gin.New()
+	r.Use(RequireIdentityHeaders())
 	r.Use(gincommon.ProtectedMiddlewares(testGinConfig)...)
 	r.Use(GUCBridgeMiddleware())
 	g := r.Group("/tenants/:id", RequireTenantPathMatch())
