@@ -33,7 +33,7 @@
 ########################################
 # Stage: builder
 ########################################
-FROM golang:1.26.6-bookworm AS builder
+FROM golang:1.26.9-bookworm AS builder
 
 ARG BUILD_VERSION=dev
 ARG SOURCE_DATE_EPOCH
