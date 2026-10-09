@@ -33,6 +33,7 @@ type ServiceAccountRegisteredPayload struct {
 	PrincipalSub     uuid.UUID `json:"principal_sub"`
 	KeycloakClientID string    `json:"keycloak_client_id"`
 	PrincipalType    string    `json:"principal_type"`
+	ActorID          uuid.UUID `json:"actor_id"`
 	CreatedAt        string    `json:"created_at"`
 }
 
@@ -42,6 +43,7 @@ type ServiceAccountCredentialIssuedPayload struct {
 	TenantID    uuid.UUID `json:"tenant_id"`
 	PrincipalID uuid.UUID `json:"principal_id"`
 	Version     int       `json:"version"`
+	ActorID     uuid.UUID `json:"actor_id"`
 	IssuedAt    string    `json:"issued_at"`
 }
 
@@ -52,6 +54,7 @@ type ServiceAccountCredentialRotatedPayload struct {
 	PrincipalID    uuid.UUID `json:"principal_id"`
 	Version        int       `json:"version"`
 	PriorVersion   int       `json:"prior_version"`
+	ActorID        uuid.UUID `json:"actor_id"`
 	ExpiresPriorAt string    `json:"expires_prior_at"`
 }
 
@@ -61,6 +64,7 @@ type ServiceAccountCredentialRevokedPayload struct {
 	TenantID    uuid.UUID `json:"tenant_id"`
 	PrincipalID uuid.UUID `json:"principal_id"`
 	Version     int       `json:"version"`
+	ActorID     uuid.UUID `json:"actor_id"`
 	RevokedAt   string    `json:"revoked_at"`
 }
 
@@ -69,5 +73,6 @@ type ServiceAccountCredentialRevokedPayload struct {
 type ServiceAccountRevokedPayload struct {
 	TenantID    uuid.UUID `json:"tenant_id"`
 	PrincipalID uuid.UUID `json:"principal_id"`
+	ActorID     uuid.UUID `json:"actor_id"`
 	RevokedAt   string    `json:"revoked_at"`
 }

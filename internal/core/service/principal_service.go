@@ -83,6 +83,7 @@ func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req
 			Data: domain.ServiceAccountRegisteredPayload{
 				TenantID: tenantID, PrincipalID: result.ID, PrincipalSub: result.PrincipalSub,
 				KeycloakClientID: result.KeycloakClientID, PrincipalType: string(result.PrincipalType),
+				ActorID:   actor,
 				CreatedAt: result.CreatedAt.UTC().Format(time.RFC3339),
 			},
 		})

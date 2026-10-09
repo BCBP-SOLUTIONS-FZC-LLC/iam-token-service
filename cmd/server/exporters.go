@@ -2,45 +2,47 @@ package main
 
 import (
 	"context"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
+
+// rotationOverlapCounter is the ReconcilerRepository slice the rotation-overlap
+// exporter uses — a local interface so the exporter does not import the
+// postgres adapter package and unit tests can use a hand-written fake.
+type rotationOverlapCounter interface {
+	RotationOverlapCount(ctx context.Context) (int, error)
+}
 
 // runRotationOverlapExporter refreshes iam_token_service_rotation_overlap_active
 // (§11.2) every interval from the BYPASSRLS reconciler pool — a
 // cross-tenant count of `rotating` credentials, which no per-request or
 // per-tenant path can maintain. Runs until ctx is cancelled.
-func runRotationOverlapExporter(ctx context.Context, reconcilerPool *pgcommon.Pool, interval time.Duration, log port.Logger) {
+func runRotationOverlapExporter(ctx context.Context, repo rotationOverlapCounter, interval time.Duration, log port.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	refreshRotationOverlapGauge(ctx, reconcilerPool, log)
+	refreshRotationOverlapGauge(ctx, repo, log)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			refreshRotationOverlapGauge(ctx, reconcilerPool, log)
+			refreshRotationOverlapGauge(ctx, repo, log)
 		}
 	}
 }
 
-func refreshRotationOverlapGauge(ctx context.Context, reconcilerPool *pgcommon.Pool, log port.Logger) {
+func refreshRotationOverlapGauge(ctx context.Context, repo rotationOverlapCounter, log port.Logger) {
 	ctx, span := gincommon.NewTracer("iam-token-service").Start(ctx, "exporter.rotation_overlap")
 	defer span.End()
 
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var count int
-	err := reconcilerPool.WithConn(queryCtx, func(ctx context.Context, conn *pgxpool.Conn) error {
-		return conn.QueryRow(ctx, `SELECT count(*) FROM service_account_credentials WHERE status = 'rotating' AND expires_at IS NOT NULL AND deleted_at IS NULL`).Scan(&count)
-	})
+	count, err := repo.RotationOverlapCount(queryCtx)
 	if err != nil {
 		if log != nil {
 			fields := map[string]interface{}{"error": err.Error()}

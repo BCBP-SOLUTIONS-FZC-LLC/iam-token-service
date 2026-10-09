@@ -35,6 +35,15 @@ docs. */}}
 {{- if not .Values.events.topicArn }}
 {{- fail (printf "events.topicArn is required when appEnv=%q (not local/dev/test) — without SNS_TOPIC_ARN the server publishes credential-lifecycle events to a no-op publisher and they are lost. See values.yaml." .Values.appEnv) }}
 {{- end }}
+{{- /* TS-RP-GAP-003: Glue schema registry must be registered and AVAILABLE
+     before this chart is installed — NewGlueCodec resolves each produced
+     schema's version UUID at startup and crashes the pod if any is missing,
+     so a deploy that outran schema registration causes a boot loop. Run
+     `make schema-register GLUE_REGISTRY_SERVICEACCOUNT_NAME=<registry>`
+     (or wait for the schema-registry CI job) before `helm upgrade`. */}}
+{{- if not .Values.events.glueRegistryName }}
+{{- fail (printf "events.glueRegistryName is required when appEnv=%q (not local/dev/test) — without GLUE_REGISTRY_NAME the server cannot resolve Glue schema version UUIDs at startup and will crash. Ensure all %d produced schemas are registered and AVAILABLE in the registry first (make schema-verify), then set this value. See TS-RP-GAP-003 and NOTES.txt." .Values.appEnv 5) }}
+{{- end }}
 {{- if not .Values.sqs.queueUrl }}
 {{- fail (printf "sqs.queueUrl is required when appEnv=%q (not local/dev/test) — without SQS_QUEUE_URL the consumer cannot read TenantMembershipsPurged and tenant offboarding never revokes credentials. See values.yaml." .Values.appEnv) }}
 {{- end }}

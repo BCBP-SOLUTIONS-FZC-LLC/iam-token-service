@@ -61,7 +61,7 @@ Paths are relative to `/api/v1/internal/tenants/:id`.
 | TS-5 | `GET /service-accounts?principal_sub=<uuid>` | Find by Keycloak `sub` (AUTH-9, TS-D16) — identity/status only; used by org-membership's non-member defense-in-depth check | `200` / `404` | Read |
 | TS-6 | `GET /service-accounts/platform-automation` | Read the tenant's automation principal (TS-D17) — the reverse of TS-5, returns `principal_sub` and `keycloak_client_id`; used by the Workflow Service's connector workers. `principal_sub` changes on an RP-3/RP-4 re-mint, `principal_id` doesn't | `200` / `404` | Read |
 | EXT-6 | `GET /service-accounts/platform-automation/jwks.json` | Public JWK Set for Keycloak's client-jwt authenticator. No identity headers; rate-limited | `200` | Read |
-| TS-H | `GET /healthz`, `GET /readyz` | Liveness / readiness (database, OpenBao, outbox; 2s per check; 503 while draining) | | Read |
+| TS-H | `GET /healthz`, `GET /readyz` | Liveness / readiness (database, OpenBao, outbox, and JWKS known-tenant refresher — TS-RP-GAP-001; 2s per check; 503 while draining) | | Read |
 | TS-D | `GET /asyncapi`, `/asyncapi.yaml`, `/swagger/*any` | Contracts; always on in local/dev/test, elsewhere only with `DOCS_ENABLED=true` and a bearer `DOCS_AUTH_TOKEN` (the server refuses to start without it) | | Read |
 
 `GET /service-accounts` is not a listing endpoint — `principal_sub` is
@@ -82,10 +82,15 @@ read by TS-3 (by id), TS-5 (by sub) or TS-6 (by its frozen name).
   bucket (5 rps / burst 10, LRU of 10,000 tenants) for every request,
   then the global bucket (20/40) for a *known* tenant or the shared
   unknown-tenant bucket (2/5) for any other. Known = the tenants with an
-  `active`/`rotating` credential (reloaded every
-  `JWKS_KNOWN_TENANTS_REFRESH`, 15s, over the reconciler pool) plus
-  tenants served keys since the last reload. Counted in
-  `jwks_rate_limited_total` and `jwks_rate_limited_by_bucket_total{bucket}`.
+  `active`/`rotating` credential (reloaded every `JWKS_KNOWN_TENANTS_REFRESH`,
+  15s, over the BYPASSRLS reconciler pool via `withReadOnlyPool`) plus tenants
+  served keys since the last reload. The pod stays not-ready via `/readyz`
+  until the first reload completes (TS-RP-GAP-001) so newly provisioned tenants
+  are always served from the global bucket from the moment traffic arrives.
+  Refresh health tracked by `iam_token_service_jwks_known_tenants_refresh_total`
+  and `iam_token_service_jwks_known_tenants_last_refresh_age_seconds`. Rate-limit
+  refusals counted in `jwks_rate_limited_total` and
+  `jwks_rate_limited_by_bucket_total{bucket}`.
 - Headers: `Cache-Control: no-cache`, `X-Content-Type-Options: nosniff`.
 
 ## 5.5 Status codes (`internal/core/domain/errors.go`, `http/errors.go`)
@@ -163,7 +168,14 @@ schema-check-only against plain JSON (`ValidatingCodec`); Glue
 wire-encoding happens at publish time (`GlueCodec` on the SNS publisher),
 so `outbox_events.payload` stays human-readable. With no
 `GLUE_REGISTRY_NAME` the codec is a no-op; with no `SNS_TOPIC_ARN` the
-publisher is a no-op (both required outside dev).
+publisher is a no-op (both required outside dev; Helm `validate.yaml`
+enforces this).
+
+**All 5 produced event payloads include `actor_id`** (UUID, required) —
+the iam-system principal UUID on all current paths. `actor_id` is also
+present in the CloudEvents envelope as `actor`; the payload field is
+intentional so consumers that parse only the JSON body have access to it
+without reading the envelope header.
 
 ## 7.5 Published events (5, frozen §25)
 

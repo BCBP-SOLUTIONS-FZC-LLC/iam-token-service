@@ -131,6 +131,30 @@ var (
 	// Service-specific: JWKS custody is unique to this service.
 	JWKSKeyErrorsTotal prometheus.Counter
 
+	// JWKSKnownTenantsRefreshTotal counts runs of the JWKSHandler
+	// known-tenant refresher (RunKnownTenantRefresher) by result
+	// (success|error). The refresher queries the database for tenants with a
+	// live credential so that their JWKS requests spend from the global
+	// rate-limit bucket rather than the tighter unknown-tenant one. A
+	// sustained error rate means the query is failing and the known-tenant
+	// set is stale; before the first successful refresh the pod reports
+	// not-ready via /readyz (TS-RP-GAP-001). Use IncJWKSKnownTenantsRefresh.
+	JWKSKnownTenantsRefreshTotal *prometheus.CounterVec
+
+	// JWKSKnownTenantsLastRefreshAgeSeconds is the number of seconds since
+	// the last successful known-tenant DB refresh. Pre-warmed to 0 at
+	// registration so the series always exists. On the success path it is set
+	// to 0 (just refreshed). On each non-shutdown failure tick it grows by the
+	// refresh interval (exportRefreshAge uses startedAt as the reference before
+	// the first success, so the gauge grows from pod start even in a full
+	// startup DB outage). After a goroutine panic it is set to 86400 (1 day)
+	// as a sentinel to ensure the staleness alert fires. Use
+	// SetJWKSKnownTenantsLastRefreshAge.
+	// Alerted by IAMTokenServiceJWKSKnownTenantsStale when the value exceeds
+	// twice the refresh interval, indicating a sustained DB outage is leaving
+	// the known-tenant set stale.
+	JWKSKnownTenantsLastRefreshAgeSeconds prometheus.Gauge
+
 	// JWKSRateLimitedTotal counts JWKS requests answered 429 by the
 	// per-tenant or process-wide limiter. Alerted: a rate-limited Keycloak
 	// fetch right after RP-17 is an auth outage for that tenant.
@@ -392,6 +416,18 @@ func registerMetrics() {
 		ConstLabels: t3,
 	})
 
+	JWKSKnownTenantsRefreshTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        tier3Prefix + "jwks_known_tenants_refresh_total",
+		Help:        "Known-tenant refresher runs by result (success|error). Context-cancelled ticks (clean shutdown) are not counted. A sustained error rate means the DB query is failing and the known-tenant set is stale; before the first success the pod reports not-ready (TS-RP-GAP-001).",
+		ConstLabels: t3,
+	}, []string{"result"})
+
+	JWKSKnownTenantsLastRefreshAgeSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        tier3Prefix + "jwks_known_tenants_last_refresh_age_seconds",
+		Help:        "Seconds since the last successful known-tenant DB refresh. Pre-warmed to 0 at registration. On success: reset to 0. On each non-shutdown failure tick: grows from either pod-start time (before first success) or last-success time, using the earlier as reference. Set to 86400 (sentinel) when the refresher goroutine panics — indicates goroutine dead, not a 24-hour DB outage.",
+		ConstLabels: t3,
+	})
+
 	JWKSRateLimitedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name:        tier3Prefix + "jwks_rate_limited_total",
 		Help:        "JWKS route requests rejected with 429 by the per-tenant or process-wide rate limiter. Sustained increase means a caller is flooding the route and Keycloak's key fetches may be starved.",
@@ -442,6 +478,8 @@ func registerMetrics() {
 		// could never have fired.
 		CadenceRotationTotal,
 		JWKSKeyErrorsTotal,
+		JWKSKnownTenantsRefreshTotal,
+		JWKSKnownTenantsLastRefreshAgeSeconds,
 		JWKSRateLimitedTotal,
 		JWKSRateLimitedByBucketTotal,
 		CredentialReplaysTotal,
@@ -474,8 +512,14 @@ func registerMetrics() {
 		OffboardingCascadeTotal.WithLabelValues(result)
 		RotationSweepTotal.WithLabelValues(result)
 	}
+	for _, result := range knownTenantsRefreshResults {
+		JWKSKnownTenantsRefreshTotal.WithLabelValues(result)
+	}
 	for _, result := range []string{"orphan_deleted", "missing_material", "ok", "error"} {
 		MaterialReconcileTotal.WithLabelValues(result)
+	}
+	for _, result := range []string{"rotated", "skipped", "failed"} {
+		CadenceRotationTotal.WithLabelValues(result)
 	}
 	ProcessedEventsDuplicates.WithLabelValues("tenant_offboarding")
 	for _, vType := range rlsViolationTypes {
@@ -491,6 +535,16 @@ func registerMetrics() {
 	for _, r := range dlqRejectReasons {
 		ConsumerDLQRejectsTotal.WithLabelValues(r)
 	}
+	// Pre-warm the "other" fallback bucket that IncConsumerDLQReject folds
+	// unknown reasons into. dlqRejectReasons only contains the two named
+	// reasons; without this call the {reason="other"} series is absent from
+	// /metrics until the first real occurrence, which breaks dashboard queries
+	// and sum-across-reasons expressions.
+	ConsumerDLQRejectsTotal.WithLabelValues(dlqReasonOther)
+	// Pre-warm the staleness gauge so the series exists from the first scrape
+	// — a gauge that is never Set() has no series, making alert expressions
+	// that query it return no-data instead of a numeric value.
+	JWKSKnownTenantsLastRefreshAgeSeconds.Set(0)
 }
 
 // Label vocabularies of the TS-D23 counters. Helpers fold anything else to
@@ -511,10 +565,31 @@ const (
 )
 
 var (
-	jwksBuckets      = []string{JWKSBucketTenant, JWKSBucketGlobal, JWKSBucketUnknown}
-	replayResults    = []string{ReplayServed, ReplayExpired, ReplayRevoked}
-	dlqRejectReasons = []string{DLQReasonSchemaViolation, DLQReasonInvalidEnvelopeID}
+	jwksBuckets                = []string{JWKSBucketTenant, JWKSBucketGlobal, JWKSBucketUnknown}
+	knownTenantsRefreshResults = []string{OutcomeSuccess, OutcomeError}
+	replayResults              = []string{ReplayServed, ReplayExpired, ReplayRevoked}
+	dlqRejectReasons           = []string{DLQReasonSchemaViolation, DLQReasonInvalidEnvelopeID}
 )
+
+// IncJWKSKnownTenantsRefresh increments jwks_known_tenants_refresh_total{result}.
+// result must be OutcomeSuccess ("success") or OutcomeError ("error"); unknown
+// values are silently dropped to keep cardinality fixed. Nil-safe.
+func IncJWKSKnownTenantsRefresh(result string) {
+	if JWKSKnownTenantsRefreshTotal == nil || !slices.Contains(knownTenantsRefreshResults, result) {
+		return
+	}
+	JWKSKnownTenantsRefreshTotal.WithLabelValues(result).Inc()
+}
+
+// SetJWKSKnownTenantsLastRefreshAge sets jwks_known_tenants_last_refresh_age_seconds
+// to ageSeconds. Call with 0.0 on a successful refresh, and with the elapsed
+// seconds since the last success on each subsequent failure tick. Nil-safe.
+func SetJWKSKnownTenantsLastRefreshAge(ageSeconds float64) {
+	if JWKSKnownTenantsLastRefreshAgeSeconds == nil {
+		return
+	}
+	JWKSKnownTenantsLastRefreshAgeSeconds.Set(ageSeconds)
+}
 
 // IncJWKSRateLimited increments jwks_rate_limited_by_bucket_total{bucket}.
 // It does NOT touch the unlabelled JWKSRateLimitedTotal; the handler keeps

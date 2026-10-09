@@ -51,7 +51,7 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 | `make test-ci` | Coverage-instrumented, merged pipeline (what CI runs; CI gates ≥ 98%) |
 | `make test-smoke IMAGE_TAG=… BINARY=…` | Smoke-test a built image |
 | `make lint` / `make arch-lint` | `golangci-lint` (plain + all test tags) / `go-arch-lint` boundary check |
-| `make gates` | `no-gocloak`, `no-secret-log`, `set-local-only`, `gincommon-obs`, `metrics-taxonomy` |
+| `make gates` | Ten invariant gates: `no-gocloak` (TS-INV-1), `no-secret-log` (TS-INV-2), `set-local-only` (RLS-6), `gincommon-obs` (negative: rejects slog/stdlib-log/direct-zap/DefaultRegisterer/hand-rolled TracerProvider), `gincommon-wired` (positive: all 8 required gincommon init functions present in every binary), `pgcommon-obs` (negative: rejects raw pgxpool/pgx.Connect/database/sql), `pgcommon-wired` (positive: ConfigFromEnv/NewPool/GUCSetFromContext/NewLoggerAdapter in every binary), `platform-events-obs` (negative: rejects sqs.ReceiveMessage/sns.Publish), `platform-events-wired` (positive: server wires SNS+outbox; consumer wires SQS+inbox), `metrics-taxonomy` (Tier-1/2/3 prefixes, `_total`/`_seconds` suffixes) |
 | `make metrics-lint` / `make metrics-inventory` | `metricslint` on a real scrape + `metric-registry.md` drift check / regenerate it |
 | `make sast` / `make vuln-check` | `gosec` / `govulncheck ./...` |
 | `make swag` / `make swag-check` | Regenerate / staleness-check `docs/swagger/` |
@@ -120,11 +120,16 @@ dependency rules: [architecture.md](architecture.md).
   `rate_limited` is counted in `jwks_rate_limited_total` and
   `jwks_rate_limited_by_bucket_total{bucket}`. "Known" = the DB list of
   tenants with an `active`/`rotating` credential (reloaded every
-  `JWKS_KNOWN_TENANTS_REFRESH` over the reconciler pool) plus tenants
-  served since the last reload. Expired overlap keys are skipped; an
-  unreadable key counts in `jwks_key_errors_total`; the active key (or
-  every key) unreadable → `503 jwks_keys_unavailable`.
-  `Cache-Control: no-cache`, `nosniff`.
+  `JWKS_KNOWN_TENANTS_REFRESH` over the BYPASSRLS reconciler pool via
+  `withReadOnlyPool`) plus tenants served since the last reload. Expired
+  overlap keys are skipped; an unreadable key counts in
+  `jwks_key_errors_total`; the active key (or every key) unreadable →
+  `503 jwks_keys_unavailable`. `Cache-Control: no-cache`, `nosniff`.
+  `JWKSHandler.Health()` implements the `/readyz` pinger (TS-RP-GAP-001):
+  the pod stays not-ready until the first successful DB refresh so newly
+  provisioned tenants are served from the global bucket immediately.
+  Tracked by `jwks_known_tenants_refresh_total{result}` and
+  `jwks_known_tenants_last_refresh_age_seconds`.
 - **`internal/adapter/inbound/http/{router,middleware}.go`** — 1 MiB body
   cap → gincommon `ObservabilityMiddlewares` (+ 30s `RequestTimeout`) →
   for `/api/v1/internal`: `RequireIdentityHeaders` (exactly one UUID

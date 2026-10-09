@@ -71,7 +71,12 @@ COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... 2>/dev/null | tr '
 # `make lint`, so without it the tagged test files were never checked.
 ALL_TEST_TAGS := integration,e2e
 
-SCHEMA_GOV_IMAGE ?= ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
+SCHEMA_GOV_IMAGE    ?= ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
+# platform-schemagov is published as linux/amd64 only.  On Apple Silicon Docker
+# Desktop uses Rosetta 2 transparently; setting --platform suppresses the
+# platform-mismatch warning and lets `docker pull` succeed without an arm64
+# manifest.  Override to linux/arm64 if/when a multi-arch image is available.
+SCHEMA_GOV_PLATFORM ?= linux/amd64
 
 # -----------------------------
 # SETUP
@@ -124,7 +129,7 @@ help:
 	@echo "  make vet             - go vet (default build + every test build tag)"
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - run go-arch-lint against .go-arch-lint.yml"
-	@echo "  make gates           - invariant gates (no-gocloak, no-secret-log, SET-LOCAL-only, gincommon-obs, metrics-taxonomy)"
+	@echo "  make gates           - invariant gates (no-gocloak, no-secret-log, SET-LOCAL-only, gincommon-obs, gincommon-wired, pgcommon-obs, pgcommon-wired, platform-events-obs, platform-events-wired, metrics-taxonomy)"
 	@echo "  make test            - unit + contract + postgres + integration tests (requires Docker)"
 	@echo "  make test-ci         - test with race detector + coverage (used in CI)"
 	@echo "  make test-unit       - unit tests only (no Docker required)"
@@ -241,9 +246,58 @@ no-secret-log:
 set-local-only:
 	bash .github/scripts/check-set-local-only.sh
 
+# gincommon-obs: NEGATIVE gate — rejects forbidden observability patterns:
+# slog/stdlib-log/direct-zap/DefaultRegisterer/bare promhttp/hand-rolled TracerProvider.
 .PHONY: gincommon-obs
 gincommon-obs:
 	bash .github/scripts/check-gincommon-observability.sh
+
+# gincommon-wired: POSITIVE gate — asserts every cmd binary actually calls the
+# eight required gincommon initialization functions (logger.NewLogger,
+# pgadapter.NewLoggerAdapter, ObservabilityMiddlewares, InitLibraryMetrics,
+# metrics.Register, MetricsHandler, InitTracingWithConfig, NewSpanTracer).
+# Catches a binary added or refactored without complete wiring that the
+# negative gate cannot detect (absences, not forbidden usages).
+.PHONY: gincommon-wired
+gincommon-wired:
+	bash .github/scripts/check-gincommon-wired.sh
+
+# pgcommon-obs: NEGATIVE gate — rejects forbidden database patterns:
+# pgxpool.Connect / pgxpool.New / pgx.Connect / pgxpool.Conn / database/sql.
+# Searches cmd/ and internal/ only; test/ is intentionally excluded (test
+# seeding infrastructure wraps pgcommon.Pool with pgxpool-compatible helpers).
+.PHONY: pgcommon-obs
+pgcommon-obs:
+	bash .github/scripts/check-pgcommon-observability.sh
+
+# pgcommon-wired: POSITIVE gate — asserts every cmd binary actually calls the
+# five required pgcommon database-wiring functions (ConfigFromEnv, a DSN helper,
+# NewPool, GUCSetFromContext, NewLoggerAdapter). Catches a binary added or
+# refactored without complete wiring that the negative gate cannot detect.
+.PHONY: pgcommon-wired
+pgcommon-wired:
+	bash .github/scripts/check-pgcommon-wired.sh
+
+# platform-events-obs: NEGATIVE gate — rejects direct sqs.ReceiveMessage (must
+# use events.SQSConsumer) and sns.Publish / sns.PublishBatch (must go through
+# outbox.Enqueue → outbox.Runner → events.NewSNSPublisher). Allowed exceptions:
+# sqs.SendMessage (DLQ routing), sqs.GetQueueAttributes (DLQ URL resolution),
+# glue.GetSchemaByDefinition (Glue codec startup).
+.PHONY: platform-events-obs
+platform-events-obs:
+	bash .github/scripts/check-platform-events-observability.sh
+
+# platform-events-wired: POSITIVE gate — asserts every cmd binary and the key
+# adapter layers wire events/outbox/dedup through platform-events:
+#   server   — events.NewSNSPublisher + outbox.NewRunner
+#   consumer — events.NewSQSConsumerWithClient + eventcfg.LoadSQS
+#   rotator  — outbox.NewRunner + eventcfg.LoadOutbox
+#   scheduler — eventbusadapter.New (enqueue-only publisher in TxRunner)
+#   eventbus adapter — outbox.Enqueue
+#   postgres adapter — inbox.NewStore
+.PHONY: platform-events-wired
+platform-events-wired:
+	bash .github/scripts/check-platform-events-wired.sh
 
 # Enterprise Platform Observability Standard — naming/namespace-classification
 # gate (Tier-1/2/3 prefixes, counter _total / histogram _seconds suffixes,
@@ -256,7 +310,7 @@ metrics-taxonomy:
 	python3 .github/scripts/check-metrics-taxonomy.py
 
 .PHONY: gates
-gates: no-gocloak no-secret-log set-local-only gincommon-obs metrics-taxonomy
+gates: no-gocloak no-secret-log set-local-only gincommon-obs gincommon-wired pgcommon-obs pgcommon-wired platform-events-obs platform-events-wired metrics-taxonomy
 
 # metrics-lint: platform-gincommon's metricslint over a real /metrics scrape
 # and the alert/dashboard/runbook references, plus the
@@ -476,12 +530,13 @@ cover-func: test-ci
 
 .PHONY: schema-pull
 schema-pull:
-	docker pull "$(SCHEMA_GOV_IMAGE)"
+	docker pull --platform "$(SCHEMA_GOV_PLATFORM)" "$(SCHEMA_GOV_IMAGE)"
 
 .PHONY: extract-schemas
 extract-schemas:
 	@echo "Extracting event schemas from api/asyncapi.yaml..."
 	docker run --rm \
+	  --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" extract \
 	  --asyncapi   api/asyncapi.yaml \
@@ -491,6 +546,7 @@ extract-schemas:
 .PHONY: schema-validate
 schema-validate: extract-schemas
 	docker run --rm \
+	  --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" validate \
 	  --asyncapi   api/asyncapi.yaml \
@@ -503,6 +559,7 @@ schema-diff:
 	  exit 1; \
 	}
 	docker run --rm \
+	  --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" diff \
 	  --current     "$(CURRENT)" \
@@ -524,6 +581,7 @@ schema-register:
 	@rm -rf .tmp/glue-schemas
 	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
 	docker run --rm \
+	  --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
 	  -e AWS_REGION="$(AWS_REGION)" \
@@ -582,6 +640,7 @@ schema-prune:
 	@rm -rf .tmp/glue-schemas
 	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas >/dev/null
 	docker run --rm \
+	  --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
 	  -e AWS_REGION="$(AWS_REGION)" \

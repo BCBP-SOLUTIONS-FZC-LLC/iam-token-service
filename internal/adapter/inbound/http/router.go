@@ -65,6 +65,11 @@ type RouterConfig struct {
 	Postgres Pinger
 	OpenBao  Pinger
 	Outbox   Pinger
+	// JWKS gates /readyz on the known-tenant refresher having completed its
+	// first successful run (TS-RP-GAP-001): until it has, a newly-provisioned
+	// tenant's first Keycloak JWKS fetch would be served from the tighter
+	// unknown-tenant rate-limit bucket instead of the global one.
+	JWKS Pinger
 }
 
 // Router owns the Gin engine for this service.
@@ -110,10 +115,11 @@ type healthHandlers struct {
 	postgres Pinger
 	openbao  Pinger
 	outbox   Pinger
+	jwks     Pinger
 }
 
 func registerInfraRoutes(r *gin.Engine, cfg RouterConfig) {
-	h := &healthHandlers{postgres: cfg.Postgres, openbao: cfg.OpenBao, outbox: cfg.Outbox}
+	h := &healthHandlers{postgres: cfg.Postgres, openbao: cfg.OpenBao, outbox: cfg.Outbox, jwks: cfg.JWKS}
 	// Liveness goes through platform-gincommon (same handler as iam-user-profile).
 	r.GET("/healthz", gincommon.HealthHandler())
 	r.GET("/readyz", h.readyz)
@@ -136,6 +142,7 @@ func (h *healthHandlers) readyz(c *gin.Context) {
 		{"database", h.postgres},
 		{"openbao", h.openbao},
 		{"outbox", h.outbox},
+		{"jwks", h.jwks},
 	}
 
 	type result struct {

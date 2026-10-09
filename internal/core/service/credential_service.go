@@ -289,6 +289,7 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 				Type: domain.EventServiceAccountCredentialIssued, TenantID: tenantID, Actor: actor,
 				Data: domain.ServiceAccountCredentialIssuedPayload{
 					TenantID: tenantID, PrincipalID: principalID, Version: nextVersion,
+					ActorID:  actor,
 					IssuedAt: newCred.IssuedAt.UTC().Format(time.RFC3339),
 				},
 			})
@@ -297,7 +298,8 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 			Type: domain.EventServiceAccountCredentialRotated, TenantID: tenantID, Actor: actor,
 			Data: domain.ServiceAccountCredentialRotatedPayload{
 				TenantID: tenantID, PrincipalID: principalID, Version: nextVersion,
-				PriorVersion: active.Version, ExpiresPriorAt: expiresPrior.UTC().Format(time.RFC3339),
+				PriorVersion: active.Version, ActorID: actor,
+				ExpiresPriorAt: expiresPrior.UTC().Format(time.RFC3339),
 			},
 		})
 	})
@@ -495,7 +497,7 @@ func (s *CredentialService) revokeCredential(ctx context.Context, tenantID, prin
 			Type: domain.EventServiceAccountCredentialRevoked, TenantID: tenantID, Actor: actor,
 			Data: domain.ServiceAccountCredentialRevokedPayload{
 				TenantID: tenantID, PrincipalID: principalID, Version: latest.Version,
-				RevokedAt: now.Format(time.RFC3339),
+				ActorID: actor, RevokedAt: now.Format(time.RFC3339),
 			},
 		})
 	})

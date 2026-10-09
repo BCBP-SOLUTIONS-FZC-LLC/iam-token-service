@@ -132,6 +132,8 @@ shared collectors via `registerShared`) → pools.
 | `keys_refresh_pending` | gauge | — | rows in `keys_refresh_pending`, intents included (server exporter) |
 | `keys_refresh_oldest_age_seconds` | gauge | — | age of the oldest marker (server exporter) |
 | `jwks_key_errors_total` | counter | — | unreadable live keys on the JWKS route |
+| `jwks_known_tenants_refresh_total` | counter | `result` (success/error) | known-tenant refresher runs; ctx-cancelled ticks not counted |
+| `jwks_known_tenants_last_refresh_age_seconds` | gauge | — | seconds since last successful refresh; grows from pod-start on failure ticks; 86400 sentinel on goroutine panic |
 | `jwks_rate_limited_total` | counter | — | any JWKS 429 |
 | `jwks_rate_limited_by_bucket_total` | counter | `bucket` (tenant/global/unknown) | which limiter refused |
 | `processed_events_duplicates_total` | counter | `consumer` | authoritative duplicate signal |
@@ -198,6 +200,8 @@ per alert in `docs/observability/runbooks.md`. Several carry
 | `OrphanMaterialMissing` | critical | `material_reconcile_total{result="missing_material"}` > 0 |
 | `CadenceRotationFailures` | critical | `cadence_rotation_total{result="failed"}` > 0 (often an RP-17 failure; self-heals via the marker) |
 | `JWKSKeyErrors` | critical | `jwks_key_errors_total` > 0 |
+| `JWKSKnownTenantRefreshErrors` | warning | refresh error rate > 50% for 5 min (`jwks_known_tenants_refresh_total`) |
+| `JWKSKnownTenantsStale` | warning | `jwks_known_tenants_last_refresh_age_seconds` > 120 for 5 min (~7 min total latency); gauge = 86400 = goroutine panicked (restart pod) |
 | `JWKSRateLimited` | warning | `jwks_rate_limited_by_bucket_total{bucket!="unknown"}` increase |
 | `RotationOverlapStuck` | warning | `rotation_overlap_active` > 0 for 1h |
 | `KeysRefreshBacklog` | warning | `keys_refresh_oldest_age_seconds` > 900 for 5m |

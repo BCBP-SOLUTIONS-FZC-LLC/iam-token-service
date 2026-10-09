@@ -259,7 +259,7 @@ func main() {
 	// DB-state gauge no request/reconciler path can maintain, refreshed
 	// here from the BYPASSRLS reconciler pool, matching the sibling
 	// exporter-goroutine pattern.
-	go runRotationOverlapExporter(ctx, reconcilerPool, envDuration("ROTATION_OVERLAP_GAUGE_INTERVAL", 30*time.Second), log)
+	go runRotationOverlapExporter(ctx, pgadapter.NewReconcilerRepository(reconcilerPool), envDuration("ROTATION_OVERLAP_GAUGE_INTERVAL", 30*time.Second), log)
 	// iam_rls_violations_total (Tier 2) from rls_violation_log — readable
 	// only by the reconciler role, so it uses the same pool.
 	go runRLSViolationExporter(ctx, pgadapter.NewRLSViolationRepository(reconcilerPool), envDuration("RLS_VIOLATION_EXPORTER_INTERVAL", time.Minute), log)
@@ -282,7 +282,29 @@ func main() {
 		WithRateLimit(envFloat("JWKS_RATE_LIMIT_RPS", 20), envInt("JWKS_RATE_LIMIT_BURST", 40)).
 		WithPerTenantRateLimit(envFloat("JWKS_RATE_LIMIT_PER_TENANT_RPS", 5), envInt("JWKS_RATE_LIMIT_PER_TENANT_BURST", 10)).
 		WithUnknownTenantRateLimit(envFloat("JWKS_RATE_LIMIT_UNKNOWN_TENANT_RPS", 2), envInt("JWKS_RATE_LIMIT_UNKNOWN_TENANT_BURST", 5))
-	go jwksHandler.RunKnownTenantRefresher(ctx, pgadapter.NewJWKSTenantsRepository(reconcilerPool), jwksKnownTenantsRefresh)
+	go func() {
+		// Wrap with recover so a panic in refreshKnownTenants (e.g. a nil
+		// pointer in metrics code) does not silently kill the goroutine. Without
+		// recovery the pod stays Ready (Health() reads lastRefreshedAt which is
+		// still non-zero) but the known-tenant set is permanently frozen and both
+		// monitoring paths go dark. The panic is logged at Error so it pages;
+		// the process is not terminated because the JWKS refresher is not on the
+		// serving-request critical path.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("jwks known-tenant refresher panicked — known-tenant set is frozen until pod restart", map[string]interface{}{
+					"panic": fmt.Sprintf("%v", r),
+				})
+				// Set the staleness gauge to a large sentinel so the
+				// IAMTokenServiceJWKSKnownTenantsStale alert fires on the next
+				// scrape. Without this the gauge stays frozen at 0 (its last
+				// success value) and monitoring is silently blind to the dead
+				// goroutine.
+				metrics.SetJWKSKnownTenantsLastRefreshAge(86400)
+			}
+		}()
+		jwksHandler.RunKnownTenantRefresher(ctx, pgadapter.NewJWKSTenantsRepository(reconcilerPool), jwksKnownTenantsRefresh)
+	}()
 
 	// ── 9. Router ─────────────────────────────────────────────────────────
 	router := httpadapter.NewRouter(httpadapter.RouterConfig{
@@ -317,6 +339,12 @@ func main() {
 				return fmt.Errorf("outbox initializing")
 			}
 		}),
+		// JWKS pinger gates /readyz on the known-tenant refresher having
+		// completed its first successful run (TS-RP-GAP-001): a newly-provisioned
+		// tenant's first Keycloak JWKS fetch must be served from the global
+		// rate-limit bucket, not the tighter unknown-tenant one, so the pod must
+		// not receive traffic until the set is populated.
+		JWKS: withDeadline(readinessCheckTimeout, jwksHandler.Health),
 	})
 
 	// ── 10. Graceful shutdown ─────────────────────────────────────────────

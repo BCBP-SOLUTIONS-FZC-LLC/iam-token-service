@@ -51,11 +51,18 @@ Before this chart is usable in a real environment:
      via an existing Secret (values.database.existingSecretName) — the
      serviceaccount_app / serviceaccount_migrator / serviceaccount_reconciler
      roles must already exist (§4.4).
-  2. Set values.events.topicArn and values.events.glueRegistryName once the
-     iam-serviceaccount-events SNS topic and Glue registry are provisioned
-     (§25). Required outside local/dev/test (the render fails); in
-     local/dev/test an empty topic means a no-op publisher.
-  3. Set values.sqs.queueUrl once tenant-lifecycle-tokensvc-q exists —
+  2. Register Glue event schemas BEFORE installing this chart (TS-RP-GAP-003):
+       make schema-register GLUE_REGISTRY_SERVICEACCOUNT_NAME=<registry>
+     NewGlueCodec resolves each produced schema's version UUID at pod startup
+     and panics if any is not AVAILABLE — a deploy that outran schema
+     registration causes an immediate boot loop. Verify with:
+       make schema-verify GLUE_REGISTRY_SERVICEACCOUNT_NAME=<registry>
+     Then set values.events.glueRegistryName. Required outside local/dev/test
+     (the render fails on an empty value).
+  3. Set values.events.topicArn once the iam-serviceaccount-events SNS topic
+     is provisioned (§25). Required outside local/dev/test (the render fails);
+     in local/dev/test an empty topic means a no-op publisher.
+  4. Set values.sqs.queueUrl once tenant-lifecycle-tokensvc-q exists —
      also required outside local/dev/test.
-  4. Confirm values.openbao.addr / authRole match the OpenBao Kubernetes
+  5. Confirm values.openbao.addr / authRole match the OpenBao Kubernetes
      auth role bound to this chart's ServiceAccount (deploy/openbao/policy.hcl).

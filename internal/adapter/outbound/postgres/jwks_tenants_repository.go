@@ -30,7 +30,7 @@ func NewJWKSTenantsRepository(reconcilerPool *pgcommon.Pool) *JWKSTenantsReposit
 // the tenant count, not the credential count.
 func (r *JWKSTenantsRepository) ListTenantsWithLiveCredentials(ctx context.Context) ([]uuid.UUID, error) {
 	var ids []uuid.UUID
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+	err := withReadOnlyPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT DISTINCT tenant_id FROM service_account_credentials
 			 WHERE status IN ('active', 'rotating') AND deleted_at IS NULL`)
