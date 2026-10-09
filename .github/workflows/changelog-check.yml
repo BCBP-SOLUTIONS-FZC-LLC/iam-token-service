@@ -16,6 +16,9 @@ name: Changelog check
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   changelog:
     name: changelog
@@ -25,6 +28,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: CHANGELOG updated in this PR
         run: |
