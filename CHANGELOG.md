@@ -6,6 +6,28 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Fixed (sixth production-readiness pass, TS-D24 — 2026-10-09)
+
+- **`actor_id` missing from all produced event payloads (TS-RP-GAP-002).** All 5 outbound event payload structs (`ServiceAccountRegistered`, `ServiceAccountCredentialIssued`, `ServiceAccountCredentialRotated`, `ServiceAccountCredentialRevoked`, `ServiceAccountRevoked`) and their Glue JSON schemas now include `actor_id` (UUID, required). The overlap-expiry sweep (`cmd/rotator/sweep.go`) was emitting uuid.Nil as `actor_id` in `ServiceAccountCredentialRevoked` — every cron-sweep-driven revoke carried a zero UUID in the audit trail. Consumed schema (`tenant_memberships_purged.json`) correctly does not carry `actor_id`. All 5 produced schemas updated to `additionalProperties: true` for schema-gov forward-compatibility (pass-5 requirement) and all 6 AsyncAPI messages gain `x-lifecycle: {status: active}`.
+- **JWKS known-tenant readiness gate (TS-RP-GAP-001).** `JWKSHandler.Health()` added as a `/readyz` pinger. The pod stays not-ready until the first successful DB refresh of the known-tenant set. Without this, a freshly started pod served all tenants from the 2 rps unknown-tenant bucket for up to one refresh interval (15s) after receiving traffic, causing Keycloak's post-RP-17 JWKS fetch to be rate-limited. Two new metrics: `jwks_known_tenants_refresh_total{result=success|error}` and `jwks_known_tenants_last_refresh_age_seconds`. Two new alerts: `IAMTokenServiceJWKSKnownTenantRefreshErrors` and `IAMTokenServiceJWKSKnownTenantsStale` (gauge > 120s for 5m, ~7min total latency). Goroutine panic recovery added: sets gauge to 86400 sentinel so the alert fires; error logged at Error level to page on-call.
+- **Glue schema registry required at startup (TS-RP-GAP-003).** `events.glueRegistryName` now required outside local/dev/test by Helm `validate.yaml`. The pod crash-loops if any produced schema is not `AVAILABLE` in Glue before deploy. NOTES.txt documents the required `make schema-register` → `make schema-verify` → `helm upgrade` ordering.
+- **Reconciler-pool SELECT queries used read-write transactions.** All BYPASSRLS reconciler-pool SELECT methods (`ReconcilerRepository` ×4, `JWKSTenantsRepository` ×1) migrated from `withPool` (pgx read-write default) to a new `withReadOnlyPool` helper (`pgx.TxOptions{AccessMode: pgx.ReadOnly}`). Correct access-mode signal to PgBouncer; safe on a read-only Postgres replica.
+- **Metric pre-warming gaps.** `ConsumerDLQRejectsTotal{reason="other"}` was absent from `/metrics` until the first unknown-reason DLQ reject (the fallback bucket `IncConsumerDLQReject` folds to was never pre-warmed). `CadenceRotationTotal{result=rotated|skipped|failed}` was registered but never pre-warmed. Both fixed; `JWKSKnownTenantsLastRefreshAgeSeconds` pre-warmed to 0 at registration so the series always exists.
+- **`IncJWKSKnownTenantsRefresh` lacked a label vocabulary guard.** Unlike `IncJWKSRateLimited` and `IncCredentialReplay`, the new helper did not validate the `result` string against the closed set `{success, error}`. An unknown value would silently create a new Prometheus label series. Fixed with a `slices.Contains` guard matching the established pattern.
+- **`TestHelpers_NilCollectorsAreNoops` incomplete.** The nil-guard contract test did not cover `SetJWKSKnownTenantsLastRefreshAge` or `IncJWKSKnownTenantsRefresh`. Both helpers added to the test.
+
+### Changed (TS-D24)
+
+- **Go 1.26.6 → 1.26.9** — fixes 12 stdlib CVEs (GO-2026-6589..GO-2026-6600 in `html/template` and `net/http`) and 5 http2 CVEs in `golang.org/x/net` (GO-2026-6603..GO-2026-6617). `govulncheck` clean on all production packages. All direct AWS SDK, OTel, prometheus/client_golang, and openbao/api dependencies updated to latest patch/minor.
+- **Ten CI enforcement gates** (was 5). Six new gates added to `make gates` in two negative+positive pairs per platform library: `gincommon-wired`, `pgcommon-obs`, `pgcommon-wired`, `platform-events-obs`, `platform-events-wired`. Negative gates reject forbidden bypass patterns; positive gates assert required wiring is present in every binary.
+- **CI pipeline aligned with iam-user-profile.** `validate-quality.yml` adds `CI_REPO_READ_TOKEN` fallback to checkout, switches `go mod tidy` → `make tidy`. `setup-go` updated to v7.0.0 (SHA-pinned) across `validate-quality.yml`, `validate-test.yml`, and `release.yml`. `changelog-check.yml` adds `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` env and `CI_REPO_READ_TOKEN` checkout token.
+- **`make schema-pull/validate/register/prune` now work on Apple Silicon** — `SCHEMA_GOV_PLATFORM=linux/amd64` variable added; `--platform` flag propagated to all `docker pull` and `docker run` schema-gov calls.
+
+### Added (TS-D24)
+
+- **Runbook updated for `IAMTokenServiceJWKSKnownTenantsStale`.** Distinguishes goroutine-dead case (gauge=86400, refresh-counter rate=0 → restart pod) from sustained-DB-outage case (gauge growing → fix DB connectivity).
+- **LLD TS-D24 Decision Register entry** documenting all 7 change categories. `JWKSHandler.Health(ctx)` added to the pgcommon table. `asyncapi.yaml`, `README.md`, `.claude/{CLAUDE,api-events,operations}.md`, `docs/observability/{README,runbooks,metric-registry}.md` updated to reflect current state.
+
 ### Dependencies
 
 - platform-events/v2 v2.0.0 → v2.1.0 (additive: SQS consumer retry backoff, `SQS_RETRY_BACKOFF` / `SQS_MAX_RETRY_BACKOFF`).
