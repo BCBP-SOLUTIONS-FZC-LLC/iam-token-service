@@ -36,11 +36,11 @@ name: CI
 
 "on":
   push:
-    branches: [main]
-    paths-ignore: ['**.md']
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/architecture/**']
   pull_request:
-    branches: [main]
-    paths-ignore: ['**.md']
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/architecture/**']
   workflow_dispatch:
 
 permissions:
@@ -85,6 +85,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Hadolint
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
@@ -151,6 +153,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -190,6 +194,7 @@ jobs:
           exit-code: '1'
           severity: CRITICAL,HIGH,UNKNOWN
           ignore-unfixed: true
+          trivyignores: .trivyignore
           cache-dir: /tmp/trivy-cache
 
       # SARIF format: uploads to GitHub Security tab.
@@ -240,6 +245,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -302,6 +309,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Post or update summary comment
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
@@ -331,6 +340,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       # The value build-image used, so this rebuild is the image trivy/smoke
       # tested (exported to the env too, as buildx reads it from there).
