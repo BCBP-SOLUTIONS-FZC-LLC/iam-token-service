@@ -143,6 +143,21 @@ func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 	return port.TxFromContext(ctx)
 }
 
+// withReadOnlyPool runs fn inside a read-only transaction on pool. It is the
+// correct helper for the BYPASSRLS reconciler pool (no GUCProvider, pure
+// SELECT queries) — read-only access mode signals intent, avoids acquiring a
+// write-mode advisory slot on PgBouncer, and is safe on a read-only replica.
+// Like withPool it joins an existing tx when one is present in ctx (e.g. test
+// fakes), though in production reconciler callers never carry a service tx.
+func withReadOnlyPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) error {
+	if tx, ok := port.TxFromContext(ctx); ok {
+		return wrapConnErrCtx(ctx, fn(tx))
+	}
+	return wrapConnErrCtx(ctx, pgcommon.RunInTx(ctx, pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(_ context.Context, tx pgx.Tx) error {
+		return fn(tx)
+	}))
+}
+
 // withPool runs fn inside a transaction, joining an existing one if present
 // in ctx. Used by repository helpers so a read outside a service tx still
 // binds RLS via pgcommon.RunInTx's checkout hook.

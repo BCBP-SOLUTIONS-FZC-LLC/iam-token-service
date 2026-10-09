@@ -204,7 +204,8 @@ func (c *OffboardingConsumer) cascade(ctx context.Context, tenantID uuid.UUID) e
 		if err := pub.Enqueue(ctx, &domain.Event{
 			Type: domain.EventServiceAccountRevoked, TenantID: tenantID, Actor: domain.SystemPrincipalID,
 			Data: domain.ServiceAccountRevokedPayload{
-				TenantID: tenantID, PrincipalID: p.ID, RevokedAt: now,
+				TenantID: tenantID, PrincipalID: p.ID,
+				ActorID: domain.SystemPrincipalID, RevokedAt: now,
 			},
 		}); err != nil {
 			return err

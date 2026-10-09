@@ -6,7 +6,7 @@ Common starting points:
 
 - Rollouts: `count by (version) (platform_build_info{service="iam-token-service",environment="$environment"})`
 - Logs (Loki): `{service="iam-token-service"} | json`, then follow `trace_id` into Tempo. Logs carry `tenant_id` / `principal_id` / `version`, never key material (TS-INV-2).
-- Readiness: `GET /readyz` on the server checks Postgres and OpenBao concurrently.
+- Readiness: `GET /readyz` on the server checks Postgres, OpenBao, and the JWKS known-tenant refresher concurrently. The pod is not Ready until the refresher completes its first successful DB query (TS-RP-GAP-001): a newly-provisioned tenant's first Keycloak JWKS fetch must be served from the global rate-limit bucket, not the tighter unknown-tenant one. Track refresh failures with `iam_token_service_jwks_known_tenants_refresh_total{result="error"}` (alert: `IAMTokenServiceJWKSKnownTenantRefreshErrors`).
 - Binaries: `server` (TS-1..TS-6, JWKS), `consumer` (offboarding cascade), `rotator` and `scheduler` (CronJobs; Prometheus `job` = `iam-token-service-<binary>`).
 - Labels: the alerts that select on `service="iam-token-service"` (`IAMTokenServiceOutboxStuck`, `IAMTokenServiceOutboxBacklogGrowing`, `IAMTokenServiceSQSReceiveErrors`, `IAMTokenServicePostgresPoolExhaustion`) depend on the series keeping their own `service` label, so the ServiceMonitor and PodMonitor set `honorLabels: true`. Without it the Prometheus Operator's `service=<Kubernetes Service name>` target label wins, the series' label is renamed `exported_service`, and those alerts can never fire. If one of them looks silent, check a raw series for `exported_service`.
 - Owed RP-17 refreshes: `SELECT * FROM keys_refresh_pending;` (one row per tenant whose Keycloak key cache still needs a refresh, with `requested_at`). The rotator and the scheduler write a row with every revoke/rotation, clear it when RP-17 succeeds, and retry owed rows at the start of each run: committed rows (`intent_until` NULL) at once, the scheduler's pre-rotation intent rows only after their `intent_until` passes. A row that keeps getting older means RP-17 is still failing for that tenant. The server exports the backlog as `iam_token_service_keys_refresh_pending` (rows) and `iam_token_service_keys_refresh_oldest_age_seconds` (every `KEYS_REFRESH_EXPORTER_INTERVAL`, Helm `exporters.keysRefreshInterval`, default 30s); `IAMTokenServiceKeysRefreshBacklog` alerts on the age.
@@ -115,6 +115,34 @@ Common starting points:
 **Triage.** Is it one tenant or all? Many tenants at once means OpenBao itself (seal status, the Kubernetes-auth login, network policy egress; `IAMTokenServiceOpenBaoCallLatencyHigh`), and recovers by itself when OpenBao does. Server logs: `jwks: skipping unreadable credential` gives `tenant_id`, `principal_id`, `credential_id` and `version`. Read the OpenBao entry at that credential's path (`iam/serviceaccount/<tenant_id>/<keycloak_client_id>/v<version>`): missing (see `IAMTokenServiceOrphanMaterialMissing`), unreadable (policy), or not a valid PEM RSA key.
 
 **Mitigate.** Rotate the credential (TS-1 with a new `rotation_id`), then call RP-17 so Keycloak drops its cached keys. Never copy key material by hand.
+
+### IAMTokenServiceJWKSKnownTenantRefreshErrors
+
+**Meaning.** The JWKS handler's known-tenant refresher (`RunKnownTenantRefresher`) is failing its periodic database query (`iam_token_service_jwks_known_tenants_refresh_total{result="error"}` sustained over 5 minutes). A failed refresh keeps the previous known-tenant set (so existing tenants stay in the global rate-limit bucket), but new tenants provisioned since the last successful refresh will be served from the tighter unknown-tenant bucket until a refresh succeeds. Before the very first successful refresh, `/readyz` returns 503 and the pod does not receive traffic (TS-RP-GAP-001), so a fresh deployment that never succeeds its first refresh will fire `IAMTokenServiceServerDown` / `IAMTokenServiceServerReplicasMissing` before this alert.
+
+**Triage.** Server logs for `jwks: known-tenant refresh failed; keeping the previous set` — the error field names the cause. Check Postgres pool health (`IAMTokenServicePostgresPoolExhaustion`), the reconciler pool specifically (the refresher uses the BYPASSRLS pool). If `iam_token_service_jwks_known_tenants_refresh_total{result="ok"}` is zero since last restart, the pod has never been Ready; `kubectl get pod -o yaml` for failed readiness probes.
+
+**Mitigate.** Restore DB connectivity. The refresher retries every `JWKS_KNOWN_TENANTS_REFRESH` (default 15 s) with no operator action needed; the alert clears once the rate drops.
+
+### IAMTokenServiceJWKSKnownTenantsStale
+
+**Meaning.** The JWKS known-tenant refresher last succeeded over 2 minutes ago (`iam_token_service_jwks_known_tenants_last_refresh_age_seconds > 120` for 5 minutes). The pod is still Ready and serving requests (the previous known-tenant set is kept by design — a DB blip must not demote every real tenant at once). However, any tenant provisioned since the last successful refresh is being served from the unknown-tenant rate-limit bucket (2 rps / burst 5) instead of the global one (20 rps / burst 40). A rate-limited Keycloak JWKS fetch right after RP-17 would block that tenant's automation credentials. Sustained DB outage after startup is the typical cause.
+
+**Triage — distinguish the two root causes before acting:**
+
+*Sustained DB outage (common):*
+- `iam_token_service_jwks_known_tenants_refresh_total{result="error"}` rate is elevated (>0 over the last 5 minutes).
+- Server logs contain `"jwks: known-tenant refresh failed; keeping the previous set"`.
+- The gauge value is growing in ~15 s steps, not a round number.
+- **Action:** restore DB / reconciler-pool connectivity (`IAMTokenServicePostgresPoolExhaustion`, `platform_db_pool_acquires_total{pool="reconciler"}`). The refresher retries automatically; the alert clears when the next tick succeeds.
+
+*Refresher goroutine dead (less common):*
+- `iam_token_service_jwks_known_tenants_refresh_total{result="error"}` rate is **0** (counter has stopped incrementing — the goroutine is no longer running).
+- The gauge is frozen at exactly **86400** (a sentinel value set by the panic-recovery handler, not an actual measured age).
+- Server Error log contains `"jwks known-tenant refresher panicked"` with a `panic` field naming the cause.
+- **Action:** the known-tenant set is permanently frozen and will not recover on its own. **Restart the pod** (`kubectl rollout restart deployment iam-token-service-server`). DB connectivity is not the issue; investigate the panic field in the log for the underlying code bug.
+
+**Mitigate.** After identifying the root cause above: restore DB connectivity for a DB outage; restart the pod for a dead goroutine.
 
 ### IAMTokenServiceJWKSRateLimited
 

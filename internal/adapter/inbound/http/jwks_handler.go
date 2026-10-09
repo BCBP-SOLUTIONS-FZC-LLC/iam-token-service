@@ -3,8 +3,10 @@ package http
 import (
 	"container/list"
 	"context"
+	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -69,6 +71,18 @@ type JWKSHandler struct {
 	known          *knownTenants
 
 	log port.Logger // optional; RunKnownTenantRefresher's failure log
+
+	// lastRefreshedAt is the Unix nanosecond timestamp of the last successful
+	// known-tenant DB refresh. 0 means no successful refresh yet. Used by
+	// Health() (zero → pod not-ready, TS-RP-GAP-001) and by exportRefreshAge
+	// (growing age → staleness gauge and alert).
+	lastRefreshedAt atomic.Int64
+	// startedAt is the Unix nanosecond timestamp when this handler was
+	// constructed. Used by exportRefreshAge as the age reference before the
+	// first successful refresh so the staleness gauge grows from pod start,
+	// not from the first error tick — ensuring the alert fires even when the
+	// DB has been unreachable for the entire pod lifetime.
+	startedAt int64
 }
 
 // Unknown-tenant bucket defaults (JWKS_RATE_LIMIT_UNKNOWN_TENANT_RPS /
@@ -83,10 +97,15 @@ const (
 // is given a non-positive one (JWKS_KNOWN_TENANTS_REFRESH's default).
 const DefaultKnownTenantsRefresh = 15 * time.Second
 
+// errJWKSNotReady is the sentinel error Health() returns before the first
+// successful known-tenant refresh — a static value so callers can use
+// errors.Is and the /readyz handler allocates nothing per probe.
+var errJWKSNotReady = errors.New("jwks known-tenant set not yet populated")
+
 // NewJWKSHandler constructs a JWKSHandler. No rate limit is applied unless
 // WithRateLimit is also called.
 func NewJWKSHandler(svc JWKSService) *JWKSHandler {
-	return &JWKSHandler{svc: svc, known: newKnownTenants(maxTrackedTenants)}
+	return &JWKSHandler{svc: svc, known: newKnownTenants(maxTrackedTenants), startedAt: time.Now().UnixNano()}
 }
 
 // RunKnownTenantRefresher keeps the known-tenant set in step with the
@@ -119,14 +138,47 @@ func (h *JWKSHandler) refreshKnownTenants(ctx context.Context, src KnownTenantSo
 	started := h.known.now()
 	ids, err := src.ListTenantsWithLiveCredentials(ctx)
 	if err != nil {
-		if ctx.Err() == nil && h.log != nil {
-			h.log.Warn("jwks: known-tenant refresh failed; keeping the previous set", map[string]interface{}{
-				"error": err.Error(),
-			})
+		if ctx.Err() == nil {
+			metrics.IncJWKSKnownTenantsRefresh(metrics.OutcomeError)
+			h.exportRefreshAge()
+			if h.log != nil {
+				h.log.Warn("jwks: known-tenant refresh failed; keeping the previous set", map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
 		}
 		return
 	}
 	h.known.replace(ids, started)
+	h.lastRefreshedAt.Store(time.Now().UnixNano())
+	metrics.IncJWKSKnownTenantsRefresh(metrics.OutcomeSuccess)
+	metrics.SetJWKSKnownTenantsLastRefreshAge(0)
+}
+
+// Health implements the Pinger interface used by /readyz (TS-RP-GAP-001).
+// It returns an error until the known-tenant refresher has completed at
+// least one successful database query, ensuring that a newly-provisioned
+// tenant's first Keycloak JWKS fetch is served from the global bucket
+// (not the tighter unknown-tenant one) as soon as the pod becomes Ready.
+func (h *JWKSHandler) Health(_ context.Context) error {
+	if h.lastRefreshedAt.Load() == 0 {
+		return errJWKSNotReady
+	}
+	return nil
+}
+
+// exportRefreshAge sets the jwks_known_tenants_last_refresh_age_seconds gauge
+// to the elapsed seconds since the last successful refresh (or since pod
+// start when no refresh has ever succeeded). Called on every non-shutdown
+// failure tick so the gauge grows by the refresh interval for each consecutive
+// failure — including the pre-ready startup window — providing an alertable
+// staleness signal even when the DB has been unreachable from the beginning.
+func (h *JWKSHandler) exportRefreshAge() {
+	ref := h.lastRefreshedAt.Load()
+	if ref == 0 {
+		ref = h.startedAt // pod start is the reference before the first success
+	}
+	metrics.SetJWKSKnownTenantsLastRefreshAge(float64(time.Now().UnixNano()-ref) / 1e9)
 }
 
 // WithRateLimit installs the global token bucket on the JWKS route and

@@ -56,6 +56,7 @@ func TestValidatingCodec_Encode_ValidPayloadPassesThroughToInner(t *testing.T) {
 		"principal_sub": "33333333-3333-3333-3333-333333333333",
 		"keycloak_client_id": "platform-automation",
 		"principal_type": "platform_automation",
+		"actor_id": "00000000-0000-0000-0000-0000000000a1",
 		"created_at": "2026-01-01T00:00:00Z"
 	}`)
 
@@ -86,6 +87,7 @@ func TestValidatingCodec_Encode_ServiceAccountRegisteredClientIDShapes(t *testin
 			"principal_sub": "33333333-3333-3333-3333-333333333333",
 			"keycloak_client_id": "` + clientID + `",
 			"principal_type": "platform_automation",
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"created_at": "2026-01-01T00:00:00Z"
 		}`)
 		_, _, err := c.Encode(context.Background(), "ServiceAccountRegistered", payload)
@@ -183,12 +185,14 @@ func TestValidatingCodec_Encode_ValidPayloadForEveryProducedEvent(t *testing.T) 
 			"principal_sub": "33333333-3333-3333-3333-333333333333",
 			"keycloak_client_id": "platform-automation",
 			"principal_type": "platform_automation",
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"created_at": "2026-01-01T00:00:00Z"
 		}`,
 		"ServiceAccountCredentialIssued": `{
 			"tenant_id": "11111111-1111-1111-1111-111111111111",
 			"principal_id": "22222222-2222-2222-2222-222222222222",
 			"version": 1,
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"issued_at": "2026-01-01T00:00:00Z"
 		}`,
 		"ServiceAccountCredentialRotated": `{
@@ -196,17 +200,20 @@ func TestValidatingCodec_Encode_ValidPayloadForEveryProducedEvent(t *testing.T) 
 			"principal_id": "22222222-2222-2222-2222-222222222222",
 			"version": 2,
 			"prior_version": 1,
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"expires_prior_at": "2026-01-01T00:00:00Z"
 		}`,
 		"ServiceAccountCredentialRevoked": `{
 			"tenant_id": "11111111-1111-1111-1111-111111111111",
 			"principal_id": "22222222-2222-2222-2222-222222222222",
 			"version": 1,
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"revoked_at": "2026-01-01T00:00:00Z"
 		}`,
 		"ServiceAccountRevoked": `{
 			"tenant_id": "11111111-1111-1111-1111-111111111111",
 			"principal_id": "22222222-2222-2222-2222-222222222222",
+			"actor_id": "00000000-0000-0000-0000-0000000000a1",
 			"revoked_at": "2026-01-01T00:00:00Z"
 		}`,
 	}

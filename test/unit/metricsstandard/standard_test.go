@@ -68,6 +68,8 @@ func TestStandard_LibrariesShareRegistryCollectors(t *testing.T) {
 		"platform_duplicate_messages_total",
 		"iam_token_service_credentials_issued_total",
 		"iam_token_service_jwks_key_errors_total",
+		"iam_token_service_jwks_known_tenants_refresh_total",
+		"iam_token_service_jwks_known_tenants_last_refresh_age_seconds",
 		"iam_token_service_cadence_rotation_total",
 		"iam_token_service_jwks_rate_limited_by_bucket_total",
 		"iam_token_service_credential_replays_total",
@@ -100,9 +102,14 @@ func exerciseEveryCollector() {
 	metrics.RotationOverlapActive.Set(0)
 	for _, op := range []string{"write", "delete"} {
 		metrics.OpenBaoCallDuration.WithLabelValues(op).Observe(0.01)
+	}
+	for _, op := range []string{"write", "delete", "read", "list"} {
 		for _, outcome := range []string{metrics.OutcomeSuccess, metrics.OutcomeError} {
 			metrics.DependencyRequestDuration.WithLabelValues(metrics.DependencyOpenBao, op, outcome).Observe(0.01)
 		}
+	}
+	for _, outcome := range []string{metrics.OutcomeSuccess, metrics.OutcomeError} {
+		metrics.DependencyRequestDuration.WithLabelValues(metrics.DependencyRealmProvisioner, metrics.OperationRefreshKeys, outcome).Observe(0.01)
 	}
 	for _, result := range []string{"ok", "error"} {
 		metrics.OffboardingCascadeTotal.WithLabelValues(result).Inc()
@@ -115,6 +122,10 @@ func exerciseEveryCollector() {
 		metrics.CadenceRotationTotal.WithLabelValues(result).Inc()
 	}
 	metrics.JWKSKeyErrorsTotal.Inc()
+	for _, result := range []string{metrics.OutcomeSuccess, metrics.OutcomeError} {
+		metrics.IncJWKSKnownTenantsRefresh(result)
+	}
+	metrics.SetJWKSKnownTenantsLastRefreshAge(0)
 	metrics.JWKSRateLimitedTotal.Inc()
 	for _, b := range []string{metrics.JWKSBucketTenant, metrics.JWKSBucketGlobal, metrics.JWKSBucketUnknown} {
 		metrics.IncJWKSRateLimited(b)

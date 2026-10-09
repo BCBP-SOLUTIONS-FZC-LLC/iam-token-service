@@ -78,6 +78,48 @@ func TestRouter_Readyz(t *testing.T) {
 		_, present := body.Checks["database"]
 		assert.False(t, present)
 	})
+
+	// TS-RP-GAP-001: JWKS known-tenant pinger is included in /readyz.
+	t.Run("jwks not yet refreshed — 503", func(t *testing.T) {
+		r := NewRouter(RouterConfig{
+			GinConfig: testGinConfig,
+			Handlers:  Handlers{Principal: NewPrincipalHandler(&fakePrincipalService{}), Credential: NewCredentialHandler(&fakeCredentialService{})},
+			Postgres:  fakePinger{},
+			OpenBao:   fakePinger{},
+			Outbox:    fakePinger{},
+			JWKS:      fakePinger{healthErr: assert.AnError},
+		})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/readyz", nil, nil)
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		var body struct {
+			Status string            `json:"status"`
+			Checks map[string]string `json:"checks"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		assert.Equal(t, "not ready", body.Status)
+		assert.Equal(t, "down", body.Checks["jwks"])
+		assert.Equal(t, "ok", body.Checks["database"])
+	})
+
+	t.Run("jwks refreshed — included as ok", func(t *testing.T) {
+		r := NewRouter(RouterConfig{
+			GinConfig: testGinConfig,
+			Handlers:  Handlers{Principal: NewPrincipalHandler(&fakePrincipalService{}), Credential: NewCredentialHandler(&fakeCredentialService{})},
+			Postgres:  fakePinger{},
+			OpenBao:   fakePinger{},
+			Outbox:    fakePinger{},
+			JWKS:      fakePinger{},
+		})
+		rec := doRequest(t, r.Handler(), http.MethodGet, "/readyz", nil, nil)
+		require.Equal(t, http.StatusOK, rec.Code)
+		var body struct {
+			Status string            `json:"status"`
+			Checks map[string]string `json:"checks"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		assert.Equal(t, "ready", body.Status)
+		assert.Equal(t, "ok", body.Checks["jwks"])
+	})
 }
 
 func TestRouter_DocsSurface_Gating(t *testing.T) {

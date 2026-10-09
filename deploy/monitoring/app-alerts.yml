@@ -404,6 +404,59 @@ groups:
             (tenant_id/principal_id/credential_id/version), OpenBao health,
             and the OpenBao entry at that credential's path.
 
+      # ── JWKS known-tenant refresher errors ────────────────────────────
+      #    Failure to list live tenants keeps the previous set, so existing
+      #    tenants stay in the global bucket, but new ones (provisioned after
+      #    the last refresh) land in the tighter unknown-tenant bucket until
+      #    a refresh succeeds. Before the first successful refresh the pod is
+      #    not-ready (TS-RP-GAP-001), so IAMTokenServiceServerDown fires
+      #    first. A sustained post-startup error rate is the alert's purpose.
+      - alert: IAMTokenServiceJWKSKnownTenantRefreshErrors
+        expr: |
+          sum by (domain, service, environment) (rate(iam_token_service_jwks_known_tenants_refresh_total{job="iam-token-service-server", result="error"}[5m]))
+            /
+          sum by (domain, service, environment) (rate(iam_token_service_jwks_known_tenants_refresh_total{job="iam-token-service-server"}[5m]))
+          > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-token-service JWKS known-tenant refresher is failing
+          description: >-
+            {{ $value | humanizePercentage }} of JWKS known-tenant refresher runs
+            have errored over the last 5 minutes. New tenants provisioned since
+            the last successful refresh will be served from the unknown-tenant
+            rate-limit bucket until this recovers. Check Postgres (reconciler pool)
+            health and server logs for "jwks: known-tenant refresh failed".
+
+      # ── JWKS known-tenant set gone stale (sustained DB outage) ────────
+      #    The staleness gauge grows from pod start (before the first success)
+      #    or from the last successful refresh. The alert fires when the gauge
+      #    exceeds 120 s (2 min / ~8 ticks @ 15 s default interval) AND holds
+      #    that condition for a further 5 min (for: 5m), giving a total fire
+      #    latency of ~7 min after the first failure. During a DB outage new
+      #    tenants are served from the tighter unknown-tenant bucket (2 rps)
+      #    instead of the global one (20 rps), delaying Keycloak's JWKS fetch
+      #    after RP-17. The pod stays Ready to avoid cascade pod-restarts; the
+      #    previous known-tenant set is preserved (deliberate: a DB blip must
+      #    not demote every real tenant at once).
+      - alert: IAMTokenServiceJWKSKnownTenantsStale
+        expr: |
+          max by (domain, service, environment) (iam_token_service_jwks_known_tenants_last_refresh_age_seconds{job="iam-token-service-server"}) > 120
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-token-service JWKS known-tenant set has not been refreshed for over 7 minutes
+          description: >-
+            The JWKS known-tenant refresher last succeeded {{ $value | humanizeDuration }} ago.
+            New tenants provisioned since then are served from the unknown-tenant rate-limit bucket
+            (2 rps) instead of the global one (20 rps), which may delay Keycloak's JWKS fetch
+            after RP-17. Check the reconciler pool's DB connectivity and
+            iam_token_service_jwks_known_tenants_refresh_total{result="error"} rate.
+
       # ── JWKS route rate limiting (per-tenant or global) ─────────────
       #    By bucket: a flood of unknown/random tenant ids is absorbed by
       #    the shared "unknown" bucket and never reaches a real tenant's

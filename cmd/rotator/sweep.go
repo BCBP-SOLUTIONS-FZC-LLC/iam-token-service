@@ -208,7 +208,8 @@ func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepos
 		return pub.Enqueue(ctx, &domain.Event{
 			Type: domain.EventServiceAccountCredentialRevoked, TenantID: row.TenantID, Actor: domain.SystemPrincipalID,
 			Data: domain.ServiceAccountCredentialRevokedPayload{
-				TenantID: row.TenantID, PrincipalID: row.PrincipalID, Version: row.Version, RevokedAt: now.Format(time.RFC3339),
+				TenantID: row.TenantID, PrincipalID: row.PrincipalID, Version: row.Version,
+				ActorID: domain.SystemPrincipalID, RevokedAt: now.Format(time.RFC3339),
 			},
 		})
 	})

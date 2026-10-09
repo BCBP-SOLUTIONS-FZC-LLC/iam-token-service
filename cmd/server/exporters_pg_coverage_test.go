@@ -97,8 +97,9 @@ func TestRefreshRotationOverlapGauge_CountsLiveRotatingAndKeepsLastOnError(t *te
 	pool := migratedPool(t)
 	seedCredentials(t, pool)
 
+	repo := pgadapter.NewReconcilerRepository(pool)
 	metrics.RotationOverlapActive.Set(-1)
-	refreshRotationOverlapGauge(t.Context(), pool, nil)
+	refreshRotationOverlapGauge(t.Context(), repo, nil)
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.RotationOverlapActive), 0,
 		"exactly one rotating row with an overlap expiry")
 
@@ -107,15 +108,15 @@ func TestRefreshRotationOverlapGauge_CountsLiveRotatingAndKeepsLastOnError(t *te
 	pool.Close()
 	log := &warnLogger{}
 	ctx, traceID := tracedCtx(t)
-	refreshRotationOverlapGauge(ctx, pool, log)
-	refreshRotationOverlapGauge(t.Context(), pool, nil) // nil logger: silent
+	refreshRotationOverlapGauge(ctx, repo, log)
+	refreshRotationOverlapGauge(t.Context(), repo, nil) // nil logger: silent
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.RotationOverlapActive), 0)
 	warns, fields := log.snapshot()
 	require.Equal(t, []string{"rotation overlap exporter: query failed"}, warns)
 	assert.NotEmpty(t, fields[0]["error"])
 	assert.Equal(t, traceID, fields[0]["trace_id"])
 
-	refreshRotationOverlapGauge(t.Context(), pool, log)
+	refreshRotationOverlapGauge(t.Context(), repo, log)
 	_, fields = log.snapshot()
 	require.Len(t, fields, 2)
 	assert.NotContains(t, fields[1], "trace_id")
@@ -125,11 +126,12 @@ func TestRunRotationOverlapExporter_RefreshesUntilCancelled(t *testing.T) {
 	metrics.Register("test")
 	pool := migratedPool(t)
 
+	repo := pgadapter.NewReconcilerRepository(pool)
 	metrics.RotationOverlapActive.Set(-1)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		runRotationOverlapExporter(ctx, pool, 5*time.Millisecond, nil)
+		runRotationOverlapExporter(ctx, repo, 5*time.Millisecond, nil)
 		close(done)
 	}()
 	require.Eventually(t, func() bool { return testutil.ToFloat64(metrics.RotationOverlapActive) == 0 },

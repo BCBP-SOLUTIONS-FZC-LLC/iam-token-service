@@ -3,7 +3,7 @@
 **Custodian of the platform-automation service account's rotating credential material** for the Tender Management SaaS Platform's IAM subsystem. It issues, rotates and revokes the per-tenant `platform-automation` Keycloak client's RSA-2048 signing keys, keeps the private-key plaintext only in OpenBao (never Postgres), serves the public half to Keycloak as a JWK Set, and runs the tenant-offboarding credential cleanup cascade.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service`
-**Module:** Go 1.26.6. Four binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) built into one distroless image and deployed by one Helm chart (2 Deployments, 2 CronJobs, 1 migrate hook Job).
+**Module:** Go 1.26.9. Four binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) built into one distroless image and deployed by one Helm chart (2 Deployments, 2 CronJobs, 1 migrate hook Job).
 **Design:** [`docs/lld/iam-lld-token-service.md`](docs/lld/iam-lld-token-service.md) (rev 1.4, Approved). This README and `ARCHITECTURE.md` summarise it. The LLD wins on any discrepancy; the recent hardening passes are recorded there as §22 TS-D21, TS-D22 and TS-D23.
 
 ---
@@ -74,7 +74,8 @@ Seven routes, all registered in `internal/adapter/inbound/http/router.go` (`NewR
 - **TS-1..TS-6** accept exactly one caller identity: `x-user-id` = the reserved iam-system principal `00000000-0000-0000-0000-0000000000a1`, and `x-tenant-id` = the path tenant. There is no operator-vs-system distinction. Which caller may reach which route is enforced at the mesh: NetworkPolicy (L4) plus the Istio `AuthorizationPolicy` (L7), which is required outside dev (see [Security](#security)).
 - **Middleware chain:** 1 MB body cap → `gincommon.ObservabilityMiddlewares` (ends with the 30s request timeout, so metrics, logs and spans record the same `503` the client gets) → on the protected group only: `RequireIdentityHeaders` (`401 missing_identity_headers` for a missing, repeated or non-UUID `x-user-id`/`x-tenant-id`; it also drops `x-tenant-roles`, which this service never reads) → `gincommon.ProtectedMiddlewares` → `GUCBridgeMiddleware` (rejects any principal other than iam-system, binds `SET LOCAL app.tenant_id`) → `RequireJSONContentType` → `RequireTenantPathMatch` (`403 tenant_path_mismatch`, never silently corrected).
 - **The JWKS route** has no header auth by design: Keycloak's outbound fetch carries no caller identity. RLS is bound from the path tenant instead. It is protected by rate limits and, in deployed environments, by the `AuthorizationPolicy` that admits Keycloak to this one path only.
-  - Rate limits: every request spends its per-tenant bucket (`JWKS_RATE_LIMIT_PER_TENANT_*`, 5 rps / burst 10, bounded LRU) plus a shared bucket. **Known** tenants (an active or rotating credential, reloaded from Postgres every `JWKS_KNOWN_TENANTS_REFRESH`, 15s, plus tenants served since the last reload) spend the global bucket (20/40). **Unknown** tenants spend only the unknown-tenant bucket (2/5), so a flood of random tenant ids cannot starve Keycloak's real fetches. A refusal is `429 rate_limited`.
+  - **Known-tenant set:** reloaded from Postgres every `JWKS_KNOWN_TENANTS_REFRESH` (15s) over the BYPASSRLS reconciler pool. The pod blocks `/readyz` until the first reload completes (TS-RP-GAP-001), ensuring a newly-provisioned tenant's first Keycloak JWKS fetch is served from the global bucket, not the tighter unknown-tenant one. Tracked by `iam_token_service_jwks_known_tenants_refresh_total{result=success|error}` and `iam_token_service_jwks_known_tenants_last_refresh_age_seconds`. The alert `IAMTokenServiceJWKSKnownTenantsStale` fires when age > 120 s for 5 minutes.
+  - Rate limits: every request spends its per-tenant bucket (`JWKS_RATE_LIMIT_PER_TENANT_*`, 5 rps / burst 10, bounded LRU) plus a shared bucket. **Known** tenants (reloaded set plus tenants served since the last reload) spend the global bucket (20/40). **Unknown** tenants spend only the unknown-tenant bucket (2/5), so a flood of random tenant ids cannot starve Keycloak's real fetches. A refusal is `429 rate_limited`.
   - Responses: `200` with the active and in-overlap keys (expired overlap keys are skipped). `503 jwks_keys_unavailable` when the active key, or every key, cannot be read from OpenBao, so Keycloak keeps its cached keys rather than caching a set without the current key. A set missing only rotating keys is still `200`, counted in `iam_token_service_jwks_key_errors_total`. Headers: `Cache-Control: no-cache`, `X-Content-Type-Options: nosniff`.
 
 ### Idempotency and replay
@@ -127,7 +128,7 @@ Mutation responses include `record_version`. No response ever includes a stored 
 | Route | Purpose |
 |---|---|
 | `GET /healthz` | Liveness (pre-auth) |
-| `GET /readyz` | Readiness: database, OpenBao (a real Kubernetes-auth login) and the outbox runner, each with a 2s deadline. Returns 503 while draining after SIGTERM |
+| `GET /readyz` | Readiness: database, OpenBao (a real Kubernetes-auth login), outbox runner, and JWKS known-tenant refresher (TS-RP-GAP-001 — pod stays not-ready until the first DB query populates the known-tenant set), each with a 2s deadline. Returns 503 while draining after SIGTERM |
 | `GET /swagger/*any`, `GET /asyncapi`, `GET /asyncapi.yaml` | Docs. Always mounted in `local`/`dev`/`test`. In every other `APP_ENV` (staging included) mounted only when `DOCS_ENABLED=true`, and then bearer-locked by `DOCS_AUTH_TOKEN`; startup fails if it is missing |
 
 `/metrics` is served on its own listener (`METRICS_PORT`), never on the API port.
@@ -267,7 +268,7 @@ Things to know as a caller:
 
 ### Prerequisites
 
-Go 1.26.6, Docker with Compose v2, and an SSH key registered with the BCBP-SOLUTIONS-FZC-LLC org (the Makefile sets `GOPRIVATE`). Building the **image** also needs a `.go_private_token` file (gitignored; a GitHub PAT with read access to the org's private repos). `make docker-up` does not need it.
+Go 1.26.9, Docker with Compose v2, and an SSH key registered with the BCBP-SOLUTIONS-FZC-LLC org (the Makefile sets `GOPRIVATE`). Building the **image** also needs a `.go_private_token` file (gitignored; a GitHub PAT with read access to the org's private repos). `make docker-up` does not need it.
 
 ### Quick start
 
@@ -288,7 +289,7 @@ OpenBao runs in dev mode and this service only supports Kubernetes auth, so a re
 | `make tidy` / `make fmt` / `make fmt-check` / `make vet` | Go basics. `vet` runs twice: default build and with every test build tag |
 | `make lint` | `golangci-lint` (`go tool`), default build + every test build tag |
 | `make arch-lint` | `go-arch-lint` against `.go-arch-lint.yml` (same script CI runs) |
-| `make gates` | Invariant gates: `no-gocloak` (TS-INV-1), `no-secret-log` (TS-INV-2: log calls, errors and span attributes, PEM/private-key names and `-----BEGIN`; runs its own self-test), `set-local-only` (RLS-6), `gincommon-obs`, `metrics-taxonomy` |
+| `make gates` | Invariant gates: `no-gocloak` (TS-INV-1), `no-secret-log` (TS-INV-2), `set-local-only` (RLS-6), `gincommon-obs` (negative: rejects slog/stdlib-log/direct-zap/DefaultRegisterer/hand-rolled TracerProvider), `gincommon-wired` (positive: every binary calls all 8 required gincommon init functions), `pgcommon-obs` (negative: rejects raw pgxpool/pgx.Connect/database/sql), `pgcommon-wired` (positive: every binary wires ConfigFromEnv/NewPool/GUCSetFromContext), `platform-events-obs` (negative: rejects sqs.ReceiveMessage/sns.Publish), `platform-events-wired` (positive: server wires SNS publisher + outbox runner; consumer wires SQS consumer + inbox), `metrics-taxonomy` (Tier-1/2/3 prefixes, `_total`/`_seconds` suffixes) |
 | `make metrics-lint` | platform-gincommon `metricslint` on a real `/metrics` scrape and the alert/rule/runbook references, plus the `metric-registry.md` drift check |
 | `make metrics-inventory` | Regenerate `docs/observability/metric-registry.md` |
 | `make vuln-check` | `govulncheck` v1.8.0 on `./...` (every package, `cmd/` included) |
@@ -411,7 +412,7 @@ Canonical suites (do not break):
 | Variable | Read by | Default | Notes |
 |---|---|---|---|
 | `AWS_REGION`, `AWS_ENDPOINT_URL` | server, consumer | `ap-south-1`, unset | Dev endpoint `http://localhost:4568` (Floci) with `test`/`test` keys. Deployed: IRSA, no keys |
-| `GLUE_REGISTRY_NAME` | server | unset → `NoopCodec` (plain JSON) | Required. Dev and Helm `iam-serviceaccount-events` |
+| `GLUE_REGISTRY_NAME` | server | unset → `NoopCodec` (plain JSON) | Required outside dev/test (Helm `events.glueRegistryName`; validated by `deploy/helm/templates/validate.yaml`). All 5 produced schemas must be registered and `AVAILABLE` in the Glue registry **before** `helm upgrade` — the pod crash-loops on startup if any schema is missing (TS-RP-GAP-003). Run `make schema-register` then `make schema-verify` first |
 | `SNS_TOPIC_ARN` | server | unset → no-op publisher | Required (`events.topicArn`) |
 | `OUTBOX_POLL_INTERVAL`, `OUTBOX_PUBLISH_CONCURRENCY`, `OUTBOX_STARTUP_JITTER`, `OUTBOX_CLAIM_LEASE_DURATION` | server | `500ms`, `4`, `2s`, `10m` | Service defaults over the library's |
 | `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_DRAIN_TIMEOUT`, `OUTBOX_PUBLISH_TIMEOUT` | server | `50`, `5`, `30s`, `10s` | platform-events defaults |

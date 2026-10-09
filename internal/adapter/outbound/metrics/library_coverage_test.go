@@ -76,12 +76,18 @@ func TestHelpers_NilCollectorsAreNoops(t *testing.T) {
 	swapNil(t, &ConsumerDLQRejectsTotal)
 	swapNil(t, &RLSViolations)
 	swapNil(t, &DependencyRequestDuration)
+	swapNil(t, &JWKSKnownTenantsLastRefreshAgeSeconds)
+	swapNil(t, &JWKSKnownTenantsRefreshTotal)
 
 	assert.NotPanics(t, func() {
 		SetKeysRefreshPending(3, 10)
 		IncConsumerDLQReject("schema_violation")
 		AddRLSViolations("cross_tenant_access", 1)
 		observeDependency(DependencyOpenBao, "write_secret", nil, 0.1)
+		SetJWKSKnownTenantsLastRefreshAge(42.5)
+		IncJWKSKnownTenantsRefresh(OutcomeSuccess)
+		IncJWKSKnownTenantsRefresh(OutcomeError)
+		IncJWKSKnownTenantsRefresh("bogus") // unknown values are silently dropped
 	})
 }
 

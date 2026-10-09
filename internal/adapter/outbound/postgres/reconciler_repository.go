@@ -31,7 +31,7 @@ var _ port.ReconcilerRepository = (*ReconcilerRepository)(nil)
 // idx_sac_overlap exists for.
 func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context, limit int) ([]port.ExpiredRotatingCredential, error) {
 	var out []port.ExpiredRotatingCredential
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+	err := withReadOnlyPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT tenant_id, principal_id, version, openbao_path
 			FROM service_account_credentials
@@ -62,7 +62,7 @@ func (r *ReconcilerRepository) ListExpiredRotating(ctx context.Context, limit in
 // exact partial index idx_sac_next_rotation exists for.
 func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context, limit int) ([]port.DueForRotation, error) {
 	var out []port.DueForRotation
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+	err := withReadOnlyPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT tenant_id, principal_id, version
 			FROM service_account_credentials
@@ -99,7 +99,7 @@ func (r *ReconcilerRepository) ListDueForRotation(ctx context.Context, limit int
 // version — not by comparing against MaxVersion.
 func (r *ReconcilerRepository) ListPrincipalMaterialStates(ctx context.Context) ([]port.PrincipalMaterialState, error) {
 	var out []port.PrincipalMaterialState
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+	err := withReadOnlyPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT p.tenant_id, p.id, p.keycloak_client_id,
 			       c.version, c.openbao_path, c.status IN ('active', 'rotating')
@@ -143,11 +143,34 @@ func (r *ReconcilerRepository) ListPrincipalMaterialStates(ctx context.Context) 
 	return out, nil
 }
 
+// RotationOverlapCount returns the number of `rotating` credentials that have
+// an overlap window set (expires_at IS NOT NULL) and have not been soft-deleted
+// across all tenants. Used by cmd/server's rotation-overlap gauge exporter to
+// populate iam_token_service_rotation_overlap_active (§11.2). Runs over the
+// BYPASSRLS reconciler pool — the pool MUST be bound to the
+// serviceaccount_reconciler role (no GUCProvider, no RLS scoping).
+func (r *ReconcilerRepository) RotationOverlapCount(ctx context.Context) (int, error) {
+	var count int
+	// Uses pgcommon.RunInTx directly with a read-only access mode rather than
+	// withPool (which defaults to read-write). The reconciler pool has no
+	// GUCProvider, so the transaction injects nothing; read-only signals intent
+	// and avoids acquiring a row-lock budget on PgBouncer.
+	err := pgcommon.RunInTx(ctx, r.pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(_ context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM service_account_credentials
+			WHERE status = 'rotating'
+			  AND expires_at IS NOT NULL
+			  AND deleted_at IS NULL`).Scan(&count)
+	})
+	return count, wrapConnErrCtx(ctx, err)
+}
+
 // IsCredentialLive reports whether the credential is still `active` or
 // `rotating` right now (false when it was revoked or no longer exists).
 func (r *ReconcilerRepository) IsCredentialLive(ctx context.Context, principalID uuid.UUID, version int) (bool, error) {
 	var live bool
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+	err := withReadOnlyPool(ctx, r.pool, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT EXISTS (SELECT 1 FROM service_account_credentials
 			                WHERE principal_id = $1 AND version = $2

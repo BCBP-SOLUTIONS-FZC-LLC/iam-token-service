@@ -187,6 +187,7 @@ components:
   messages:
     ServiceAccountRegistered:
       title: ServiceAccountRegistered
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/published'
       traits:
@@ -196,6 +197,7 @@ components:
 
     ServiceAccountCredentialIssued:
       title: ServiceAccountCredentialIssued
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/published'
       traits:
@@ -205,6 +207,7 @@ components:
 
     ServiceAccountCredentialRotated:
       title: ServiceAccountCredentialRotated
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/published'
       traits:
@@ -214,6 +217,7 @@ components:
 
     ServiceAccountCredentialRevoked:
       title: ServiceAccountCredentialRevoked
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/published'
       traits:
@@ -223,6 +227,7 @@ components:
 
     ServiceAccountRevoked:
       title: ServiceAccountRevoked
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/published'
       traits:
@@ -233,6 +238,7 @@ components:
     TenantMembershipsPurged:
       title: TenantMembershipsPurged
       description: Consumed only — canonical schema owned by the producing service (Core). additionalProperties left open.
+      x-lifecycle: {status: active}
       tags:
         - $ref: '#/components/tags/consumed'
       traits:
@@ -258,8 +264,8 @@ components:
 
     ServiceAccountRegisteredPayload:
       type: object
-      additionalProperties: false
-      required: [tenant_id, principal_id, principal_sub, keycloak_client_id, principal_type, created_at]
+      additionalProperties: true
+      required: [tenant_id, principal_id, principal_sub, keycloak_client_id, principal_type, actor_id, created_at]
       properties:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
@@ -269,46 +275,55 @@ components:
         # TS-4 accepts (domain.ValidPlatformAutomationClientID, §25 rev 1.1).
         keycloak_client_id: { type: string, pattern: "^platform-automation(-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$" }
         principal_type: { type: string, enum: [platform_automation] }
+        # actor_id is also carried in the CloudEvents envelope `actor` field; it is
+        # duplicated into the payload body so consumers that parse only the payload
+        # body have access to it without reading the envelope. On all current paths
+        # this is the iam-system UUID (00000000-0000-0000-0000-0000000000a1).
+        actor_id: { type: string, format: uuid, description: "UUID of the iam-system or operator principal that triggered this event" }
         created_at: { type: string, format: date-time }
 
     ServiceAccountCredentialIssuedPayload:
       type: object
-      additionalProperties: false
-      required: [tenant_id, principal_id, version, issued_at]
+      additionalProperties: true
+      required: [tenant_id, principal_id, version, actor_id, issued_at]
       properties:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
         version: { type: integer, minimum: 1 }
+        actor_id: { type: string, format: uuid, description: "UUID of the iam-system or operator principal that triggered this event" }
         issued_at: { type: string, format: date-time }
 
     ServiceAccountCredentialRotatedPayload:
       type: object
-      additionalProperties: false
-      required: [tenant_id, principal_id, version, prior_version, expires_prior_at]
+      additionalProperties: true
+      required: [tenant_id, principal_id, version, prior_version, actor_id, expires_prior_at]
       properties:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
         version: { type: integer, minimum: 2 }
         prior_version: { type: integer, minimum: 1 }
+        actor_id: { type: string, format: uuid, description: "UUID of the iam-system or operator principal that triggered this event" }
         expires_prior_at: { type: string, format: date-time }
 
     ServiceAccountCredentialRevokedPayload:
       type: object
-      additionalProperties: false
-      required: [tenant_id, principal_id, version, revoked_at]
+      additionalProperties: true
+      required: [tenant_id, principal_id, version, actor_id, revoked_at]
       properties:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
         version: { type: integer, minimum: 1 }
+        actor_id: { type: string, format: uuid, description: "UUID of the iam-system or operator principal that triggered this event" }
         revoked_at: { type: string, format: date-time }
 
     ServiceAccountRevokedPayload:
       type: object
-      additionalProperties: false
-      required: [tenant_id, principal_id, revoked_at]
+      additionalProperties: true
+      required: [tenant_id, principal_id, actor_id, revoked_at]
       properties:
         tenant_id: { type: string, format: uuid }
         principal_id: { type: string, format: uuid }
+        actor_id: { type: string, format: uuid, description: "UUID of the iam-system or operator principal that triggered this event" }
         revoked_at: { type: string, format: date-time }
 
     TenantMembershipsPurgedPayload:

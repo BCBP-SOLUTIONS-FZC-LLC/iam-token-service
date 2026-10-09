@@ -76,8 +76,9 @@ func TestRegister_IsIdempotentAndRegistersAllCollectors(t *testing.T) {
 	for _, c := range []prometheus.Collector{
 		CredentialsIssuedTotal, RotationOverlapActive, OpenBaoCallDuration,
 		OffboardingCascadeTotal, RotationSweepTotal, MaterialReconcileTotal,
-		CadenceRotationTotal, JWKSKeyErrorsTotal, ProcessedEventsDuplicates,
-		UnknownEventAcknowledged, DependencyRequestDuration, DuplicateMessagesTotal,
+		CadenceRotationTotal, JWKSKeyErrorsTotal, JWKSKnownTenantsRefreshTotal,
+		JWKSKnownTenantsLastRefreshAgeSeconds, ProcessedEventsDuplicates, UnknownEventAcknowledged,
+		DependencyRequestDuration, DuplicateMessagesTotal,
 		JWKSRateLimitedByBucketTotal, CredentialReplaysTotal, KeysRefreshPending,
 		KeysRefreshOldestAgeSeconds, ConsumerDLQRejectsTotal,
 	} {
