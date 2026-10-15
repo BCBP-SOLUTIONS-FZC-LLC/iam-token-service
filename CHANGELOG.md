@@ -6,6 +6,18 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (dependency maintenance pass, TS-D25 — 2026-10-15)
+
+- **`platform-pgcommon/v2` v2.0.0 → v2.0.1** — patch bump closing compatibility gaps TS-RP-GAP-007 (skew vs. iam-realm-provisioner) and TS-AL-GAP-001 (skew vs. iam-audit-log). Patch may include RLS GUC binding or pool error-handling fixes; no public API surface change. `govulncheck` clean. Build and full unit test suite pass.
+- **`aws-sdk-go-v2` patch/minor bumps:** core v1.47.2 → v1.47.3; `config` v1.33.8 → v1.33.9; `credentials` v1.20.8 → v1.20.9; `service/glue` v1.169.0 → v1.171.0; `service/sqs` v1.52.3 → v1.52.4 — plus transitive AWS SDK components (`configsources`, `endpoints/v2`, `internal/v4a`, `accept-encoding`, `presigned-url`, `signin`, `sso`, `ssooidc`, `sts`, `smithy-go`).
+- **`jackc/puddle/v2` v2.2.2 → v2.2.3** — patch bump to the pgx connection-pool dependency.
+- **`golang.org/x/sync` v0.23.0 → v0.24.0** — minor bump; used for `errgroup` and `singleflight` in the JWKS handler and OpenBao client.
+- `go mod tidy` run; `go.sum` updated.
+
+### Added (TS-D25)
+
+- **LLD TS-D25 Decision Register entry.** `README.md` shared-library version table, `.claude/architecture.md` pinned-versions line, and LLD §3 `require` block updated to reflect `platform-pgcommon/v2 v2.0.1`.
+
 ### Fixed (sixth production-readiness pass, TS-D24 — 2026-10-09)
 
 - **`actor_id` missing from all produced event payloads (TS-RP-GAP-002).** All 5 outbound event payload structs (`ServiceAccountRegistered`, `ServiceAccountCredentialIssued`, `ServiceAccountCredentialRotated`, `ServiceAccountCredentialRevoked`, `ServiceAccountRevoked`) and their Glue JSON schemas now include `actor_id` (UUID, required). The overlap-expiry sweep (`cmd/rotator/sweep.go`) was emitting uuid.Nil as `actor_id` in `ServiceAccountCredentialRevoked` — every cron-sweep-driven revoke carried a zero UUID in the audit trail. Consumed schema (`tenant_memberships_purged.json`) correctly does not carry `actor_id`. All 5 produced schemas updated to `additionalProperties: true` for schema-gov forward-compatibility (pass-5 requirement) and all 6 AsyncAPI messages gain `x-lifecycle: {status: active}`.
