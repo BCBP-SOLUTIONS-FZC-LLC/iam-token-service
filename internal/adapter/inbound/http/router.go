@@ -10,7 +10,7 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 )
 
 // Pinger is satisfied by any dependency /readyz must check.
@@ -86,8 +86,6 @@ func (r *Router) Handler() http.Handler { return r.engine }
 // mesh-only, header-authenticated /api/v1/internal/* credential-lifecycle
 // API (TS-1..TS-6, §5.1).
 func NewRouter(cfg RouterConfig) *Router {
-	errorLogger = cfg.GinConfig.Logger
-
 	r := gin.New()
 	r.HandleMethodNotAllowed = true
 

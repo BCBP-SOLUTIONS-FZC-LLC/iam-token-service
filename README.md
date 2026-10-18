@@ -84,31 +84,31 @@ TS-1's idempotency key is a **body field**, `rotation_id`, not an `Idempotency-K
 
 ### Concurrency
 
-TS-1, TS-2 and the offboarding cascade serialize per principal on a row lock (`LockForUpdate`; offboarding uses `LockByTenant`). A caller that cannot get the lock within `PG_LOCK_TIMEOUT` (SQLSTATE `55P03`) gets `409 rotation_in_flight`, with `details.active_rotation_id` when it can be looked up. TS-1 takes the next version as `MaxVersion + 1` over every row (a version number is never reused), generates the keypair before the transaction, closes any older open overlaps, and after commit runs an opportunistic sweep of expired overlaps. The JWKS route reads without locking. Details: LLD §9, [`.claude/request-flows.md`](.claude/request-flows.md).
+TS-1, TS-2 and the offboarding cascade serialize per principal on a row lock (`LockForUpdate`; offboarding uses `LockByTenant`). A caller that cannot get the lock within `PG_LOCK_TIMEOUT` (SQLSTATE `55P03`) gets `409 rotation_in_flight`; when an active rotation exists, its ID is included in the RFC 9457 `detail` field. TS-1 takes the next version as `MaxVersion + 1` over every row (a version number is never reused), generates the keypair before the transaction, closes any older open overlaps, and after commit runs an opportunistic sweep of expired overlaps. The JWKS route reads without locking. Details: LLD §9, [`.claude/request-flows.md`](.claude/request-flows.md).
 
 ### Error codes
 
-Every non-2xx response is the flat `platform-gincommon` envelope `{error, status, trace_id, request_id, details?}` (`internal/adapter/inbound/http/errors.go`). A bind failure is one `400 invalid_request` (fail-fast, single error; `details.field` names the field).
+Every non-2xx response is an **RFC 9457 Problem Details** object (`application/problem+json`) rendered by `platform-gincommon` v2's global error handler (`pkg/gincommon.AbortWithProblem`). The service registers a domain-specific `problem.Type` per error code (`internal/adapter/inbound/http/errors.go`); it never writes a raw JSON error body itself. A bind failure is one `400 INVALID_REQUEST` with a `validationErrors` array (field + fixed message).
 
-| Code | Status | Trigger | §17 |
-|---|---|---|---|
-| `invalid_request` | 400 | Malformed JSON, a UUID/integer parse failure, or a business-rule field check | Frozen |
-| `missing_identity_headers` | 401 | `x-user-id`/`x-tenant-id` missing, repeated or not a UUID, or `x-user-id` is not iam-system | Frozen |
-| `tenant_path_mismatch` | 403 | Path `:id` differs from `x-tenant-id` | Additive |
-| `principal_not_found` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6) | Frozen |
-| `rotation_in_flight` | 409 | Principal row lock not obtained within `PG_LOCK_TIMEOUT` (`details.active_rotation_id`, best effort) | Frozen |
-| `optimistic_lock_conflict` | 409 | A concurrent writer changed `record_version` (`details.expected_version`) | Frozen |
-| `credential_replay_revoked` | 409 | `rotation_id` replay of a since-revoked version (TS-D13) | Additive |
-| `credential_replay_expired` | 409 | `rotation_id` replay past `ROTATION_REPLAY_WINDOW` (`details.version`) | Additive |
-| `unsupported_media_type` | 415 | Write body without `Content-Type: application/json` | Additive |
-| `principal_revoked` | 422 | TS-1/TS-2 against a revoked (offboarded) principal | Frozen |
-| `rate_limited` | 429 | JWKS route limiter refused the request | Additive |
-| `internal_error` | 500 | Anything unclassified (logged) | Additive |
-| `secret_store_unavailable` | 502 | OpenBao write/delete failed; nothing was committed | Frozen |
-| `db_unavailable` | 503 | Postgres connectivity/resource exhaustion, by SQLSTATE class `08`/`53`/`57`/`58` or a closed pool only (TS-D16) | Additive |
-| `jwks_keys_unavailable` | 503 | JWKS route: the active key, or every key, unreadable (TS-D23) | Additive |
+| `errorCode` value | Status | Trigger | §17 | RFC 9457 extra field |
+|---|---|---|---|---|
+| `invalid_request` | 400 | Malformed JSON, a UUID/integer parse failure, or a business-rule field check | Frozen | `validationErrors[].field` / `.message` |
+| `missing_identity_headers` | 401 | `x-user-id`/`x-tenant-id` missing, repeated or not a UUID, or `x-user-id` is not iam-system | Frozen | — |
+| `tenant_path_mismatch` | 403 | Path `:id` differs from `x-tenant-id` | Additive | — |
+| `principal_not_found` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6) | Frozen | — |
+| `rotation_in_flight` | 409 | Principal row lock not obtained within `PG_LOCK_TIMEOUT` (active rotation in `detail`) | Frozen | `detail` |
+| `optimistic_lock_conflict` | 409 | A concurrent writer changed `record_version` (expected version in `detail`) | Frozen | `detail` |
+| `credential_replay_revoked` | 409 | `rotation_id` replay of a since-revoked version (TS-D13) | Additive | — |
+| `credential_replay_expired` | 409 | `rotation_id` replay past `ROTATION_REPLAY_WINDOW` (version in `detail`) | Additive | `detail` |
+| `unsupported_media_type` | 415 | Write body without `Content-Type: application/json` | Additive | — |
+| `principal_revoked` | 422 | TS-1/TS-2 against a revoked (offboarded) principal | Frozen | — |
+| `rate_limited` | 429 | JWKS route limiter refused the request | Additive | — |
+| `internal_error` | 500 | Anything unclassified (logged, no `detail` sent) | Additive | — |
+| `secret_store_unavailable` | 502 | OpenBao write/delete failed; nothing was committed | Frozen | — |
+| `db_unavailable` | 503 | Postgres connectivity/resource exhaustion, by SQLSTATE class `08`/`53`/`57`/`58` or a closed pool only (TS-D16) | Additive | — |
+| `jwks_keys_unavailable` | 503 | JWKS route: the active key, or every key, unreadable (TS-D23) | Additive | — |
 
-The seven frozen codes are LLD §17 and cannot change in place; the domain-level additive codes are commented as such in `internal/core/domain/errors.go`.
+The seven frozen §17 codes keep their exact wire values (lowercase); only the containing field name changed from `error` to `errorCode` with the RFC 9457 adoption (TS-D26). Domain-level additive codes are commented as such in `internal/core/domain/errors.go`.
 
 ### Notable validation rules
 
@@ -199,7 +199,7 @@ The rule worth remembering: **`cmd/rotator` may not depend on `service`**. It dr
 
 ### Shared libraries
 
-`platform-pgcommon/v2` v2.0.1 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.1.0 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon` v1.6.0 (middleware, logging, tracing, metrics registry, `/metrics`), `openbao/openbao/api/v2` v2.7.1.
+`platform-pgcommon/v2` v2.0.2 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.1.0 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon/v2` v2.0.0 (middleware, logging, tracing, metrics registry, `/metrics`, RFC 9457 Problem Details), `openbao/openbao/api/v2` v2.7.1.
 
 ---
 
@@ -259,7 +259,7 @@ Things to know as a caller:
 1. **Register first.** TS-1 against an unregistered `principal_id` is `404 principal_not_found`.
 2. **Retry TS-1 with the same `rotation_id`**, within the replay window, to recover a lost response without generating new material. Use a new `rotation_id` only for a genuinely new rotation.
 3. **TS-1 and TS-2 alone change nothing at Keycloak** (TS-INV-7). An operator-driven rotate or revoke must be followed by RP-17. The scheduler and rotator do this themselves.
-4. **Optimistic locking:** both tables carry `record_version`, bumped by the `touch_row()` trigger. A `409 optimistic_lock_conflict` returns `details.expected_version`. TS-2 and the sweep re-check after a conflict and report the idempotent outcome when two actors converged on the same result (TS-D13).
+4. **Optimistic locking:** both tables carry `record_version`, bumped by the `touch_row()` trigger. A `409 optimistic_lock_conflict` includes the expected version in the RFC 9457 `detail` field. TS-2 and the sweep re-check after a conflict and report the idempotent outcome when two actors converged on the same result (TS-D13).
 5. **Rate limits:** TS-1..TS-6 apply none (in-mesh callers only). Only the JWKS route is rate-limited (above).
 
 ---
@@ -571,7 +571,7 @@ No `v*` tag exists yet; pin `main` images by digest.
 |---|---|---|
 | JWKS route `503 jwks_keys_unavailable` | The tenant's active key (or every key) could not be read from OpenBao: OpenBao down, login failing, or material missing | Keycloak keeps its cached keys meanwhile. Check OpenBao health and the server log `jwks: skipping unreadable credential`; if material is gone, rotate (TS-1) then RP-17. Runbook: `IAMTokenServiceJWKSKeyErrors` |
 | JWKS route `429 rate_limited` | Per-tenant, global or unknown-tenant bucket exhausted. A brand-new tenant counts as unknown for up to `JWKS_KNOWN_TENANTS_REFRESH` (15s) | Check `iam_token_service_jwks_rate_limited_by_bucket_total{bucket}`: `unknown` = a scan of random ids (block at ingress); `tenant`/`global` = real traffic, raise `jwks.*`. Unexpected callers mean the `AuthorizationPolicy` is too wide |
-| `409 rotation_in_flight` | Another TS-1/TS-2/offboarding held the principal lock longer than `PG_LOCK_TIMEOUT` (2s) | Retry. To repeat the same rotation, reuse the same `rotation_id`; `details.active_rotation_id`, when present, names the competing one |
+| `409 rotation_in_flight` | Another TS-1/TS-2/offboarding held the principal lock longer than `PG_LOCK_TIMEOUT` (2s) | Retry. To repeat the same rotation, reuse the same `rotation_id`; the competing rotation ID is included in the RFC 9457 `detail` field when available |
 | `409 credential_replay_expired` | A `rotation_id` replayed more than `ROTATION_REPLAY_WINDOW` (15m) after issue | Not a fault: start a new rotation with a fresh `rotation_id`. `409 credential_replay_revoked` means the version is gone |
 | `keys_refresh_pending` rows not draining / `IAMTokenServiceKeysRefreshBacklog` | RP-17 keeps failing, or the CronJobs are not running | `SELECT tenant_id, requested_at, intent_until FROM keys_refresh_pending ORDER BY requested_at;`. Check Realm Provisioner health, the CronJob alerts, egress `realmProvisionerPort` and `cronjobs.istioInject`. Rows with `intent_until` in the future are a scheduler run in progress, not a backlog |
 | `TenantMembershipsPurged` in the DLQ with `DLQReason=invalid_envelope_id` | Producer sent a missing or non-UUID envelope `id` | That tenant's credentials are **not** revoked yet. Give the message a valid UUID `id` and redrive; never discard it. Producer must fix its ids |

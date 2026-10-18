@@ -9,15 +9,10 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/pkg/requestctx"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
-
-// writeMissingIdentityHeaders writes the frozen §17 missing_identity_headers
-// 401 — no `details` field per the taxonomy.
-func writeMissingIdentityHeaders(c *gin.Context) {
-	writeError(c, string(domain.ErrMissingIdentityHeaders), http.StatusUnauthorized, nil)
-}
 
 // RequireIdentityHeaders runs BEFORE gincommon.ProtectedMiddlewares and
 // answers the frozen §17 401 missing_identity_headers itself whenever
@@ -116,7 +111,7 @@ func RequireTenantPathMatch() gin.HandlerFunc {
 			return
 		}
 		if pathTenantID != rc.TenantID {
-			writeError(c, "tenant_path_mismatch", http.StatusForbidden, nil)
+			gincommon.AbortWithProblem(c, problem.NewError(problemTypeTenantPathMismatch, "").WithCode("tenant_path_mismatch"))
 			return
 		}
 		c.Next()
@@ -138,7 +133,7 @@ func RequireJSONContentType() gin.HandlerFunc {
 			return
 		}
 		if c.ContentType() != "application/json" {
-			writeError(c, "unsupported_media_type", http.StatusUnsupportedMediaType, nil)
+			gincommon.AbortWithProblem(c, problem.NewError(problem.TypeUnsupportedMediaType, "").WithCode("unsupported_media_type"))
 			return
 		}
 		c.Next()

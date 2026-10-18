@@ -6,6 +6,27 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (platform-gincommon v2 + RFC 9457 adoption, TS-D26 — 2026-10-18)
+
+- **`platform-gincommon` v1.6.0 → `platform-gincommon/v2` v2.0.0** (module-path change; new `require` line and import prefix `platform-gincommon/v2/pkg/…`). The v2 `ObservabilityMiddlewares` chain appends a global `ProblemMiddleware` as its innermost handler. All 30 import sites updated. Gates and unit tests pass.
+- **`platform-pgcommon/v2` v2.0.1 → v2.0.2** — patch bump.
+- **RFC 9457 Problem Details adoption.** `internal/adapter/inbound/http/errors.go` fully rewritten:
+  - Removed: `ErrorResponse` DTO, `writeError`, `newErrorResponse`, `logRequestError`, `errorLogger` package var.
+  - Added: 12 domain `problem.Type` vars (one per frozen §17 code, domain `"iam"`, UPPER_SNAKE_CASE errorCodes).
+  - `HandleError` → `toProblem` → `domainErrToProblem` → `gincommon.AbortWithProblem`; platform-gincommon owns the wire format and all logging.
+  - `writeInvalidRequest`/`writeMissingIdentityHeaders` now call `gincommon.AbortWithProblem`; two `writeError` calls in middleware.go and two in jwks_handler.go replaced in-place.
+  - Structured `details` encoded in RFC 9457 `detail` string (`active_rotation_id`, `version`, `expected_version`); `field`/`reason` map to `validationErrors[].{field,message}`.
+  - `errorLogger` set-once pattern in `NewRouter` removed — error logging is now owned by gincommon's ProblemMiddleware.
+  - `ProblemDetails` / `ValidationItem` swagger-only doc stubs added; all `@Failure {object}` annotations updated from `ErrorResponse` to `ProblemDetails`; `docs/swagger/` regenerated.
+- **Wire format change for callers.** The response field name changes from `error` to `errorCode`; the `errorCode` VALUE is preserved in the exact frozen §17 lowercase form (`"principal_not_found"`, not `"PRINCIPAL_NOT_FOUND"`), so callers that branch on the string value only need to update the field name. Response shape is `application/problem+json` RFC 9457 instead of the former `{error, status, trace_id, request_id, details?}` envelope.
+- **All 10 invariant gates pass.** `make build`, `make test-unit`, `make gates`, `make swag` clean.
+
+### Added (TS-D26)
+
+- **LLD TS-D26 Decision Register entry.**
+- README.md error code table updated: `errorCode` column replaces `Code` (values unchanged, frozen §17 lowercase), RFC 9457 field column added. Shared-library table updated: `platform-gincommon v1.6.0` → `platform-gincommon/v2 v2.0.0`; `platform-pgcommon/v2` v2.0.2.
+- ARCHITECTURE.md Session-specific decisions §5–6 added; Failure Domains table updated.
+
 ### Changed (dependency maintenance pass, TS-D25 — 2026-10-15)
 
 - **`platform-pgcommon/v2` v2.0.0 → v2.0.1** — patch bump closing compatibility gaps TS-RP-GAP-007 (skew vs. iam-realm-provisioner) and TS-AL-GAP-001 (skew vs. iam-audit-log). Patch may include RLS GUC binding or pool error-handling fixes; no public API surface change. `govulncheck` clean. Build and full unit test suite pass.

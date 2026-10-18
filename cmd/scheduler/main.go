@@ -47,8 +47,8 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/logger"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 

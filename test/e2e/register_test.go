@@ -94,8 +94,8 @@ func TestRegister_MissingIdentityHeaders(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if er.Error != "missing_identity_headers" {
-		t.Fatalf("error = %q, want missing_identity_headers", er.Error)
+	if er.ErrorCode != "missing_identity_headers" {
+		t.Fatalf("error = %q, want missing_identity_headers", er.ErrorCode)
 	}
 }
 
@@ -118,8 +118,8 @@ func TestRegister_NonSystemPrincipalUserID(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if er.Error != "missing_identity_headers" {
-		t.Fatalf("error = %q, want missing_identity_headers", er.Error)
+	if er.ErrorCode != "missing_identity_headers" {
+		t.Fatalf("error = %q, want missing_identity_headers", er.ErrorCode)
 	}
 }
 
@@ -136,11 +136,11 @@ func TestRegister_NonUUIDPrincipalSub(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
-	if er.Error != "invalid_request" {
-		t.Fatalf("error = %q, want invalid_request", er.Error)
+	if er.ErrorCode != "invalid_request" {
+		t.Fatalf("error = %q, want invalid_request", er.ErrorCode)
 	}
-	if er.Details["field"] != "principal_sub" {
-		t.Fatalf("details.field = %v, want principal_sub", er.Details["field"])
+	if len(er.ValidationErrors) == 0 || er.ValidationErrors[0].Field != "principal_sub" {
+		t.Fatalf("validationErrors[0].field = %v, want principal_sub", er.ValidationErrors)
 	}
 }
 
@@ -158,10 +158,10 @@ func TestRegister_WrongKeycloakClientID(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
-	if er.Error != "invalid_request" {
-		t.Fatalf("error = %q, want invalid_request", er.Error)
+	if er.ErrorCode != "invalid_request" {
+		t.Fatalf("error = %q, want invalid_request", er.ErrorCode)
 	}
-	if er.Details["field"] != "keycloak_client_id" {
-		t.Fatalf("details.field = %v, want keycloak_client_id", er.Details["field"])
+	if len(er.ValidationErrors) == 0 || er.ValidationErrors[0].Field != "keycloak_client_id" {
+		t.Fatalf("validationErrors[0].field = %v, want keycloak_client_id", er.ValidationErrors)
 	}
 }

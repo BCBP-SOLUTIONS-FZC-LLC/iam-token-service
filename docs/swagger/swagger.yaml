@@ -1,17 +1,46 @@
 basePath: /api/v1/internal
 definitions:
-  http.ErrorResponse:
+  http.ProblemDetails:
     properties:
-      details:
-        additionalProperties: {}
-        type: object
-      error:
+      detail:
+        example: Principal abc123 was not found.
         type: string
-      request_id:
+      errorCode:
+        example: PRINCIPAL_NOT_FOUND
+        type: string
+      instance:
+        example: /api/v1/internal/tenants/t1/service-accounts/p1
         type: string
       status:
+        example: 404
         type: integer
-      trace_id:
+      tenantId:
+        example: 10000000-0000-0000-0000-000000000001
+        type: string
+      timestamp:
+        example: "2026-10-15T10:45:22Z"
+        type: string
+      title:
+        example: Principal Not Found
+        type: string
+      traceId:
+        example: 4bf92f3577b34da6a3ce929d0e0e4736
+        type: string
+      type:
+        example: https://errors.company.com/iam/principal-not-found
+        type: string
+      validationErrors:
+        items:
+          $ref: '#/definitions/http.ValidationItem'
+        type: array
+    type: object
+  http.ValidationItem:
+    properties:
+      field:
+        example: rotation_id
+        type: string
+      message:
+        example: must be a UUID
         type: string
     type: object
   http.automationPrincipalResponseBody:
@@ -174,27 +203,27 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "404":
           description: principal_not_found
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -238,32 +267,32 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "409":
           description: rotation_in_flight (retryable; the principal row is locked
             by a concurrent credential write)
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "415":
           description: unsupported_media_type
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -300,27 +329,27 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "404":
           description: principal_not_found
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -378,45 +407,45 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "404":
           description: principal_not_found
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "409":
           description: rotation_in_flight (retryable; incl. principal lock wait timeout)
             | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired
             — details.version on the replay codes
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "415":
           description: unsupported_media_type
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "422":
           description: principal_revoked
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "502":
           description: secret_store_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -459,40 +488,40 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "404":
           description: principal_not_found
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "409":
           description: rotation_in_flight (retryable; principal lock wait timeout)
             | optimistic_lock_conflict
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "415":
           description: unsupported_media_type (only when a body is sent)
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "502":
           description: secret_store_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -527,27 +556,27 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "401":
           description: missing_identity_headers
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "403":
           description: tenant_path_mismatch
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "404":
           description: principal_not_found
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       security:
       - TenantID: []
         UserID: []
@@ -583,20 +612,20 @@ paths:
         "400":
           description: invalid_request
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "429":
           description: rate_limited
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
         "503":
           description: jwks_keys_unavailable (active key, or every live key, unreadable)
             | db_unavailable
           schema:
-            $ref: '#/definitions/http.ErrorResponse'
+            $ref: '#/definitions/http.ProblemDetails'
       summary: EXT-6 — Platform-automation JWKS
       tags:
       - ServiceAccounts

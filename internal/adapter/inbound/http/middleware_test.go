@@ -11,7 +11,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/pkg/requestctx"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
@@ -32,7 +32,7 @@ func TestGUCBridgeMiddleware(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 		require.Equal(t, http.StatusUnauthorized, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "missing_identity_headers", er.Error)
+		assert.Equal(t, "missing_identity_headers", er.ErrorCode)
 	})
 
 	t.Run("missing headers rejected upstream by RequireAuth", func(t *testing.T) {
@@ -119,7 +119,8 @@ func TestRequireTenantPathMatch(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/tenants/not-a-uuid/probe", nil, nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "id", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "id", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("mismatch — 403 tenant_path_mismatch", func(t *testing.T) {
@@ -133,7 +134,7 @@ func TestRequireTenantPathMatch(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+uuid.New().String()+"/probe", nil, nil)
 		require.Equal(t, http.StatusForbidden, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "tenant_path_mismatch", er.Error)
+		assert.Equal(t, "tenant_path_mismatch", er.ErrorCode)
 	})
 
 	t.Run("match — next runs", func(t *testing.T) {

@@ -65,37 +65,37 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -153,43 +153,43 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "409": {
                         "description": "rotation_in_flight (retryable; the principal row is locked by a concurrent credential write)",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "415": {
                         "description": "unsupported_media_type",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -231,37 +231,37 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -297,25 +297,25 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "429": {
                         "description": "rate_limited",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "jwks_keys_unavailable (active key, or every live key, unreadable) | db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -365,37 +365,37 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -463,61 +463,61 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "409": {
                         "description": "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "415": {
                         "description": "unsupported_media_type",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "422": {
                         "description": "principal_revoked",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "502": {
                         "description": "secret_store_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -574,55 +574,55 @@ const docTemplate = `{
                     "400": {
                         "description": "invalid_request",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "401": {
                         "description": "missing_identity_headers",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "403": {
                         "description": "tenant_path_mismatch",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "404": {
                         "description": "principal_not_found",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "409": {
                         "description": "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "415": {
                         "description": "unsupported_media_type (only when a body is sent)",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "502": {
                         "description": "secret_store_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     },
                     "503": {
                         "description": "db_unavailable",
                         "schema": {
-                            "$ref": "#/definitions/http.ErrorResponse"
+                            "$ref": "#/definitions/http.ProblemDetails"
                         }
                     }
                 }
@@ -630,24 +630,63 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "http.ErrorResponse": {
+        "http.ProblemDetails": {
             "type": "object",
             "properties": {
-                "details": {
-                    "type": "object",
-                    "additionalProperties": {}
+                "detail": {
+                    "type": "string",
+                    "example": "Principal abc123 was not found."
                 },
-                "error": {
-                    "type": "string"
+                "errorCode": {
+                    "type": "string",
+                    "example": "PRINCIPAL_NOT_FOUND"
                 },
-                "request_id": {
-                    "type": "string"
+                "instance": {
+                    "type": "string",
+                    "example": "/api/v1/internal/tenants/t1/service-accounts/p1"
                 },
                 "status": {
-                    "type": "integer"
+                    "type": "integer",
+                    "example": 404
                 },
-                "trace_id": {
-                    "type": "string"
+                "tenantId": {
+                    "type": "string",
+                    "example": "10000000-0000-0000-0000-000000000001"
+                },
+                "timestamp": {
+                    "type": "string",
+                    "example": "2026-10-15T10:45:22Z"
+                },
+                "title": {
+                    "type": "string",
+                    "example": "Principal Not Found"
+                },
+                "traceId": {
+                    "type": "string",
+                    "example": "4bf92f3577b34da6a3ce929d0e0e4736"
+                },
+                "type": {
+                    "type": "string",
+                    "example": "https://errors.company.com/iam/principal-not-found"
+                },
+                "validationErrors": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/http.ValidationItem"
+                    }
+                }
+            }
+        },
+        "http.ValidationItem": {
+            "type": "object",
+            "properties": {
+                "field": {
+                    "type": "string",
+                    "example": "rotation_id"
+                },
+                "message": {
+                    "type": "string",
+                    "example": "must be a UUID"
                 }
             }
         },

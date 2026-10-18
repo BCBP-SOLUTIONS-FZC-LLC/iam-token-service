@@ -17,6 +17,8 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 	pgdomain "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
@@ -422,10 +424,10 @@ type jwksResponseBody struct {
 // @Produce      json
 // @Param        id  path      string  true  "Tenant UUID"  format(uuid)
 // @Success      200 {object}  jwksResponseBody
-// @Failure      400 {object}  ErrorResponse  "invalid_request"
-// @Failure      429 {object}  ErrorResponse  "rate_limited"
-// @Failure      500 {object}  ErrorResponse
-// @Failure      503 {object}  ErrorResponse  "jwks_keys_unavailable (active key, or every live key, unreadable) | db_unavailable"
+// @Failure      400 {object}  ProblemDetails  "invalid_request"
+// @Failure      429 {object}  ProblemDetails  "rate_limited"
+// @Failure      500 {object}  ProblemDetails
+// @Failure      503 {object}  ProblemDetails  "jwks_keys_unavailable (active key, or every live key, unreadable) | db_unavailable"
 // @Router       /tenants/{id}/service-accounts/platform-automation/jwks.json [get]
 func (h *JWKSHandler) JWKS(c *gin.Context) {
 	tenantID, err := uuid.Parse(c.Param("id"))
@@ -442,7 +444,7 @@ func (h *JWKSHandler) JWKS(c *gin.Context) {
 			metrics.JWKSRateLimitedTotal.Inc()
 		}
 		metrics.IncJWKSRateLimited(bucket)
-		writeError(c, "rate_limited", http.StatusTooManyRequests, nil)
+		gincommon.AbortWithProblem(c, problem.NewError(problem.TypeRateLimitExceeded, "").WithCode("rate_limited"))
 		return
 	}
 
@@ -473,8 +475,7 @@ func (h *JWKSHandler) JWKS(c *gin.Context) {
 	// secret_store_unavailable, whose frozen status is 502). A set missing
 	// only overlap (rotating) keys is still served.
 	if res.Unservable() {
-		de := domain.NewError(domain.ErrJWKSKeysUnavailable, "the tenant's active JWKS key could not be read")
-		writeError(c, string(de.Code), de.Status(), nil)
+		HandleError(c, domain.NewError(domain.ErrJWKSKeysUnavailable, "the tenant's active JWKS key could not be read"))
 		return
 	}
 

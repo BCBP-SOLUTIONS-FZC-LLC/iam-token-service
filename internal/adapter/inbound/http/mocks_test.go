@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -156,12 +157,12 @@ func doJSON(t *testing.T, h http.Handler, method, path string, headers map[strin
 	return rec
 }
 
-// decodeErrorBody decodes rec's body as ErrorResponse for §17-shape assertions.
-func decodeErrorBody(t *testing.T, rec *httptest.ResponseRecorder) ErrorResponse {
+// decodeErrorBody decodes rec's body as an RFC 9457 problem.Problem.
+func decodeErrorBody(t *testing.T, rec *httptest.ResponseRecorder) problem.Problem {
 	t.Helper()
-	var er ErrorResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &er); err != nil {
-		t.Fatalf("decode error body: %v, body=%s", err, rec.Body.String())
+	var p problem.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatalf("decode problem body: %v, body=%s", err, rec.Body.String())
 	}
-	return er
+	return p
 }

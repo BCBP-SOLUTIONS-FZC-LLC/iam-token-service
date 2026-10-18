@@ -81,16 +81,16 @@ type issueOrRotateResponseBody struct {
 // @Param        request       body      issueOrRotateRequestBody  true  "rotation_id required; overlap_seconds optional (defaults to the configured value, §12)"
 // @Success      200           {object}  issueOrRotateResponseBody  "rotation_id replay — already committed"
 // @Success      201           {object}  issueOrRotateResponseBody  "issued or rotated"
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      404  {object}  ErrorResponse  "principal_not_found"
-// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes"
-// @Failure      415  {object}  ErrorResponse  "unsupported_media_type"
-// @Failure      422  {object}  ErrorResponse  "principal_revoked"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      502  {object}  ErrorResponse  "secret_store_unavailable"
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      404  {object}  ProblemDetails  "principal_not_found"
+// @Failure      409  {object}  ProblemDetails  "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes"
+// @Failure      415  {object}  ProblemDetails  "unsupported_media_type"
+// @Failure      422  {object}  ProblemDetails  "principal_revoked"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      502  {object}  ProblemDetails  "secret_store_unavailable"
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials [post]
 func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
@@ -186,15 +186,15 @@ type revokeResponseBody struct {
 // @Param        principal_id  path      string  true  "Principal UUID"   format(uuid)
 // @Param        version       path      int     true  "Credential version"
 // @Success      200           {object}  revokeResponseBody
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      404  {object}  ErrorResponse  "principal_not_found"
-// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict"
-// @Failure      415  {object}  ErrorResponse  "unsupported_media_type (only when a body is sent)"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      502  {object}  ErrorResponse  "secret_store_unavailable"
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      404  {object}  ProblemDetails  "principal_not_found"
+// @Failure      409  {object}  ProblemDetails  "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict"
+// @Failure      415  {object}  ProblemDetails  "unsupported_media_type (only when a body is sent)"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      502  {object}  ProblemDetails  "secret_store_unavailable"
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials/{version}/revoke [post]
 func (h *CredentialHandler) Revoke(c *gin.Context) {
