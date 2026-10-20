@@ -18,9 +18,8 @@ The signed-off design is `docs/lld/iam-lld-token-service.md` (rev 1.4,
 Approved) — the tie-breaker on any discrepancy. A frozen name (LLD §25) or
 a resolved open question (§16) cannot change in place; that needs a new LLD
 revision. Prose, the Decision Register (§22) and the runbooks (§24) are
-living documents. The §22 entries TS-D13..TS-D23 are the changelog of the
-hardening passes since sign-off; TS-D21/22/23 are the most recent
-production-readiness passes.
+living documents. The §22 entries TS-D13..TS-D26 are the changelog of the
+hardening passes since sign-off; TS-D24/25/26 are the most recent passes.
 
 ## What this repo is
 

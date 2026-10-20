@@ -82,7 +82,8 @@ func TestJWKSHandler_JWKS(t *testing.T) {
 		rec := doJSON(t, r, http.MethodGet, "/api/v1/internal/tenants/not-a-uuid/service-accounts/platform-automation/jwks.json", nil, nil, nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "id", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "id", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("500 on service error", func(t *testing.T) {
@@ -138,7 +139,7 @@ func TestJWKSHandler_RateLimit(t *testing.T) {
 		second := doJSON(t, r, http.MethodGet, path, nil, nil, nil)
 		require.Equal(t, http.StatusTooManyRequests, second.Code)
 		er := decodeErrorBody(t, second)
-		assert.Equal(t, "rate_limited", er.Error)
+		assert.Equal(t, "rate_limited", er.ErrorCode)
 	})
 
 	t.Run("per-tenant limit isolates tenants and every 429 is counted", func(t *testing.T) {
@@ -320,7 +321,7 @@ func TestJWKSHandler_AllKeysUnreadableIs503(t *testing.T) {
 	rec := doJSON(t, r, http.MethodGet, jwksPath(uuid.New()), nil, nil, nil)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	er := decodeErrorBody(t, rec)
-	assert.Equal(t, "jwks_keys_unavailable", er.Error, "not secret_store_unavailable, whose frozen status is 502")
+	assert.Equal(t, "jwks_keys_unavailable", er.ErrorCode, "not SECRET_STORE_UNAVAILABLE, whose frozen status is 502")
 	assert.Equal(t, http.StatusServiceUnavailable, er.Status)
 	assert.Equal(t, before+2, testutil.ToFloat64(metrics.JWKSKeyErrorsTotal))
 }
@@ -335,7 +336,7 @@ func TestJWKSHandler_ActiveKeyUnreadableIs503(t *testing.T) {
 	r := newJWKSTestRouter(&fakeJWKSService{keys: []map[string]any{{"kty": "RSA", "kid": "old"}}, skipped: 1, activeSkipped: true})
 	rec := doJSON(t, r, http.MethodGet, jwksPath(uuid.New()), nil, nil, nil)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	assert.Equal(t, "jwks_keys_unavailable", decodeErrorBody(t, rec).Error)
+	assert.Equal(t, "jwks_keys_unavailable", decodeErrorBody(t, rec).ErrorCode)
 	assert.Equal(t, before+1, testutil.ToFloat64(metrics.JWKSKeyErrorsTotal))
 }
 

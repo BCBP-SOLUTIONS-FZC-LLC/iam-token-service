@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	httpadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/adapter/inbound/http"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 )
 
 func TestPingerFunc_Health(t *testing.T) {

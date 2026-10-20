@@ -168,8 +168,8 @@ func TestRevoke_NonexistentVersion(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	if er.Error != "principal_not_found" {
-		t.Fatalf("error = %q, want principal_not_found", er.Error)
+	if er.ErrorCode != "principal_not_found" {
+		t.Fatalf("error = %q, want principal_not_found", er.ErrorCode)
 	}
 }
 
@@ -203,7 +203,7 @@ func TestCredentials_CrossTenantIsolation(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-tenant revoke status = %d, want 404", resp.StatusCode)
 	}
-	if er.Error != "principal_not_found" {
-		t.Fatalf("error = %q, want principal_not_found", er.Error)
+	if er.ErrorCode != "principal_not_found" {
+		t.Fatalf("error = %q, want principal_not_found", er.ErrorCode)
 	}
 }

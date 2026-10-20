@@ -85,7 +85,7 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, path, map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -94,7 +94,8 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		rec := doJSON(t, r, http.MethodPost, badPath, sysHeaders(tenantID), issueOrRotateRequestBody{RotationID: rotationID.String()}, nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "principal_id", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "principal_id", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("400 malformed JSON body", func(t *testing.T) {
@@ -108,7 +109,8 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		rec := doJSON(t, r, http.MethodPost, path, sysHeaders(tenantID), issueOrRotateRequestBody{RotationID: "not-a-uuid"}, nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "rotation_id", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "rotation_id", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("omitted rotation_id passes through as uuid.Nil", func(t *testing.T) {
@@ -199,7 +201,7 @@ func TestCredentialHandler_Revoke(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, base+"/1/revoke", nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -214,7 +216,8 @@ func TestCredentialHandler_Revoke(t *testing.T) {
 		rec := doRequest(t, r, http.MethodPost, base+"/abc/revoke", sysHeaders(tenantID), nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "version", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "version", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("400 non-positive version", func(t *testing.T) {

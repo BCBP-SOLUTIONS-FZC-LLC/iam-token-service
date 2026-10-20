@@ -54,7 +54,7 @@ docs/swagger/  generated OpenAPI (make swag)
 ## Shared library dependencies
 
 Pinned in `go.mod`: platform-gincommon v1.6.0, platform-events/v2 v2.1.0,
-platform-pgcommon/v2 v2.0.0.
+platform-pgcommon/v2 v2.0.1.
 
 - **`platform-pgcommon`** — pool/RLS-GUC/retry (`pgcommon.Pool`, `SET LOCAL app.tenant_id`), per-transaction `PG_STATEMENT_TIMEOUT`/`PG_LOCK_TIMEOUT` (`SET LOCAL`, app and reconciler pools), `pgmetrics` (`platform_db_*`, `pool` label `default`/`reconciler`); `Config.Tracer` takes gincommon's `NewSpanTracer`.
 - **`platform-events`** — envelope, transactional outbox (`outbox.Enqueue`/`outbox.Runner`, dead letters, `PrunePublished`), SNS/SQS transport, `pkg/inbox` (consumer dedup over `processed_events`), queue-depth sampler, its own `platform_*` metrics. `eventbus`'s `Codec`/`NoopCodec` are type aliases to `events.Codec`/`events.NoopCodec`.

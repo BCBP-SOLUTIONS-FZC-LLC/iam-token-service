@@ -62,13 +62,13 @@ type principalResponseBody struct {
 // @Param        request  body      registerRequestBody   true  "Principal registration"
 // @Success      200      {object}  principalResponseBody  "already registered — idempotent repeat"
 // @Success      201      {object}  principalResponseBody  "created"
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      409  {object}  ErrorResponse  "rotation_in_flight (retryable; the principal row is locked by a concurrent credential write)"
-// @Failure      415  {object}  ErrorResponse  "unsupported_media_type"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      409  {object}  ProblemDetails  "rotation_in_flight (retryable; the principal row is locked by a concurrent credential write)"
+// @Failure      415  {object}  ProblemDetails  "unsupported_media_type"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts [post]
 func (h *PrincipalHandler) Register(c *gin.Context) {
@@ -147,12 +147,12 @@ type readPrincipalResponseBody struct {
 // @Param        id            path      string  true  "Tenant UUID"     format(uuid)
 // @Param        principal_id  path      string  true  "Principal UUID"  format(uuid)
 // @Success      200           {object}  readPrincipalResponseBody
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      404  {object}  ErrorResponse  "principal_not_found"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      404  {object}  ProblemDetails  "principal_not_found"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id} [get]
 func (h *PrincipalHandler) Read(c *gin.Context) {
@@ -217,12 +217,12 @@ func (h *PrincipalHandler) Read(c *gin.Context) {
 // @Param        id             path      string  true  "Tenant UUID"          format(uuid)
 // @Param        principal_sub  query     string  true  "Keycloak sub UUID"    format(uuid)
 // @Success      200            {object}  principalResponseBody
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      404  {object}  ErrorResponse  "principal_not_found"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      404  {object}  ProblemDetails  "principal_not_found"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts [get]
 func (h *PrincipalHandler) FindBySub(c *gin.Context) {
@@ -274,12 +274,12 @@ type automationPrincipalResponseBody struct {
 // @Produce      json
 // @Param        id   path      string  true  "Tenant UUID"  format(uuid)
 // @Success      200  {object}  automationPrincipalResponseBody
-// @Failure      400  {object}  ErrorResponse  "invalid_request"
-// @Failure      401  {object}  ErrorResponse  "missing_identity_headers"
-// @Failure      403  {object}  ErrorResponse  "tenant_path_mismatch"
-// @Failure      404  {object}  ErrorResponse  "principal_not_found"
-// @Failure      500  {object}  ErrorResponse
-// @Failure      503  {object}  ErrorResponse  "db_unavailable"
+// @Failure      400  {object}  ProblemDetails  "invalid_request"
+// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
+// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
+// @Failure      404  {object}  ProblemDetails  "principal_not_found"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      503  {object}  ProblemDetails  "db_unavailable"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/platform-automation [get]
 func (h *PrincipalHandler) ReadPlatformAutomation(c *gin.Context) {

@@ -3,8 +3,7 @@ package domain
 import "fmt"
 
 // ErrorCode is one of the frozen §17 error taxonomy codes, surfaced through
-// platform-gincommon's flat ErrorResponse shape
-// ({error, status, trace_id, request_id, details?}).
+// platform-gincommon as an RFC 9457 Problem Details errorCode (UPPER_SNAKE_CASE).
 type ErrorCode string
 
 // ErrorCode values (§17).

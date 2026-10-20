@@ -288,8 +288,8 @@ func TestRouter_MissingIdentityHeaders_FrozenCode(t *testing.T) {
 			rec := doRequest(t, r.Handler(), http.MethodGet, path, headers, nil)
 			require.Equal(t, http.StatusUnauthorized, rec.Code)
 			er := decodeErrorBody(t, rec)
-			assert.Equal(t, "missing_identity_headers", er.Error)
-			assert.Nil(t, er.Details, "§17: no details on missing_identity_headers")
+			assert.Equal(t, "missing_identity_headers", er.ErrorCode)
+			assert.Empty(t, er.ValidationErrors, "no validationErrors on MISSING_IDENTITY_HEADERS")
 		})
 	}
 }
@@ -320,7 +320,7 @@ func TestRequireIdentityHeaders_RepeatedHeaderIsMissingIdentity(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 
 	req = httptest.NewRequest(http.MethodGet, "/probe", nil)
 	req.Header.Set("x-user-id", domain.SystemPrincipalID.String())

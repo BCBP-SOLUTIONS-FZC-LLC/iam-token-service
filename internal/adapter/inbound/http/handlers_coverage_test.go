@@ -28,7 +28,7 @@ func TestPrincipalHandler_ReadPlatformAutomation_NoRequestContextIs401(t *testin
 	h.ReadPlatformAutomation(c)
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 }
 
 // WithLogger returns the same handler for chaining, and a failed refresh is

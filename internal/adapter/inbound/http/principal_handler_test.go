@@ -57,7 +57,7 @@ func TestPrincipalHandler_Register(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodPost, "/tenants/"+tenantID.String()+"/service-accounts", map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 malformed JSON body", func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestPrincipalHandler_Register(t *testing.T) {
 		rec := doRequest(t, r, http.MethodPost, "/tenants/"+tenantID.String()+"/service-accounts", sysHeaders(tenantID), []byte(`{not-json`))
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "invalid_request", er.Error)
+		assert.Equal(t, "invalid_request", er.ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
@@ -74,7 +74,8 @@ func TestPrincipalHandler_Register(t *testing.T) {
 			registerRequestBody{PrincipalSub: "not-a-uuid", KeycloakClientID: domain.KeycloakClientPlatformAutomation}, nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "principal_sub", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "principal_sub", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("403 tenant path mismatch", func(t *testing.T) {
@@ -142,7 +143,7 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts/"+principalID.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -150,7 +151,8 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts/not-a-uuid", sysHeaders(tenantID), nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "principal_id", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "principal_id", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("404 principal not found", func(t *testing.T) {
@@ -190,7 +192,7 @@ func TestPrincipalHandler_FindBySub(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
@@ -198,7 +200,8 @@ func TestPrincipalHandler_FindBySub(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub=not-a-uuid", sysHeaders(tenantID), nil)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "principal_sub", er.Details["field"])
+		require.Len(t, er.ValidationErrors, 1)
+		assert.Equal(t, "principal_sub", er.ValidationErrors[0].Field)
 	})
 
 	t.Run("400 missing principal_sub", func(t *testing.T) {
@@ -265,6 +268,6 @@ func TestPrincipalHandler_ReadPlatformAutomation(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, path, nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).Error)
+		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
 	})
 }
