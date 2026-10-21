@@ -6,6 +6,11 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (Workflow admitted to TS-6, TS-D28 — 2026-10-22)
+
+- **Workflow is admitted to TS-6 by default** (Workflow open question I5): `networkPolicy.workflowNamespaceSelector` and `authorizationPolicy.workflowNamespaces` default to `workflow-app`, the platform namespace. Admission is per namespace, so Execution's API service and its connector workers both qualify. The Istio rule keeps Workflow to `GET …/service-accounts/platform-automation`.
+- **Fail closed:** the Workflow NetworkPolicy rule now renders only when `authorizationPolicy.enabled`. NetworkPolicy admits the whole HTTP port, where TS-1/TS-2/TS-4 are gated only by the reserved `x-user-id`, so admitting Workflow without the mesh policy would let it request a private key. Set the selector to `null` to drop the rule.
+
 ### Changed (RFC 9457 leftovers, TS-D27 — 2026-10-21)
 
 - **`errorCode` is UPPER_SNAKE_CASE.** The `.WithCode(<lowercase §17 code>)` overrides are gone; every problem's `errorCode` is its registered `problem.Type` code (`PRINCIPAL_NOT_FOUND`, `ROTATION_IN_FLIGHT`, …; platform `RATE_LIMIT_EXCEEDED` replaces `rate_limited`, `UNSUPPORTED_MEDIA_TYPE`, `INTERNAL_ERROR`). Statuses and meanings unchanged; `domain.ErrorCode` stays lowercase internally. **Breaking for callers that matched the lowercase values** (nothing deployed).
