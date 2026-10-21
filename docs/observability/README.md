@@ -19,7 +19,7 @@ How this service implements the standard defined and enforced by [platform-ginco
 
 | Library | Version | Emits here | Wiring |
 |---|---|---|---|
-| platform-gincommon | v1.6.0 | `platform_http_*`, `platform_build_info`, `platform_library_info{library="platform-gincommon"}`; owns the registry and `metricslint` | `gincommon.ObservabilityMiddlewares(cfg)` in `internal/adapter/inbound/http/router.go` (server) and on the consumer's health router; `/metrics` served by `gincommon.MetricsHandler()` on `METRICS_PORT` in all four binaries |
+| platform-gincommon/v2 | v2.1.0 | `platform_http_*`, `platform_build_info`, `platform_library_info{library="platform-gincommon"}`; owns the registry and `metricslint` | `gincommon.ObservabilityMiddlewares(cfg)` in `internal/adapter/inbound/http/router.go` (server) and on the consumer's health router; `/metrics` served by `gincommon.MetricsHandler()` on `METRICS_PORT` in all four binaries |
 | platform-events/v2 | v2.0.0 | `platform_messages_*`, `platform_retry_total`, `platform_dlq_messages_total`, `platform_outbox_*`, `platform_dependency_request_seconds` (SNS/SQS/codec), `platform_event_propagation_seconds`, ... | `events.InitMetrics(events.MetricsIdentityFromLabels(gincommon.MetricsConstLabels()), gincommon.MetricsRegisterer())` in `metrics.InitLibraryMetrics` |
 | platform-pgcommon/v2 | v2.0.0 | `platform_db_*`, labelled `pool="default"` (RLS-scoped app pool) and `pool="reconciler"` (BYPASSRLS enumeration pool, `SystemPoolConfig`) | `pgmetrics.InitWithIdentity(pgmetrics.IdentityFromLabels(...), gincommon.MetricsRegisterer())` in `metrics.InitLibraryMetrics`, before `pgcommon.NewPool` |
 
