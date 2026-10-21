@@ -37,19 +37,18 @@ var (
 )
 
 // writeInvalidRequest aborts with a 400 problem carrying one validationErrors
-// entry for HTTP-layer parse failures on path and body values. The errorCode
-// wire value is the frozen §17 code "invalid_request".
+// entry for HTTP-layer parse failures on path and body values (errorCode
+// INVALID_REQUEST). A body that fails to bind goes through
+// gincommon.ShouldBindJSON instead (VALIDATION_FAILED, or 413 when oversized).
 func writeInvalidRequest(c *gin.Context, field, message string) {
 	gincommon.AbortWithProblem(c, problem.NewError(problemTypeInvalidRequest, "").
-		WithCode(string(domain.ErrInvalidRequest)).
 		WithFields(problem.FieldError{Field: field, Message: message}))
 }
 
-// writeMissingIdentityHeaders aborts with a 401 problem. The errorCode wire
-// value is the frozen §17 code "missing_identity_headers".
+// writeMissingIdentityHeaders aborts with a 401 problem (errorCode
+// MISSING_IDENTITY_HEADERS).
 func writeMissingIdentityHeaders(c *gin.Context) {
-	gincommon.AbortWithProblem(c, problem.NewError(problemTypeMissingIdentityHeaders, "").
-		WithCode(string(domain.ErrMissingIdentityHeaders)))
+	gincommon.AbortWithProblem(c, problem.NewError(problemTypeMissingIdentityHeaders, ""))
 }
 
 // HandleError translates a domain or infrastructure error to an RFC 9457 problem
@@ -77,26 +76,24 @@ func toProblem(err error) *problem.Error {
 	// maps 55P03 → rotation_in_flight before errors reach handlers; a leaked
 	// one must still classify correctly.
 	if isLockNotAvailable(err) {
-		return problem.NewError(problemTypeRotationInFlight, "").WithCode(string(domain.ErrRotationInFlight))
+		return problem.NewError(problemTypeRotationInFlight, "")
 	}
 	// Defense in depth: SQLSTATE class 08/53/57/58. The adapter maps these to
 	// db_unavailable; a leaked one must still produce 503, not 500.
 	if isUnavailableSQLState(err) {
-		return problem.NewError(problemTypeDBUnavailable, "The database is unavailable.").WithCode(string(domain.ErrDBUnavailable))
+		return problem.NewError(problemTypeDBUnavailable, "The database is unavailable.")
 	}
-	return problem.NewInternalError(err).WithCode("internal_error")
+	return problem.NewInternalError(err)
 }
 
 // domainErrToProblem converts a typed *domain.Error to a *problem.Error.
-// The RFC 9457 type URI identifies the problem class; the errorCode wire
-// value is the frozen §17 lowercase code (WithCode preserves the exact
-// string callers already depend on, while the Type.Code satisfies the
-// platform registry's UPPER_SNAKE_CASE requirement internally).
+// The RFC 9457 type URI identifies the problem class and the errorCode is the
+// type's registered UPPER_SNAKE_CASE code (the §17 code upper-cased, TS-D27);
+// the lowercase domain.ErrorCode stays an internal identifier only.
 func domainErrToProblem(de *domain.Error) *problem.Error {
 	switch de.Code {
 	case domain.ErrInvalidRequest:
-		pe := problem.NewError(problemTypeInvalidRequest, de.Message).
-			WithCode(string(domain.ErrInvalidRequest))
+		pe := problem.NewError(problemTypeInvalidRequest, de.Message)
 		if f, ok := de.Details["field"].(string); ok {
 			msg, _ := de.Details["reason"].(string)
 			if msg == "" {
@@ -106,75 +103,47 @@ func domainErrToProblem(de *domain.Error) *problem.Error {
 		}
 		return pe
 	case domain.ErrMissingIdentityHeaders:
-		return problem.NewError(problemTypeMissingIdentityHeaders, "").
-			WithCode(string(domain.ErrMissingIdentityHeaders))
+		return problem.NewError(problemTypeMissingIdentityHeaders, "")
 	case domain.ErrPrincipalNotFound:
-		return problem.NewError(problemTypePrincipalNotFound, de.Message).
-			WithCode(string(domain.ErrPrincipalNotFound))
+		return problem.NewError(problemTypePrincipalNotFound, de.Message)
 	case domain.ErrRotationInFlight:
 		detail := de.Message
 		if rid, ok := de.Details["active_rotation_id"].(string); ok && rid != "" {
 			detail = fmt.Sprintf("A rotation is already in progress (rotation %s).", rid)
 		}
-		return problem.NewError(problemTypeRotationInFlight, detail).
-			WithCode(string(domain.ErrRotationInFlight))
+		return problem.NewError(problemTypeRotationInFlight, detail)
 	case domain.ErrOptimisticLockConflict:
 		detail := de.Message
 		if v, ok := de.Details["expected_version"]; ok {
 			detail = fmt.Sprintf("The record was modified since version %v was read.", v)
 		}
-		return problem.NewError(problemTypeOptimisticLockConflict, detail).
-			WithCode(string(domain.ErrOptimisticLockConflict))
+		return problem.NewError(problemTypeOptimisticLockConflict, detail)
 	case domain.ErrCredentialReplayRevoked:
-		return problem.NewError(problemTypeCredentialReplayRevoked, de.Message).
-			WithCode(string(domain.ErrCredentialReplayRevoked))
+		return problem.NewError(problemTypeCredentialReplayRevoked, de.Message)
 	case domain.ErrCredentialReplayExpired:
 		detail := de.Message
 		if v, ok := de.Details["version"]; ok {
 			detail = fmt.Sprintf("Credential version %v replay window has expired.", v)
 		}
-		return problem.NewError(problemTypeCredentialReplayExpired, detail).
-			WithCode(string(domain.ErrCredentialReplayExpired))
+		return problem.NewError(problemTypeCredentialReplayExpired, detail)
 	case domain.ErrPrincipalRevoked:
-		return problem.NewError(problemTypePrincipalRevoked, de.Message).
-			WithCode(string(domain.ErrPrincipalRevoked))
+		return problem.NewError(problemTypePrincipalRevoked, de.Message)
 	case domain.ErrSecretStoreUnavailable:
-		return problem.NewError(problemTypeSecretStoreUnavailable, "The secret store is unavailable.").
-			WithCode(string(domain.ErrSecretStoreUnavailable))
+		return problem.NewError(problemTypeSecretStoreUnavailable, "The secret store is unavailable.")
 	case domain.ErrDBUnavailable:
-		return problem.NewError(problemTypeDBUnavailable, "The database is unavailable.").
-			WithCode(string(domain.ErrDBUnavailable))
+		return problem.NewError(problemTypeDBUnavailable, "The database is unavailable.")
 	case domain.ErrJWKSKeysUnavailable:
-		return problem.NewError(problemTypeJWKSKeysUnavailable, "The JWKS keys are unavailable.").
-			WithCode(string(domain.ErrJWKSKeysUnavailable))
+		return problem.NewError(problemTypeJWKSKeysUnavailable, "The JWKS keys are unavailable.")
 	default:
-		return problem.NewInternalError(de).WithCode("internal_error")
+		return problem.NewInternalError(de)
 	}
 }
 
-// ProblemDetails is the RFC 9457 problem details shape emitted for every
-// non-2xx response (Content-Type: application/problem+json). Defined here only
-// for Swagger documentation — the authoritative implementation is in
-// platform-gincommon (pkg/problem.Problem). Handlers never construct this type.
-type ProblemDetails struct {
-	Type             string           `json:"type" example:"https://errors.company.com/iam/principal-not-found"`
-	Title            string           `json:"title" example:"Principal Not Found"`
-	Status           int              `json:"status" example:"404"`
-	Detail           string           `json:"detail,omitempty" example:"Principal abc123 was not found."`
-	Instance         string           `json:"instance,omitempty" example:"/api/v1/internal/tenants/t1/service-accounts/p1"`
-	TraceID          string           `json:"traceId,omitempty" example:"4bf92f3577b34da6a3ce929d0e0e4736"`
-	ErrorCode        string           `json:"errorCode,omitempty" example:"PRINCIPAL_NOT_FOUND"`
-	TenantID         string           `json:"tenantId,omitempty" example:"10000000-0000-0000-0000-000000000001"`
-	Timestamp        string           `json:"timestamp,omitempty" example:"2026-10-15T10:45:22Z"`
-	ValidationErrors []ValidationItem `json:"validationErrors,omitempty"`
-}
-
-// ValidationItem is one entry of the validationErrors extension on a
-// 400 INVALID_REQUEST problem (Swagger doc stub — impl in platform-gincommon).
-type ValidationItem struct {
-	Field   string `json:"field" example:"rotation_id"`
-	Message string `json:"message" example:"must be a UUID"`
-}
+// ProblemDetails is the RFC 9457 problem body (application/problem+json) of
+// every non-2xx response, declared as an alias of the platform-gincommon type
+// so swag can resolve it from the @Failure annotations. Handlers never build
+// it: platform-gincommon renders every problem.
+type ProblemDetails = problem.Problem
 
 // isUnavailableSQLState reports whether err is a *pgconn.PgError whose SQLSTATE
 // class indicates a connectivity or resource failure (08, 53, 57, 58). Used for

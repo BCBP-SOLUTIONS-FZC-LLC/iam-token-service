@@ -12,6 +12,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 func newPrincipalTestRouter(svc PrincipalService) *gin.Engine {
@@ -57,7 +58,7 @@ func TestPrincipalHandler_Register(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodPost, "/tenants/"+tenantID.String()+"/service-accounts", map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 malformed JSON body", func(t *testing.T) {
@@ -65,7 +66,7 @@ func TestPrincipalHandler_Register(t *testing.T) {
 		rec := doRequest(t, r, http.MethodPost, "/tenants/"+tenantID.String()+"/service-accounts", sysHeaders(tenantID), []byte(`{not-json`))
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "invalid_request", er.ErrorCode)
+		assert.Equal(t, problem.TypeValidationFailed.Code, er.ErrorCode, "bind errors go through gincommon.ShouldBindJSON")
 	})
 
 	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
@@ -143,7 +144,7 @@ func TestPrincipalHandler_Read(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts/"+principalID.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -192,7 +193,7 @@ func TestPrincipalHandler_FindBySub(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+tenantID.String()+"/service-accounts?principal_sub="+principalSub.String(), nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_sub", func(t *testing.T) {
@@ -268,6 +269,6 @@ func TestPrincipalHandler_ReadPlatformAutomation(t *testing.T) {
 		r := newPrincipalTestRouter(&fakePrincipalService{})
 		rec := doRequest(t, r, http.MethodGet, path, nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 }

@@ -202,9 +202,12 @@ dependency rules: [architecture.md](architecture.md).
   the consumer's decode-only codec.
 - **`internal/core/domain/errors.go`** — the frozen §17 codes plus additive
   ones (`db_unavailable`, `credential_replay_revoked`,
-  `credential_replay_expired`, `jwks_keys_unavailable`); the HTTP layer
-  also writes `rate_limited`, `tenant_path_mismatch`,
-  `unsupported_media_type`, `internal_error`.
+  `credential_replay_expired`, `jwks_keys_unavailable`), lowercase internal
+  identifiers only. On the wire `errorCode` is the UPPER_SNAKE code of the
+  `problem.Type` in `http/errors.go` (TS-D27); the HTTP layer also writes
+  `TENANT_PATH_MISMATCH` and the platform types `RATE_LIMIT_EXCEEDED`,
+  `UNSUPPORTED_MEDIA_TYPE`, `VALIDATION_FAILED`, `PAYLOAD_TOO_LARGE`,
+  `INTERNAL_ERROR`. Every error body goes through platform-gincommon.
 - **`deploy/helm/templates/validate.yaml`** — render guards outside
   local/dev/test: `authorizationPolicy.enabled` (with `meshNamespaces` and
   `keycloakNamespaces`), `events.topicArn`, `sqs.queueUrl`, docs need auth;

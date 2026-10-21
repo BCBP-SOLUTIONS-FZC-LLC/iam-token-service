@@ -88,38 +88,40 @@ TS-1, TS-2 and the offboarding cascade serialize per principal on a row lock (`L
 
 ### Error codes
 
-Every non-2xx response is an **RFC 9457 Problem Details** object (`application/problem+json`) rendered by `platform-gincommon` v2's global error handler (`pkg/gincommon.AbortWithProblem`). The service registers a domain-specific `problem.Type` per error code (`internal/adapter/inbound/http/errors.go`); it never writes a raw JSON error body itself. A bind failure is one `400 INVALID_REQUEST` with a `validationErrors` array (field + fixed message).
+Every non-2xx response is an **RFC 9457 Problem Details** object (`application/problem+json`) rendered by `platform-gincommon` v2's global error handler (`pkg/gincommon.AbortWithProblem`). The service registers a domain-specific `problem.Type` per error code (`internal/adapter/inbound/http/errors.go`); it never writes a raw JSON error body itself. A path/field parse failure is one `400 INVALID_REQUEST` with a `validationErrors` entry (field + fixed message); a body that does not bind goes through `gincommon.ShouldBindJSON` (`400 VALIDATION_FAILED`, or `413 PAYLOAD_TOO_LARGE` past the 1 MB cap).
 
 | `errorCode` value | Status | Trigger | §17 | RFC 9457 extra field |
 |---|---|---|---|---|
-| `invalid_request` | 400 | Malformed JSON, a UUID/integer parse failure, or a business-rule field check | Frozen | `validationErrors[].field` / `.message` |
-| `missing_identity_headers` | 401 | `x-user-id`/`x-tenant-id` missing, repeated or not a UUID, or `x-user-id` is not iam-system | Frozen | — |
-| `tenant_path_mismatch` | 403 | Path `:id` differs from `x-tenant-id` | Additive | — |
-| `principal_not_found` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6) | Frozen | — |
-| `rotation_in_flight` | 409 | Principal row lock not obtained within `PG_LOCK_TIMEOUT` (active rotation in `detail`) | Frozen | `detail` |
-| `optimistic_lock_conflict` | 409 | A concurrent writer changed `record_version` (expected version in `detail`) | Frozen | `detail` |
-| `credential_replay_revoked` | 409 | `rotation_id` replay of a since-revoked version (TS-D13) | Additive | — |
-| `credential_replay_expired` | 409 | `rotation_id` replay past `ROTATION_REPLAY_WINDOW` (version in `detail`) | Additive | `detail` |
-| `unsupported_media_type` | 415 | Write body without `Content-Type: application/json` | Additive | — |
-| `principal_revoked` | 422 | TS-1/TS-2 against a revoked (offboarded) principal | Frozen | — |
-| `rate_limited` | 429 | JWKS route limiter refused the request | Additive | — |
-| `internal_error` | 500 | Anything unclassified (logged, no `detail` sent) | Additive | — |
-| `secret_store_unavailable` | 502 | OpenBao write/delete failed; nothing was committed | Frozen | — |
-| `db_unavailable` | 503 | Postgres connectivity/resource exhaustion, by SQLSTATE class `08`/`53`/`57`/`58` or a closed pool only (TS-D16) | Additive | — |
-| `jwks_keys_unavailable` | 503 | JWKS route: the active key, or every key, unreadable (TS-D23) | Additive | — |
+| `INVALID_REQUEST` | 400 | A UUID/integer parse failure or a business-rule field check | Frozen | `validationErrors[].field` / `.message` |
+| `MISSING_IDENTITY_HEADERS` | 401 | `x-user-id`/`x-tenant-id` missing, repeated or not a UUID, or `x-user-id` is not iam-system | Frozen | — |
+| `TENANT_PATH_MISMATCH` | 403 | Path `:id` differs from `x-tenant-id` | Additive | — |
+| `PRINCIPAL_NOT_FOUND` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6) | Frozen | — |
+| `ROTATION_IN_FLIGHT` | 409 | Principal row lock not obtained within `PG_LOCK_TIMEOUT` (active rotation in `detail`) | Frozen | `detail` |
+| `OPTIMISTIC_LOCK_CONFLICT` | 409 | A concurrent writer changed `record_version` (expected version in `detail`) | Frozen | `detail` |
+| `CREDENTIAL_REPLAY_REVOKED` | 409 | `rotation_id` replay of a since-revoked version (TS-D13) | Additive | — |
+| `CREDENTIAL_REPLAY_EXPIRED` | 409 | `rotation_id` replay past `ROTATION_REPLAY_WINDOW` (version in `detail`) | Additive | `detail` |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | Write body without `Content-Type: application/json` (platform type) | Additive | — |
+| `PRINCIPAL_REVOKED` | 422 | TS-1/TS-2 against a revoked (offboarded) principal | Frozen | — |
+| `VALIDATION_FAILED` | 400 | Malformed or empty JSON body (platform type, `gincommon.ShouldBindJSON`) | Platform | — |
+| `PAYLOAD_TOO_LARGE` | 413 | Body over the 1 MB cap (platform type) | Platform | — |
+| `RATE_LIMIT_EXCEEDED` | 429 | JWKS route limiter refused the request (platform type) | Additive | — |
+| `INTERNAL_ERROR` | 500 | Anything unclassified (logged, no `detail` sent; platform type) | Additive | — |
+| `SECRET_STORE_UNAVAILABLE` | 502 | OpenBao write/delete failed; nothing was committed | Frozen | — |
+| `DB_UNAVAILABLE` | 503 | Postgres connectivity/resource exhaustion, by SQLSTATE class `08`/`53`/`57`/`58` or a closed pool only (TS-D16) | Additive | — |
+| `JWKS_KEYS_UNAVAILABLE` | 503 | JWKS route: the active key, or every key, unreadable (TS-D23) | Additive | — |
 
-The seven frozen §17 codes keep their exact wire values (lowercase); only the containing field name changed from `error` to `errorCode` with the RFC 9457 adoption (TS-D26). Domain-level additive codes are commented as such in `internal/core/domain/errors.go`.
+The `errorCode` is always the registered problem type's UPPER_SNAKE_CASE code — the §17 code upper-cased, or the platform type's own code for `RATE_LIMIT_EXCEEDED`/`UNSUPPORTED_MEDIA_TYPE`/`INTERNAL_ERROR` (TS-D27; the lowercase wire values TS-D26 kept were dropped, nothing being deployed). The lowercase `domain.ErrorCode` values in `internal/core/domain/errors.go` are internal identifiers only, never sent.
 
 ### Notable validation rules
 
 | Field | Rule | Error |
 |---|---|---|
-| `id` (path) | UUID; must equal `x-tenant-id` | `400` / `403 tenant_path_mismatch` |
-| `principal_id` (path), `principal_sub` (TS-4 body, TS-5 query) | UUID | `400 invalid_request` |
-| `rotation_id` (TS-1 body) | Required UUID (checked in the service layer) | `400 invalid_request` |
+| `id` (path) | UUID; must equal `x-tenant-id` | `400` / `403 TENANT_PATH_MISMATCH` |
+| `principal_id` (path), `principal_sub` (TS-4 body, TS-5 query) | UUID | `400 INVALID_REQUEST` |
+| `rotation_id` (TS-1 body) | Required UUID (checked in the service layer) | `400 INVALID_REQUEST` |
 | `overlap_seconds` (TS-1 body) | Omitted = `ROTATION_DEFAULT_OVERLAP_SECONDS` (300); `0` = hard cutover; clamped to `[0, 900]` (`domain.ClampOverlapSeconds`) | Never rejected |
-| `version` (path, TS-2) | Integer | `400 invalid_request` |
-| `keycloak_client_id` (TS-4 body) | `platform-automation` or `platform-automation-<tenant_id>` (`domain.ValidPlatformAutomationClientID`, service layer) | `400 invalid_request` |
+| `version` (path, TS-2) | Integer | `400 INVALID_REQUEST` |
+| `keycloak_client_id` (TS-4 body) | `platform-automation` or `platform-automation-<tenant_id>` (`domain.ValidPlatformAutomationClientID`, service layer) | `400 INVALID_REQUEST` |
 
 Mutation responses include `record_version`. No response ever includes a stored secret except TS-1's freshly generated private key. Logs carry `tenant_id`, `principal_id`, `version`, `op`, `result`, never a credential field.
 

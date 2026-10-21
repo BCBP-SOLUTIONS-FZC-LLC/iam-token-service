@@ -160,6 +160,9 @@ func doJSON(t *testing.T, h http.Handler, method, path string, headers map[strin
 // decodeErrorBody decodes rec's body as an RFC 9457 problem.Problem.
 func decodeErrorBody(t *testing.T, rec *httptest.ResponseRecorder) problem.Problem {
 	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); !problem.IsProblemContentType(ct) {
+		t.Fatalf("Content-Type = %q, want application/problem+json, body=%s", ct, rec.Body.String())
+	}
 	var p problem.Problem
 	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
 		t.Fatalf("decode problem body: %v, body=%s", err, rec.Body.String())

@@ -12,6 +12,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/pkg/requestctx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 )
 
 // CredentialService is the subset of *service.CredentialService this
@@ -81,16 +82,16 @@ type issueOrRotateResponseBody struct {
 // @Param        request       body      issueOrRotateRequestBody  true  "rotation_id required; overlap_seconds optional (defaults to the configured value, §12)"
 // @Success      200           {object}  issueOrRotateResponseBody  "rotation_id replay — already committed"
 // @Success      201           {object}  issueOrRotateResponseBody  "issued or rotated"
-// @Failure      400  {object}  ProblemDetails  "invalid_request"
-// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
-// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
-// @Failure      404  {object}  ProblemDetails  "principal_not_found"
-// @Failure      409  {object}  ProblemDetails  "rotation_in_flight (retryable; incl. principal lock wait timeout) | optimistic_lock_conflict | credential_replay_revoked | credential_replay_expired — details.version on the replay codes"
-// @Failure      415  {object}  ProblemDetails  "unsupported_media_type"
-// @Failure      422  {object}  ProblemDetails  "principal_revoked"
+// @Failure      400  {object}  ProblemDetails  "INVALID_REQUEST (field) | VALIDATION_FAILED (unbindable body)"
+// @Failure      401  {object}  ProblemDetails  "MISSING_IDENTITY_HEADERS"
+// @Failure      403  {object}  ProblemDetails  "TENANT_PATH_MISMATCH"
+// @Failure      404  {object}  ProblemDetails  "PRINCIPAL_NOT_FOUND"
+// @Failure      409  {object}  ProblemDetails  "ROTATION_IN_FLIGHT (retryable; incl. principal lock wait timeout) | OPTIMISTIC_LOCK_CONFLICT | CREDENTIAL_REPLAY_REVOKED | CREDENTIAL_REPLAY_EXPIRED — version in detail on the replay codes"
+// @Failure      415  {object}  ProblemDetails  "UNSUPPORTED_MEDIA_TYPE"
+// @Failure      422  {object}  ProblemDetails  "PRINCIPAL_REVOKED"
 // @Failure      500  {object}  ProblemDetails
-// @Failure      502  {object}  ProblemDetails  "secret_store_unavailable"
-// @Failure      503  {object}  ProblemDetails  "db_unavailable"
+// @Failure      502  {object}  ProblemDetails  "SECRET_STORE_UNAVAILABLE"
+// @Failure      503  {object}  ProblemDetails  "DB_UNAVAILABLE"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials [post]
 func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
@@ -107,8 +108,8 @@ func (h *CredentialHandler) IssueOrRotate(c *gin.Context) {
 	}
 
 	var body issueOrRotateRequestBody
-	if err := c.ShouldBindJSON(&body); err != nil {
-		writeInvalidRequest(c, "body", "malformed JSON body")
+	if err := gincommon.ShouldBindJSON(c, &body); err != nil {
+		gincommon.AbortWithProblem(c, err)
 		return
 	}
 
@@ -186,15 +187,15 @@ type revokeResponseBody struct {
 // @Param        principal_id  path      string  true  "Principal UUID"   format(uuid)
 // @Param        version       path      int     true  "Credential version"
 // @Success      200           {object}  revokeResponseBody
-// @Failure      400  {object}  ProblemDetails  "invalid_request"
-// @Failure      401  {object}  ProblemDetails  "missing_identity_headers"
-// @Failure      403  {object}  ProblemDetails  "tenant_path_mismatch"
-// @Failure      404  {object}  ProblemDetails  "principal_not_found"
-// @Failure      409  {object}  ProblemDetails  "rotation_in_flight (retryable; principal lock wait timeout) | optimistic_lock_conflict"
-// @Failure      415  {object}  ProblemDetails  "unsupported_media_type (only when a body is sent)"
+// @Failure      400  {object}  ProblemDetails  "INVALID_REQUEST"
+// @Failure      401  {object}  ProblemDetails  "MISSING_IDENTITY_HEADERS"
+// @Failure      403  {object}  ProblemDetails  "TENANT_PATH_MISMATCH"
+// @Failure      404  {object}  ProblemDetails  "PRINCIPAL_NOT_FOUND"
+// @Failure      409  {object}  ProblemDetails  "ROTATION_IN_FLIGHT (retryable; principal lock wait timeout) | OPTIMISTIC_LOCK_CONFLICT"
+// @Failure      415  {object}  ProblemDetails  "UNSUPPORTED_MEDIA_TYPE (only when a body is sent)"
 // @Failure      500  {object}  ProblemDetails
-// @Failure      502  {object}  ProblemDetails  "secret_store_unavailable"
-// @Failure      503  {object}  ProblemDetails  "db_unavailable"
+// @Failure      502  {object}  ProblemDetails  "SECRET_STORE_UNAVAILABLE"
+// @Failure      503  {object}  ProblemDetails  "DB_UNAVAILABLE"
 // @Security     TenantID && UserID
 // @Router       /tenants/{id}/service-accounts/{principal_id}/credentials/{version}/revoke [post]
 func (h *CredentialHandler) Revoke(c *gin.Context) {
