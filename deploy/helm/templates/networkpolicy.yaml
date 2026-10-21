@@ -28,7 +28,7 @@ required outside local/dev/test (templates/validate.yaml).
 {{- fail "networkPolicy.ingressNamespaceSelector is required when networkPolicy.enabled is true — an empty selector matches every namespace in the cluster (no restriction). Set it to a real namespace label selector scoping ingress to your mesh namespace(s), e.g. {matchLabels: {mesh: iam}}. See values.yaml." }}
 {{- end }}
 {{- if not .Values.networkPolicy.monitoringNamespaceSelector }}
-{{- fail "networkPolicy.monitoringNamespaceSelector is required when networkPolicy.enabled is true — without it Prometheus cannot scrape any pod, ServerDown pages permanently and every other alert goes dark. Set it to your monitoring namespace's label selector, e.g. {matchLabels: {kubernetes.io/metadata.name: monitoring}}. See values.yaml." }}
+{{- fail "networkPolicy.monitoringNamespaceSelector is required when networkPolicy.enabled is true — without it Prometheus cannot scrape any pod, ServerDown pages permanently and every other alert goes dark. Set it to your monitoring namespace's label selector, e.g. {matchLabels: {kubernetes.io/metadata.name: observability}}. See values.yaml." }}
 {{- end }}
 {{- if not (.Values.networkPolicy.egress | default dict).postgresCIDRs }}
 {{- fail "networkPolicy.egress.postgresCIDRs is required when networkPolicy.enabled is true — Postgres (RDS) is off-cluster and a namespaceSelector never matches it, so without its CIDR every workload fails its startup database connection. See values.yaml." }}

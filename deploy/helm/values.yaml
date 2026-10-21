@@ -270,7 +270,7 @@ networkPolicy:
   # to the Prometheus pods, e.g.
   #   monitoringNamespaceSelector:
   #     matchLabels:
-  #       kubernetes.io/metadata.name: monitoring
+  #       kubernetes.io/metadata.name: observability
   #   monitoringPodSelector:
   #     matchLabels:
   #       app.kubernetes.io/name: prometheus
