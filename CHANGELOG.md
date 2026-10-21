@@ -6,6 +6,10 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (deploy: platform namespace names gateway / observability — 2026-10-22)
+
+- Helm NetworkPolicy ingress selector `envoy-gateway-system` → `gateway` (Envoy Gateway data plane) and metrics-ingress selector `monitoring` → `observability` (Prometheus), matching the platform namespace list (AWS dev environment HLD). The chart sets no default selector; only the commented `monitoringNamespaceSelector` example and its `fail` hint change.
+
 ### Changed (Workflow admitted to TS-6, TS-D28 — 2026-10-22)
 
 - **Workflow is admitted to TS-6 by default** (Workflow open question I5): `networkPolicy.workflowNamespaceSelector` and `authorizationPolicy.workflowNamespaces` default to `workflow-app`, the platform namespace. Admission is per namespace, so Execution's API service and its connector workers both qualify. The Istio rule keeps Workflow to `GET …/service-accounts/platform-automation`.
