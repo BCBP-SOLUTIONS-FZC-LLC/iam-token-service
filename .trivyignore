@@ -9,3 +9,15 @@
 # (sha256:afa5c872…) still ships 2026b, so there is no base to move to yet.
 # Drop this line once a rebuilt distroless image carries 2026c.
 DLA-4792-1 exp:2026-11-07
+
+# DLA-4845-1: ca-certificates 20250419~deb12u1 → deb12u2 (removes the
+# distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3"
+# roots). gcr.io/distroless/static-debian12:nonroot does not yet ship the
+# fixed package; the latest upstream image still carries deb12u1 (checked
+# 2026-10-21). The exposure itself is closed: the Dockerfile copies the
+# bookworm builder's deb12u2 bundle over distroless's
+# /etc/ssl/certs/ca-certificates.crt (150 → 148 certs). Trivy still reports
+# the finding only because it reads distroless's dpkg status metadata. The
+# expiry forces a re-check: remove this entry and the COPY once distroless
+# ships deb12u2. Same fix as iam-delegation ed2f405.
+DLA-4845-1 exp:2026-11-21

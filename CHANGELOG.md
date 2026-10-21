@@ -6,6 +6,10 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Fixed (runtime CA bundle, DLA-4845-1 — 2026-10-21)
+
+- **Runtime CA bundle:** distroless static-debian12 (latest upstream) ships ca-certificates 20250419~deb12u1; deb12u2 removes the distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3" roots, and Trivy failed the CI image on DLA-4845-1. The runtime image now copies the bookworm builder's deb12u2 bundle (148 certs, both roots absent) over distroless's `/etc/ssl/certs/ca-certificates.crt`. `.trivyignore` gains `DLA-4845-1 exp:2026-11-21` (Trivy still reads distroless's dpkg metadata); remove both once distroless ships deb12u2. Same fix as iam-delegation `ed2f405`.
+
 ### Changed (platform-gincommon v2.1.0 — 2026-10-21)
 
 - **`platform-gincommon/v2` v2.0.0 → v2.1.0** — additive release (RFC 9457 extension members); no new dependencies, no code change, the new extension API is not adopted. Its Platform Observability Registry is unchanged for this service (`make metrics-inventory` only moves the version line in `docs/observability/metric-registry.md`). README, `.claude/architecture.md`, LLD §3.1 `require` block and `docs/observability/README.md` (both previously still naming v1.6.0) updated.
