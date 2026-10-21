@@ -25,15 +25,16 @@
 # override `command` to invoke /iam-token-service-rotator or
 # /iam-token-service-scheduler against the SAME image reference.
 #
-# NOTE: base image FROM lines below are tag-pinned, not digest-pinned — this
-# repo has no verified digest to pin against yet (§13.6: nothing is deployed
-# anywhere). Digest-pin these once a release pipeline exists to verify and
-# refresh them, matching the sibling services' supply-chain posture.
+# NOTE: the builder image is digest-pinned (golang:1.26.10-bookworm, index
+# digest verified with `docker buildx imagetools inspect`); the runtime image
+# is still tag-pinned (§13.6: nothing is deployed anywhere). Digest-pin it once
+# a release pipeline exists to verify and refresh it, matching the sibling
+# services' supply-chain posture (`make pin-base-images` rewrites both).
 
 ########################################
 # Stage: builder
 ########################################
-FROM golang:1.26.9-bookworm AS builder
+FROM golang:1.26.10-bookworm@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51 AS builder
 
 ARG BUILD_VERSION=dev
 ARG SOURCE_DATE_EPOCH

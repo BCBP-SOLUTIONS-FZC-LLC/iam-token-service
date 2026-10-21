@@ -132,15 +132,15 @@ jobs:
       - name: SAST (gosec)
         run: make sast
 
-      # Softened to a warning, not a hard gate: the Dockerfile's base images
-      # (golang:1.26.6-bookworm, distroless/static-debian12:nonroot) are not
-      # yet digest-pinned. A floating tag can be silently overwritten
-      # upstream, breaking supply-chain guarantees — pin both to @sha256:...
-      # and flip this to ::error once that's done.
+      # Softened to a warning, not a hard gate: the builder image
+      # (golang:1.26.10-bookworm) is digest-pinned, but the runtime image
+      # (distroless/static-debian12:nonroot) is not yet. A floating tag can be
+      # silently overwritten upstream, breaking supply-chain guarantees — pin
+      # it to @sha256:... and flip this to ::error once that's done.
       - name: Dockerfile base image digest check
         run: |
           if grep -E '^FROM [^ @]+:[^ @]+( AS .+)?$' Dockerfile; then
-            echo "::warning file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines are not digest-pinned (e.g. golang:1.26.6-bookworm@sha256:...). Tracked as a known gap, not yet a blocking gate."
+            echo "::warning file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines are not digest-pinned (e.g. golang:1.26.10-bookworm@sha256:...). Tracked as a known gap, not yet a blocking gate."
           else
             echo "Dockerfile base images are digest-pinned."
           fi

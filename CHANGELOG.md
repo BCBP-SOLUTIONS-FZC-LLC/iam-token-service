@@ -6,6 +6,10 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Security (Go 1.26.10 — 2026-10-21)
+
+- **Go 1.26.9 → 1.26.10** — fixes GO-2026-6809 (CVE-2026-111943, HIGH) in `crypto/x509`, which `govulncheck` reports as reachable and which failed Validate / Quality's vulnerability check; Trivy flagged the same CVE in the built binaries. `go.mod` now requires `go 1.26.10` (CI's `setup-go` reads it via `go-version-file`). The Dockerfile builder is now digest-pinned: `golang:1.26.10-bookworm@sha256:fe3da92a…dd51` (index digest verified with `docker buildx imagetools inspect`); the runtime image stays tag-pinned. `make pin-base-images` targets 1.26.10 and is re-runnable on an already-pinned `FROM`. README, VERSIONING compatibility matrix and the validate-quality digest-check comment/message updated. `make vuln-check`: no reachable vulnerabilities.
+
 ### Changed (platform-gincommon v2 + RFC 9457 adoption, TS-D26 — 2026-10-18)
 
 - **`platform-gincommon` v1.6.0 → `platform-gincommon/v2` v2.0.0** (module-path change; new `require` line and import prefix `platform-gincommon/v2/pkg/…`). The v2 `ObservabilityMiddlewares` chain appends a global `ProblemMiddleware` as its innermost handler. All 30 import sites updated. Gates and unit tests pass.
