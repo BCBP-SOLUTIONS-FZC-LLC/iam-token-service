@@ -320,7 +320,8 @@ visibilityTimeoutSeconds, queueDepthInterval, handlerTimeout,
 drainTimeout}`; `processedEvents.ttlDays`; `rlsViolationLog.ttlDays`;
 `docs.{enabled, authEnabled}`; `otel.*`; `appEnv`, `observabilityDomain`,
 `logLevel`, `logSampling`; `serviceMonitor.*`; `ingress.*` (HTTPRoute +
-optional Envoy `securityPolicy`); `autoscaling.*`; `podDisruptionBudget.*`;
+optional Envoy `securityPolicy`, `mergeType: StrategicMerge` so it
+merges with the Gateway policy — Envoy Gateway ≥ v1.8); `autoscaling.*`; `podDisruptionBudget.*`;
 `existingSecret`/`secretValues`/`rotationEpoch` (bump to roll pods after
 an external secret rotation).
 
