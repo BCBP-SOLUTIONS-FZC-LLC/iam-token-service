@@ -69,16 +69,18 @@ spec:
             {{- .Values.networkPolicy.keycloakNamespaceSelector | toYaml | nindent 12 }}
       ports:
         - port: http
+    {{- if .Values.authorizationPolicy.enabled }}
     {{- with .Values.networkPolicy.workflowNamespaceSelector }}
-    # Workflow connector workers reading TS-6 (TS-D17) — optional, only
-    # rendered when Workflow runs outside ingressNamespaceSelector's
-    # namespaces. Like the Keycloak rule, this admits the whole port; the
-    # AuthorizationPolicy limits Workflow to TS-6.
+    # Workflow services reading TS-6 (TS-D17; Execution's API service and its
+    # connector workers, Workflow I5). Like the Keycloak rule this admits the
+    # whole port, so it is rendered only together with the AuthorizationPolicy,
+    # which limits Workflow to TS-6 — never on its own (fail closed).
     - from:
         - namespaceSelector:
             {{- . | toYaml | nindent 12 }}
       ports:
         - port: http
+    {{- end }}
     {{- end }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}

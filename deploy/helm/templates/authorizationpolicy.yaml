@@ -39,7 +39,7 @@ spec:
             # matched by its suffix (the tenant id is the variable segment).
             paths: ["*/service-accounts/platform-automation/jwks.json"]
     {{- end }}
-    # Workflow connector workers: TS-6 only.
+    # Workflow services (Execution API, connector workers): TS-6 only.
     {{- with .Values.authorizationPolicy.workflowNamespaces }}
     - from:
         - source:

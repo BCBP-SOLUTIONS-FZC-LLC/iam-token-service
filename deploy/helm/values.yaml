@@ -227,17 +227,21 @@ networkPolicy:
   #     matchLabels:
   #       app: keycloak
   keycloakNamespaceSelector: {}
-  # Optional (TS-D17) — the Workflow Service's connector workers call TS-6
-  # (GET .../service-accounts/platform-automation) to learn each tenant's
-  # automation subject. Leave empty when Workflow already runs inside the
-  # ingressNamespaceSelector namespaces; otherwise set it to Workflow's own
-  # namespace, e.g.:
-  #   workflowNamespaceSelector:
-  #     matchLabels:
-  #       app.kubernetes.io/part-of: workflow
-  # This admits the whole HTTP port; authorizationPolicy below is what limits
-  # Workflow to TS-6.
-  workflowNamespaceSelector: {}
+  # TS-D17 — Workflow services call TS-6 (GET .../service-accounts/
+  # platform-automation) to learn each tenant's automation subject: the
+  # Execution Service's API service (Workflow open question I5) and its
+  # connector workers. Admission is per namespace, so any Workflow pod there
+  # qualifies. Default: workflow-app, the platform namespace
+  # (docs/HLD/aws-dev-environment-ap-south-1.md; Workflow LLDs §11.1).
+  # NetworkPolicy is L4 and would admit the whole HTTP port, where the other
+  # routes' only gate is the reserved x-user-id header — so this rule is
+  # rendered ONLY when authorizationPolicy.enabled, whose workflowNamespaces
+  # rule limits Workflow to TS-6. Without the mesh policy Workflow is not
+  # admitted at all (fail closed). To drop the rule, set it to null (Helm
+  # merges {} into this default, so {} would keep it).
+  workflowNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: workflow-app
   # postgresPort: the port DATABASE_URL connects to (PgBouncer's, when
   # database.pgBouncerMode). postgresDirectPort: the port the direct, non-
   # PgBouncer DSNs connect to — RECONCILER_DATABASE_URL (the server's DB-state
@@ -310,7 +314,8 @@ authorizationPolicy:
   enabled: false
   meshNamespaces: []      # RP / O&M / operator gateway — every route (required when enabled)
   keycloakNamespaces: []  # JWKS route only (required when enabled)
-  workflowNamespaces: []  # TS-6 only
+  workflowNamespaces:     # TS-6 only — Workflow services (Execution API, connector workers), TS-D17 / Workflow I5
+    - workflow-app
   # strictMTLS: a STRICT PeerAuthentication on the server (enabled: true
   # only). Under the mesh-wide default (PERMISSIVE) the sidecar still accepts
   # plaintext; a plaintext request has no source namespace, so this ALLOW

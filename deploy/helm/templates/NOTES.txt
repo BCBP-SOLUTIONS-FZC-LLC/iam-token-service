@@ -35,7 +35,8 @@ only (networkPolicy, authorizationPolicy).
 {{ end -}}
 {{ if not .Values.authorizationPolicy.enabled -}}
 ⚠  authorizationPolicy.enabled is false. Any pod that can reach the HTTP
-   port (including the Keycloak/Workflow namespaces networkPolicy admits)
+   port (including the Keycloak namespace networkPolicy admits; Workflow is
+   admitted only together with authorizationPolicy)
    can call every route by setting the reserved x-user-id header. Required
    outside local/dev/test.
 
