@@ -372,9 +372,17 @@ ingress:
 
   # Envoy Gateway SecurityPolicy — rate limiting (CORS is unlikely to ever
   # be needed — no browser-facing surface — kept for structural parity).
-  # Requires gateway.envoyproxy.io/v1alpha1 CRD (Envoy Gateway v0.6+).
+  # Requires gateway.envoyproxy.io/v1alpha1 CRD (Envoy Gateway v1.8+ for mergeType).
   securityPolicy:
     enabled: false
+    # Merge this route policy with the Gateway-level SecurityPolicy instead of
+    # replacing it, so the gateway's JWT + ext_authz (AuthZ Enrichment's
+    # trusted identity headers) stay in force on these routes. StrategicMerge |
+    # JSONMerge; requires Envoy Gateway >= v1.8. Set "" only on an older
+    # gateway (where the unknown field would be pruned or rejected) — and on
+    # such a gateway do not enable this policy at all: it would replace the
+    # gateway policy.
+    mergeType: StrategicMerge
     cors:
       enabled: false
       allowOrigins: []

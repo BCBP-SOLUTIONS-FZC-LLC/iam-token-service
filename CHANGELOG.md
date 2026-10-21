@@ -11,6 +11,10 @@ This service has never been deployed to any environment — there is no released
 - **Workflow is admitted to TS-6 by default** (Workflow open question I5): `networkPolicy.workflowNamespaceSelector` and `authorizationPolicy.workflowNamespaces` default to `workflow-app`, the platform namespace. Admission is per namespace, so Execution's API service and its connector workers both qualify. The Istio rule keeps Workflow to `GET …/service-accounts/platform-automation`.
 - **Fail closed:** the Workflow NetworkPolicy rule now renders only when `authorizationPolicy.enabled`. NetworkPolicy admits the whole HTTP port, where TS-1/TS-2/TS-4 are gated only by the reserved `x-user-id`, so admitting Workflow without the mesh policy would let it request a private key. Set the selector to `null` to drop the rule.
 
+### Fixed (Helm SecurityPolicy mergeType — 2026-10-22)
+
+- **Helm: the route SecurityPolicy now merges with the Gateway-level policy** (`ingress.securityPolicy.mergeType`, default `StrategicMerge`, rendered into the SecurityPolicy spec only when non-empty). Without `mergeType`, Envoy Gateway applies only the most specific SecurityPolicy, so enabling this chart's HTTPRoute policy REPLACED the Gateway's on these routes — dropping its JWT validation and ext_authz (AuthZ Enrichment, which sets the trusted identity headers; IAM HLD §11.1). `mergeType` requires Envoy Gateway ≥ v1.8; set `""` only on an older gateway, and there leave the policy disabled. Dormant by default (`securityPolicy.enabled: false`).
+
 ### Changed (RFC 9457 leftovers, TS-D27 — 2026-10-21)
 
 - **`errorCode` is UPPER_SNAKE_CASE.** The `.WithCode(<lowercase §17 code>)` overrides are gone; every problem's `errorCode` is its registered `problem.Type` code (`PRINCIPAL_NOT_FOUND`, `ROTATION_IN_FLIGHT`, …; platform `RATE_LIMIT_EXCEEDED` replaces `rate_limited`, `UNSUPPORTED_MEDIA_TYPE`, `INTERNAL_ERROR`). Statuses and meanings unchanged; `domain.ErrorCode` stays lowercase internally. **Breaking for callers that matched the lowercase values** (nothing deployed).
