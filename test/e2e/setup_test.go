@@ -336,6 +336,9 @@ func decodeErrorBody(t *testing.T, method, path string, headers map[string]strin
 	t.Helper()
 	var p problem.Problem
 	resp := doJSON(t, method, path, headers, reqBody, &p)
+	if ct := resp.Header.Get("Content-Type"); !problem.IsProblemContentType(ct) {
+		t.Fatalf("Content-Type = %q, want application/problem+json", ct)
+	}
 	return resp, p
 }
 

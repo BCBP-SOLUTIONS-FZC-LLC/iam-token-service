@@ -32,7 +32,7 @@ func TestGUCBridgeMiddleware(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 		require.Equal(t, http.StatusUnauthorized, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "missing_identity_headers", er.ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", er.ErrorCode)
 	})
 
 	t.Run("missing headers rejected upstream by RequireAuth", func(t *testing.T) {
@@ -134,7 +134,7 @@ func TestRequireTenantPathMatch(t *testing.T) {
 		rec := doRequest(t, r, http.MethodGet, "/tenants/"+uuid.New().String()+"/probe", nil, nil)
 		require.Equal(t, http.StatusForbidden, rec.Code)
 		er := decodeErrorBody(t, rec)
-		assert.Equal(t, "tenant_path_mismatch", er.ErrorCode)
+		assert.Equal(t, "TENANT_PATH_MISMATCH", er.ErrorCode)
 	})
 
 	t.Run("match — next runs", func(t *testing.T) {

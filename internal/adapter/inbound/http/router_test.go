@@ -14,6 +14,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 func newFullTestRouter(t *testing.T, docs DocsConfig, principalSvc PrincipalService, credentialSvc CredentialService, postgres, openbao, outbox Pinger) *Router {
@@ -160,9 +161,18 @@ func TestRouter_DocsSurface_Gating(t *testing.T) {
 
 		rec := doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		// The docs 401 is an RFC 9457 problem rendered by platform-gincommon
+		// (behind ObservabilityMiddlewares, so it carries a traceId).
+		p := decodeErrorBody(t, rec)
+		assert.Equal(t, http.StatusUnauthorized, p.Status)
+		assert.Equal(t, problem.TypeUnauthorized.Code, p.ErrorCode)
+		assert.Equal(t, "/asyncapi.yaml", p.Instance)
+		assert.NotEmpty(t, p.TraceID)
+		assert.NotContains(t, rec.Body.String(), `"error"`)
 
 		rec = doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", map[string]string{"Authorization": "Bearer wrong"}, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, problem.TypeUnauthorized.Code, decodeErrorBody(t, rec).ErrorCode)
 
 		// A short/garbage header must not panic subtle.ConstantTimeCompare.
 		rec = doRequest(t, r.Handler(), http.MethodGet, "/asyncapi.yaml", map[string]string{"Authorization": "x"}, nil)
@@ -288,7 +298,7 @@ func TestRouter_MissingIdentityHeaders_FrozenCode(t *testing.T) {
 			rec := doRequest(t, r.Handler(), http.MethodGet, path, headers, nil)
 			require.Equal(t, http.StatusUnauthorized, rec.Code)
 			er := decodeErrorBody(t, rec)
-			assert.Equal(t, "missing_identity_headers", er.ErrorCode)
+			assert.Equal(t, "MISSING_IDENTITY_HEADERS", er.ErrorCode)
 			assert.Empty(t, er.ValidationErrors, "no validationErrors on MISSING_IDENTITY_HEADERS")
 		})
 	}
@@ -320,7 +330,7 @@ func TestRequireIdentityHeaders_RepeatedHeaderIsMissingIdentity(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+	assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 
 	req = httptest.NewRequest(http.MethodGet, "/probe", nil)
 	req.Header.Set("x-user-id", domain.SystemPrincipalID.String())

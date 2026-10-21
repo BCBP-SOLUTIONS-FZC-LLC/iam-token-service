@@ -23,7 +23,7 @@ func TestHandleError_DomainError(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "principal_revoked", p.ErrorCode)
+	assert.Equal(t, "PRINCIPAL_REVOKED", p.ErrorCode)
 	assert.Equal(t, http.StatusUnprocessableEntity, p.Status)
 	assert.Equal(t, "revoked", p.Detail)
 }
@@ -36,7 +36,7 @@ func TestHandleError_UnclassifiedError_Returns500(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "internal_error", p.ErrorCode)
+	assert.Equal(t, "INTERNAL_ERROR", p.ErrorCode)
 	assert.Empty(t, p.Detail, "internal-error detail is never sent to the client")
 }
 
@@ -50,7 +50,7 @@ func TestHandleError_LeakedConnectivitySQLState_Returns503(t *testing.T) {
 			rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 			p := decodeErrorBody(t, rec)
-			assert.Equal(t, "db_unavailable", p.ErrorCode)
+			assert.Equal(t, "DB_UNAVAILABLE", p.ErrorCode)
 		})
 	}
 }
@@ -63,7 +63,7 @@ func TestHandleError_LeakedConstraintSQLState_Returns500(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "internal_error", p.ErrorCode)
+	assert.Equal(t, "INTERNAL_ERROR", p.ErrorCode)
 }
 
 func TestWriteInvalidRequest(t *testing.T) {
@@ -74,7 +74,7 @@ func TestWriteInvalidRequest(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "invalid_request", p.ErrorCode)
+	assert.Equal(t, "INVALID_REQUEST", p.ErrorCode)
 	require.Len(t, p.ValidationErrors, 1)
 	assert.Equal(t, "some_field", p.ValidationErrors[0].Field)
 	assert.Equal(t, "some reason", p.ValidationErrors[0].Message)
@@ -86,7 +86,7 @@ func TestWriteMissingIdentityHeaders(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "missing_identity_headers", p.ErrorCode)
+	assert.Equal(t, "MISSING_IDENTITY_HEADERS", p.ErrorCode)
 	assert.Empty(t, p.ValidationErrors)
 }
 
@@ -113,7 +113,7 @@ func TestHandleError_LeakedLockTimeout_Returns409RotationInFlight(t *testing.T) 
 	})
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusConflict, rec.Code)
-	assert.Equal(t, "rotation_in_flight", decodeErrorBody(t, rec).ErrorCode)
+	assert.Equal(t, "ROTATION_IN_FLIGHT", decodeErrorBody(t, rec).ErrorCode)
 }
 
 func TestHandleError_CredentialReplayExpired_Is409WithVersion(t *testing.T) {
@@ -124,6 +124,6 @@ func TestHandleError_CredentialReplayExpired_Is409WithVersion(t *testing.T) {
 	rec := doRequest(t, r, http.MethodGet, "/probe", nil, nil)
 	require.Equal(t, http.StatusConflict, rec.Code)
 	p := decodeErrorBody(t, rec)
-	assert.Equal(t, "credential_replay_expired", p.ErrorCode)
+	assert.Equal(t, "CREDENTIAL_REPLAY_EXPIRED", p.ErrorCode)
 	assert.Contains(t, p.Detail, "version 3")
 }

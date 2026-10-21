@@ -424,10 +424,10 @@ type jwksResponseBody struct {
 // @Produce      json
 // @Param        id  path      string  true  "Tenant UUID"  format(uuid)
 // @Success      200 {object}  jwksResponseBody
-// @Failure      400 {object}  ProblemDetails  "invalid_request"
-// @Failure      429 {object}  ProblemDetails  "rate_limited"
+// @Failure      400 {object}  ProblemDetails  "INVALID_REQUEST"
+// @Failure      429 {object}  ProblemDetails  "RATE_LIMIT_EXCEEDED"
 // @Failure      500 {object}  ProblemDetails
-// @Failure      503 {object}  ProblemDetails  "jwks_keys_unavailable (active key, or every live key, unreadable) | db_unavailable"
+// @Failure      503 {object}  ProblemDetails  "JWKS_KEYS_UNAVAILABLE (active key, or every live key, unreadable) | DB_UNAVAILABLE"
 // @Router       /tenants/{id}/service-accounts/platform-automation/jwks.json [get]
 func (h *JWKSHandler) JWKS(c *gin.Context) {
 	tenantID, err := uuid.Parse(c.Param("id"))
@@ -444,7 +444,7 @@ func (h *JWKSHandler) JWKS(c *gin.Context) {
 			metrics.JWKSRateLimitedTotal.Inc()
 		}
 		metrics.IncJWKSRateLimited(bucket)
-		gincommon.AbortWithProblem(c, problem.NewError(problem.TypeRateLimitExceeded, "").WithCode("rate_limited"))
+		gincommon.AbortWithProblem(c, problem.NewError(problem.TypeRateLimitExceeded, ""))
 		return
 	}
 

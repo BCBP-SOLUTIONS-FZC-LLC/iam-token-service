@@ -95,23 +95,28 @@ read by TS-3 (by id), TS-5 (by sub) or TS-6 (by its frozen name).
 
 ## 5.5 Status codes (`internal/core/domain/errors.go`, `http/errors.go`)
 
-| `error` | HTTP | `details` | Status |
+Every error is an RFC 9457 problem (`application/problem+json`) rendered by
+platform-gincommon; `errorCode` is the problem type's UPPER_SNAKE code (TS-D27).
+The former `details` travel in `detail` (or `validationErrors` for `field`).
+
+| `errorCode` | HTTP | in `detail` / `validationErrors` | Status |
 |---|---|---|---|
-| `missing_identity_headers` | 401 | — | frozen §17 |
-| `principal_not_found` | 404 | — | frozen |
-| `rotation_in_flight` | 409 | `active_rotation_id` (best effort, also on the `55P03` lock-timeout path) | frozen |
-| `optimistic_lock_conflict` | 409 | `expected_version` | frozen |
-| `principal_revoked` | 422 | — | frozen |
-| `secret_store_unavailable` | 502 | — | frozen |
-| `invalid_request` | 400 | `field`, `reason` | frozen |
-| `db_unavailable` | 503 | — | additive (SQLSTATE class 08/53/57/58 or closed pool, TS-D16) |
-| `credential_replay_revoked` | 409 | `version` | additive (TS-D13) |
-| `credential_replay_expired` | 409 | `version` | additive (TS-D22) |
-| `jwks_keys_unavailable` | 503 | — | additive, JWKS route (TS-D23) |
-| `rate_limited` | 429 | — | additive, JWKS route |
-| `tenant_path_mismatch` | 403 | — | additive |
-| `unsupported_media_type` | 415 | — | additive |
-| `internal_error` | 500 | — | any unclassified error |
+| `MISSING_IDENTITY_HEADERS` | 401 | — | frozen §17 |
+| `PRINCIPAL_NOT_FOUND` | 404 | — | frozen |
+| `ROTATION_IN_FLIGHT` | 409 | `active_rotation_id` (best effort, also on the `55P03` lock-timeout path) | frozen |
+| `OPTIMISTIC_LOCK_CONFLICT` | 409 | `expected_version` | frozen |
+| `PRINCIPAL_REVOKED` | 422 | — | frozen |
+| `SECRET_STORE_UNAVAILABLE` | 502 | — | frozen |
+| `INVALID_REQUEST` | 400 | `field`, `reason` | frozen |
+| `DB_UNAVAILABLE` | 503 | — | additive (SQLSTATE class 08/53/57/58 or closed pool, TS-D16) |
+| `CREDENTIAL_REPLAY_REVOKED` | 409 | `version` | additive (TS-D13) |
+| `CREDENTIAL_REPLAY_EXPIRED` | 409 | `version` | additive (TS-D22) |
+| `JWKS_KEYS_UNAVAILABLE` | 503 | — | additive, JWKS route (TS-D23) |
+| `RATE_LIMIT_EXCEEDED` | 429 | — | additive (platform type), JWKS route |
+| `TENANT_PATH_MISMATCH` | 403 | — | additive |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | — | additive |
+| `INTERNAL_ERROR` | 500 | — | platform type, any unclassified error |
+| `VALIDATION_FAILED` / `PAYLOAD_TOO_LARGE` | 400 / 413 | — | platform types, body bind failure via `gincommon.ShouldBindJSON` |
 
 ## 7.1 Inbound events
 

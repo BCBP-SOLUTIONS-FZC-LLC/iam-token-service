@@ -11,6 +11,7 @@ import (
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 // Pinger is satisfied by any dependency /readyz must check.
@@ -201,7 +202,7 @@ func registerDocsRoutes(r *gin.Engine, cfg RouterConfig) {
 			// bytes of a guessed token are correct via response latency.
 			got := []byte(c.GetHeader("Authorization"))
 			if subtle.ConstantTimeCompare(got, expected) != 1 {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+				gincommon.AbortWithProblem(c, problem.NewUnauthorizedError("A valid docs bearer token is required."))
 				return
 			}
 			c.Next()

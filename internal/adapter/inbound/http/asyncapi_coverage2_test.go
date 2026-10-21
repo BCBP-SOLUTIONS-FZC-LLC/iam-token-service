@@ -20,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 // ── UnmarshalYAML — decode error propagates ──────────────────────────────
@@ -59,8 +61,11 @@ func TestAsyncAPIHandler_SpecLoadErrorReturns500(t *testing.T) {
 	AsyncAPIHandler(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
-	assert.Contains(t, w.Body.String(), "internal_error")
-	assert.Contains(t, w.Body.String(), "AsyncAPI spec unavailable")
+	assert.True(t, problem.IsProblemContentType(w.Header().Get("Content-Type")), w.Header().Get("Content-Type"))
+	p, err := problem.Decode(w.Body)
+	require.NoError(t, err)
+	assert.Equal(t, problem.TypeInternalError.Code, p.ErrorCode)
+	assert.NotContains(t, p.Detail, "boom", "the cause never reaches the client")
 }
 
 // ── renderPage — env badge color switch + long description truncation ────

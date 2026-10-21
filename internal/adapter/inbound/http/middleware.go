@@ -111,7 +111,7 @@ func RequireTenantPathMatch() gin.HandlerFunc {
 			return
 		}
 		if pathTenantID != rc.TenantID {
-			gincommon.AbortWithProblem(c, problem.NewError(problemTypeTenantPathMismatch, "").WithCode("tenant_path_mismatch"))
+			gincommon.AbortWithProblem(c, problem.NewError(problemTypeTenantPathMismatch, ""))
 			return
 		}
 		c.Next()
@@ -133,7 +133,7 @@ func RequireJSONContentType() gin.HandlerFunc {
 			return
 		}
 		if c.ContentType() != "application/json" {
-			gincommon.AbortWithProblem(c, problem.NewError(problem.TypeUnsupportedMediaType, "").WithCode("unsupported_media_type"))
+			gincommon.AbortWithProblem(c, problem.NewError(problem.TypeUnsupportedMediaType, ""))
 			return
 		}
 		c.Next()

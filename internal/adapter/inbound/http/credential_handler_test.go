@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/problem"
 )
 
 func newCredentialTestRouter(svc CredentialService) *gin.Engine {
@@ -85,7 +87,7 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, path, map[string]string{"Content-Type": "application/json"}, []byte(`{}`))
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {
@@ -102,6 +104,15 @@ func TestCredentialHandler_IssueOrRotate(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, path, sysHeaders(tenantID), []byte(`{not-json`))
 		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Equal(t, problem.TypeValidationFailed.Code, decodeErrorBody(t, rec).ErrorCode)
+	})
+
+	t.Run("413 oversized body (1 MB cap) is a payload-too-large problem", func(t *testing.T) {
+		r := newFullTestRouter(t, DocsConfig{Environment: "dev"}, &fakePrincipalService{}, &fakeCredentialService{}, fakePinger{}, fakePinger{}, fakePinger{})
+		big := []byte(`{"rotation_id":"` + strings.Repeat("a", 1<<20) + `"}`)
+		rec := doRequest(t, r.Handler(), http.MethodPost, "/api/v1/internal"+path, sysHeaders(tenantID), big)
+		require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+		assert.Equal(t, problem.TypePayloadTooLarge.Code, decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID rotation_id", func(t *testing.T) {
@@ -201,7 +212,7 @@ func TestCredentialHandler_Revoke(t *testing.T) {
 		r := newCredentialTestRouter(&fakeCredentialService{})
 		rec := doRequest(t, r, http.MethodPost, base+"/1/revoke", nil, nil)
 		assert.Equal(t, http.StatusUnauthorized, rec.Code)
-		assert.Equal(t, "missing_identity_headers", decodeErrorBody(t, rec).ErrorCode)
+		assert.Equal(t, "MISSING_IDENTITY_HEADERS", decodeErrorBody(t, rec).ErrorCode)
 	})
 
 	t.Run("400 non-UUID principal_id", func(t *testing.T) {

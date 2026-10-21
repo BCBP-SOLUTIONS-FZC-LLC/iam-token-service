@@ -90,8 +90,8 @@ func TestRead_NonexistentPrincipal(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	if er.ErrorCode != "principal_not_found" {
-		t.Fatalf("error = %q, want principal_not_found", er.ErrorCode)
+	if er.ErrorCode != "PRINCIPAL_NOT_FOUND" {
+		t.Fatalf("error = %q, want PRINCIPAL_NOT_FOUND", er.ErrorCode)
 	}
 }
 
@@ -109,8 +109,8 @@ func TestRead_MissingIdentityHeaders(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if er.ErrorCode != "missing_identity_headers" {
-		t.Fatalf("error = %q, want missing_identity_headers", er.ErrorCode)
+	if er.ErrorCode != "MISSING_IDENTITY_HEADERS" {
+		t.Fatalf("error = %q, want MISSING_IDENTITY_HEADERS", er.ErrorCode)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestRead_CrossTenantIsolation(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (RLS must hide tenant A's row from tenant B)", resp.StatusCode)
 	}
-	if er.ErrorCode != "principal_not_found" {
-		t.Fatalf("error = %q, want principal_not_found", er.ErrorCode)
+	if er.ErrorCode != "PRINCIPAL_NOT_FOUND" {
+		t.Fatalf("error = %q, want PRINCIPAL_NOT_FOUND", er.ErrorCode)
 	}
 }

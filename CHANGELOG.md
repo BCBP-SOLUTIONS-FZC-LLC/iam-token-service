@@ -6,6 +6,16 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (RFC 9457 leftovers, TS-D27 — 2026-10-21)
+
+- **`errorCode` is UPPER_SNAKE_CASE.** The `.WithCode(<lowercase §17 code>)` overrides are gone; every problem's `errorCode` is its registered `problem.Type` code (`PRINCIPAL_NOT_FOUND`, `ROTATION_IN_FLIGHT`, …; platform `RATE_LIMIT_EXCEEDED` replaces `rate_limited`, `UNSUPPORTED_MEDIA_TYPE`, `INTERNAL_ERROR`). Statuses and meanings unchanged; `domain.ErrorCode` stays lowercase internally. **Breaking for callers that matched the lowercase values** (nothing deployed).
+- **Docs bearer-token 401** (`/swagger/*`, `/asyncapi`, `/asyncapi.yaml`) is now a `gincommon.AbortWithProblem` `UNAUTHORIZED` problem (was `{"error":"unauthorized"}`); constant-time compare kept.
+- **AsyncAPI page spec-load 500** is now an `INTERNAL_ERROR` problem (was `{"code":"internal_error","message":…}`).
+- **TS-1/TS-4 body binding** uses `gincommon.ShouldBindJSON`: malformed/empty body → `400 VALIDATION_FAILED`; a body over the 1 MB cap → `413 PAYLOAD_TOO_LARGE` (was a 400).
+- **Swagger `ProblemDetails`** is now `type ProblemDetails = problem.Problem` (hand-written `ProblemDetails`/`ValidationItem` structs removed); `@Failure` descriptions list UPPER_SNAKE codes; `docs/swagger/` regenerated.
+- Tests: the unit and e2e `decodeErrorBody` helpers assert `Content-Type: application/problem+json`; new docs-401, 413 and AsyncAPI-500 problem assertions.
+- Docs: LLD §5.1/§5.5/§17 and TS-D27, README error table, `.claude/api-events.md`, `.claude/CLAUDE.md`.
+
 ### Fixed (runtime CA bundle, DLA-4845-1 — 2026-10-21)
 
 - **Runtime CA bundle:** distroless static-debian12 (latest upstream) ships ca-certificates 20250419~deb12u1; deb12u2 removes the distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3" roots, and Trivy failed the CI image on DLA-4845-1. The runtime image now copies the bookworm builder's deb12u2 bundle (148 certs, both roots absent) over distroless's `/etc/ssl/certs/ca-certificates.crt`. `.trivyignore` gains `DLA-4845-1 exp:2026-11-21` (Trivy still reads distroless's dpkg metadata); remove both once distroless ships deb12u2. Same fix as iam-delegation `ed2f405`.
