@@ -6,6 +6,18 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Fixed (runtime CA bundle, DLA-4845-1 — 2026-10-21)
+
+- **Runtime CA bundle:** distroless static-debian12 (latest upstream) ships ca-certificates 20250419~deb12u1; deb12u2 removes the distrusted Comodo "AAA Certificate Services" and "emSign ECC Root CA - G3" roots, and Trivy failed the CI image on DLA-4845-1. The runtime image now copies the bookworm builder's deb12u2 bundle (148 certs, both roots absent) over distroless's `/etc/ssl/certs/ca-certificates.crt`. `.trivyignore` gains `DLA-4845-1 exp:2026-11-21` (Trivy still reads distroless's dpkg metadata); remove both once distroless ships deb12u2. Same fix as iam-delegation `ed2f405`.
+
+### Changed (platform-gincommon v2.1.0 — 2026-10-21)
+
+- **`platform-gincommon/v2` v2.0.0 → v2.1.0** — additive release (RFC 9457 extension members); no new dependencies, no code change, the new extension API is not adopted. Its Platform Observability Registry is unchanged for this service (`make metrics-inventory` only moves the version line in `docs/observability/metric-registry.md`). README, `.claude/architecture.md`, LLD §3.1 `require` block and `docs/observability/README.md` (both previously still naming v1.6.0) updated.
+
+### Security (Go 1.26.10 — 2026-10-21)
+
+- **Go 1.26.9 → 1.26.10** — fixes GO-2026-6809 (CVE-2026-111943, HIGH) in `crypto/x509`, which `govulncheck` reports as reachable and which failed Validate / Quality's vulnerability check; Trivy flagged the same CVE in the built binaries. `go.mod` now requires `go 1.26.10` (CI's `setup-go` reads it via `go-version-file`). The Dockerfile builder is now digest-pinned: `golang:1.26.10-bookworm@sha256:fe3da92a…dd51` (index digest verified with `docker buildx imagetools inspect`); the runtime image stays tag-pinned. `make pin-base-images` targets 1.26.10 and is re-runnable on an already-pinned `FROM`. README, VERSIONING compatibility matrix and the validate-quality digest-check comment/message updated. `make vuln-check`: no reachable vulnerabilities.
+
 ### Changed (platform-gincommon v2 + RFC 9457 adoption, TS-D26 — 2026-10-18)
 
 - **`platform-gincommon` v1.6.0 → `platform-gincommon/v2` v2.0.0** (module-path change; new `require` line and import prefix `platform-gincommon/v2/pkg/…`). The v2 `ObservabilityMiddlewares` chain appends a global `ProblemMiddleware` as its innermost handler. All 30 import sites updated. Gates and unit tests pass.

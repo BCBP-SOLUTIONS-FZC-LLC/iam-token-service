@@ -132,7 +132,7 @@ Both match `release.yml`'s tag trigger pattern
 
 | iam-token-service | Go | `platform-pgcommon` | `platform-events` | `platform-gincommon` |
 |---|---|---|---|---|
-| `main` (unreleased) | 1.26.6 | see `go.mod` | see `go.mod` | see `go.mod` |
+| `main` (unreleased) | 1.26.10 | see `go.mod` | see `go.mod` | see `go.mod` |
 
 This table gains a row per tagged release once releases exist; check
 `go.mod` directly for the exact pinned versions of shared platform

@@ -3,7 +3,7 @@
 **Custodian of the platform-automation service account's rotating credential material** for the Tender Management SaaS Platform's IAM subsystem. It issues, rotates and revokes the per-tenant `platform-automation` Keycloak client's RSA-2048 signing keys, keeps the private-key plaintext only in OpenBao (never Postgres), serves the public half to Keycloak as a JWK Set, and runs the tenant-offboarding credential cleanup cascade.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service`
-**Module:** Go 1.26.9. Four binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) built into one distroless image and deployed by one Helm chart (2 Deployments, 2 CronJobs, 1 migrate hook Job).
+**Module:** Go 1.26.10. Four binaries (`cmd/server`, `cmd/consumer`, `cmd/rotator`, `cmd/scheduler`) built into one distroless image and deployed by one Helm chart (2 Deployments, 2 CronJobs, 1 migrate hook Job).
 **Design:** [`docs/lld/iam-lld-token-service.md`](docs/lld/iam-lld-token-service.md) (rev 1.4, Approved). This README and `ARCHITECTURE.md` summarise it. The LLD wins on any discrepancy; the recent hardening passes are recorded there as §22 TS-D21, TS-D22 and TS-D23.
 
 ---
@@ -199,7 +199,7 @@ The rule worth remembering: **`cmd/rotator` may not depend on `service`**. It dr
 
 ### Shared libraries
 
-`platform-pgcommon/v2` v2.0.2 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.1.0 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon/v2` v2.0.0 (middleware, logging, tracing, metrics registry, `/metrics`, RFC 9457 Problem Details), `openbao/openbao/api/v2` v2.7.1.
+`platform-pgcommon/v2` v2.0.2 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.1.0 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon/v2` v2.1.0 (middleware, logging, tracing, metrics registry, `/metrics`, RFC 9457 Problem Details), `openbao/openbao/api/v2` v2.7.1.
 
 ---
 
@@ -268,7 +268,7 @@ Things to know as a caller:
 
 ### Prerequisites
 
-Go 1.26.9, Docker with Compose v2, and an SSH key registered with the BCBP-SOLUTIONS-FZC-LLC org (the Makefile sets `GOPRIVATE`). Building the **image** also needs a `.go_private_token` file (gitignored; a GitHub PAT with read access to the org's private repos). `make docker-up` does not need it.
+Go 1.26.10, Docker with Compose v2, and an SSH key registered with the BCBP-SOLUTIONS-FZC-LLC org (the Makefile sets `GOPRIVATE`). Building the **image** also needs a `.go_private_token` file (gitignored; a GitHub PAT with read access to the org's private repos). `make docker-up` does not need it.
 
 ### Quick start
 

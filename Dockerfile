@@ -25,15 +25,16 @@
 # override `command` to invoke /iam-token-service-rotator or
 # /iam-token-service-scheduler against the SAME image reference.
 #
-# NOTE: base image FROM lines below are tag-pinned, not digest-pinned — this
-# repo has no verified digest to pin against yet (§13.6: nothing is deployed
-# anywhere). Digest-pin these once a release pipeline exists to verify and
-# refresh them, matching the sibling services' supply-chain posture.
+# NOTE: the builder image is digest-pinned (golang:1.26.10-bookworm, index
+# digest verified with `docker buildx imagetools inspect`); the runtime image
+# is still tag-pinned (§13.6: nothing is deployed anywhere). Digest-pin it once
+# a release pipeline exists to verify and refresh it, matching the sibling
+# services' supply-chain posture (`make pin-base-images` rewrites both).
 
 ########################################
 # Stage: builder
 ########################################
-FROM golang:1.26.9-bookworm AS builder
+FROM golang:1.26.10-bookworm@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51 AS builder
 
 ARG BUILD_VERSION=dev
 ARG SOURCE_DATE_EPOCH
@@ -110,6 +111,15 @@ COPY --from=builder /out/iam-token-service-server /iam-token-service-server
 COPY --from=builder /out/iam-token-service-consumer /iam-token-service-consumer
 COPY --from=builder /out/iam-token-service-rotator /iam-token-service-rotator
 COPY --from=builder /out/iam-token-service-scheduler /iam-token-service-scheduler
+# Patched CA bundle over distroless's. The distroless static-debian12 image
+# (latest upstream, checked 2026-10-21) ships ca-certificates
+# 20250419~deb12u1; deb12u2 (DLA-4845-1) removes two distrusted roots, Comodo
+# "AAA Certificate Services" and "emSign ECC Root CA - G3", and the Go
+# binaries trust exactly this file for every outbound TLS connection. The
+# bookworm builder's apt-get install above already pulls deb12u2 (verified:
+# 148 certs, vs distroless's 150). Drop this COPY and the .trivyignore entry
+# once distroless ships deb12u2. Same fix as iam-delegation ed2f405.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 USER nonroot:nonroot
 
