@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
@@ -177,18 +177,15 @@ func (c *OffboardingConsumer) cascade(ctx context.Context, tenantID uuid.UUID) e
 	// ordering could leak it forever. If anything fails after a delete, the
 	// transaction (claim included) rolls back and the redelivery repeats the
 	// cascade; Delete is a no-op on an already-missing path, so that is safe.
-	for _, path := range paths {
-		if err := c.secrets.Delete(ctx, path); err != nil {
-			return err
-		}
-	}
-	// Then erase whatever else lives under the tenant's subtree: material a
-	// failed or racing TS-1 wrote but never committed has no row, so the
-	// path list above cannot see it, and once the principal row is gone the
-	// §8.6 reconciler can never find it either (§15.2 erasure). The principal
-	// rows are locked (LockByTenant … FOR UPDATE), so no new issue/rotate
-	// for this tenant can write more material until this transaction ends.
-	if err := c.deleteSubtree(ctx, domain.OpenBaoTenantPrefix(tenantID), 0); err != nil {
+	//
+	// After the rows' paths, the whole tenant subtree goes: material a
+	// failed or racing TS-1 wrote but never committed has no row, and once
+	// the principal row is gone the §8.6 reconciler can never find it either
+	// (§15.2 erasure). The principal rows are locked (LockByTenant … FOR
+	// UPDATE), so no new issue/rotate for this tenant can write more
+	// material until this transaction ends. TS-7 runs the same step
+	// (service.EraseSecretMaterial) scoped to one principal's client prefix.
+	if err := service.EraseSecretMaterial(ctx, c.secrets, paths, domain.OpenBaoTenantPrefix(tenantID), 0); err != nil {
 		return err
 	}
 
@@ -199,44 +196,10 @@ func (c *OffboardingConsumer) cascade(ctx context.Context, tenantID uuid.UUID) e
 	if !ok {
 		return nil
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC()
 	for _, p := range principals {
-		if err := pub.Enqueue(ctx, &domain.Event{
-			Type: domain.EventServiceAccountRevoked, TenantID: tenantID, Actor: domain.SystemPrincipalID,
-			Data: domain.ServiceAccountRevokedPayload{
-				TenantID: tenantID, PrincipalID: p.ID,
-				ActorID: domain.SystemPrincipalID, RevokedAt: now,
-			},
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// maxSubtreeDepth bounds the recursive walk: the frozen layout is
-// <tenant>/<keycloak_client_id>/v<n> (§6.3), so anything deeper is not ours.
-const maxSubtreeDepth = 4
-
-// deleteSubtree deletes every leaf under prefix. SecretStore.List returns
-// one level, with sub-folders suffixed "/".
-func (c *OffboardingConsumer) deleteSubtree(ctx context.Context, prefix string, depth int) error {
-	if depth > maxSubtreeDepth {
-		return nil
-	}
-	keys, err := c.secrets.List(ctx, prefix)
-	if err != nil {
-		return err
-	}
-	for _, key := range keys {
-		child := prefix + "/" + strings.TrimSuffix(key, "/")
-		if strings.HasSuffix(key, "/") {
-			if err := c.deleteSubtree(ctx, child, depth+1); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := c.secrets.Delete(ctx, child); err != nil {
+		// The same principal-level event TS-7 emits (service.ServiceAccountRevokedEvent).
+		if err := pub.Enqueue(ctx, service.ServiceAccountRevokedEvent(tenantID, p.ID, domain.SystemPrincipalID, now)); err != nil {
 			return err
 		}
 	}

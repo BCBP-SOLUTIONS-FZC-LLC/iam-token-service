@@ -66,6 +66,10 @@ type fakeCredentialService struct {
 
 	revokeResult *service.RevokeResult
 	revokeErr    error
+
+	revokePrincipalResult *service.RevokePrincipalResult
+	revokePrincipalErr    error
+	revokePrincipalCalls  int
 }
 
 func (f *fakeCredentialService) IssueOrRotate(ctx context.Context, tenantID, principalID uuid.UUID, req service.IssueOrRotateRequest, actor uuid.UUID) (*service.IssueOrRotateResult, error) {
@@ -77,6 +81,11 @@ func (f *fakeCredentialService) IssueOrRotate(ctx context.Context, tenantID, pri
 
 func (f *fakeCredentialService) Revoke(_ context.Context, _, _ uuid.UUID, _ int, _ uuid.UUID) (*service.RevokeResult, error) {
 	return f.revokeResult, f.revokeErr
+}
+
+func (f *fakeCredentialService) RevokePrincipal(_ context.Context, _, _ uuid.UUID) (*service.RevokePrincipalResult, error) {
+	f.revokePrincipalCalls++
+	return f.revokePrincipalResult, f.revokePrincipalErr
 }
 
 var _ CredentialService = (*fakeCredentialService)(nil)

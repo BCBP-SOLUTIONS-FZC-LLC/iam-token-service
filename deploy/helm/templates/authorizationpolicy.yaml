@@ -4,7 +4,8 @@ path-level granularity, so the namespaces it admits only for one route —
 Keycloak (EXT-6 JWKS fetch) and Workflow (TS-6, TS-D17) — could otherwise
 call every route on the HTTP port, protected only by the reserved
 x-user-id header (LLD §5.2). With a mesh, this policy narrows each source to
-its one route; the mesh callers (RP, O&M, operator gateway) keep every route.
+its one route; the mesh callers (RP, O&M, operator gateway) keep every route,
+TS-7 included (the Realm Provisioner's orphaned-signup-reap calls it).
 The x-user-id header is not a boundary on its own (any caller can set it), so
 this policy is required outside local/dev/test whenever networkPolicy is on
 (templates/validate.yaml). source.namespaces matches only mTLS-authenticated
@@ -39,7 +40,9 @@ spec:
             # matched by its suffix (the tenant id is the variable segment).
             paths: ["*/service-accounts/platform-automation/jwks.json"]
     {{- end }}
-    # Workflow services (Execution API, connector workers): TS-6 only.
+    # Workflow services (Execution API, connector workers): TS-6 only. The
+    # path is a suffix match and the method is GET, so TS-7 (POST
+    # …/platform-automation/revoke) and every other route stay out of reach.
     {{- with .Values.authorizationPolicy.workflowNamespaces }}
     - from:
         - source:

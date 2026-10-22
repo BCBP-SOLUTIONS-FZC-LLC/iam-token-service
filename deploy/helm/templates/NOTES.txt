@@ -1,7 +1,7 @@
 {{ .Chart.Name }} {{ .Chart.AppVersion }} has been installed.
 
 Components deployed:
-  - {{ include "iam-token-service.fullname" . }}-server    (Deployment, {{ .Values.server.replicaCount }} replica(s)) — TS-1..TS-6 HTTP API + EXT-6 JWKS
+  - {{ include "iam-token-service.fullname" . }}-server    (Deployment, {{ .Values.server.replicaCount }} replica(s)) — TS-1..TS-7 HTTP API + EXT-6 JWKS
   - {{ include "iam-token-service.fullname" . }}-consumer  (Deployment, {{ .Values.consumer.replicaCount }} replica(s)) — TenantMembershipsPurged offboarding cascade
   - {{ include "iam-token-service.fullname" . }}-rotator   (CronJob, schedule "{{ .Values.rotator.schedule }}") — overlap-expiry sweep, orphan-material reconciler, prune
   - {{ include "iam-token-service.fullname" . }}-scheduler (CronJob, schedule "{{ .Values.scheduler.schedule }}") — cadence-based automatic rotation + RP-17

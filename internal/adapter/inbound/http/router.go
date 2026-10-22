@@ -85,7 +85,7 @@ func (r *Router) Handler() http.Handler { return r.engine }
 // unauthenticated infra probes, the docs surface, the EXT-6 JWKS route
 // (unauthenticated by header, outside the protected group — §5.6) and the
 // mesh-only, header-authenticated /api/v1/internal/* credential-lifecycle
-// API (TS-1..TS-6, §5.1).
+// API (TS-1..TS-7, §5.1).
 func NewRouter(cfg RouterConfig) *Router {
 	r := gin.New()
 	r.HandleMethodNotAllowed = true
@@ -241,7 +241,7 @@ func registerJWKSRoutes(r *gin.Engine, cfg RouterConfig) {
 	r.GET("/api/v1/internal/tenants/:id/service-accounts/platform-automation/jwks.json", h.JWKS.JWKS)
 }
 
-// ── Credential-lifecycle API — /api/v1/internal/* (TS-1..TS-6, §5.1/§25) ──
+// ── Credential-lifecycle API — /api/v1/internal/* (TS-1..TS-7, §5.1/§25) ──
 
 func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 	h := cfg.Handlers
@@ -261,6 +261,7 @@ func registerInternalRoutes(r *gin.Engine, cfg RouterConfig) {
 	tenantScoped.POST("/service-accounts", h.Principal.Register)                                          // TS-4
 	tenantScoped.GET("/service-accounts", h.Principal.FindBySub)                                          // TS-5 (AUTH-9)
 	tenantScoped.GET("/service-accounts/platform-automation", h.Principal.ReadPlatformAutomation)         // TS-6 (TS-D17)
+	tenantScoped.POST("/service-accounts/platform-automation/revoke", h.Credential.RevokePrincipal)       // TS-7 (TS-D29)
 	tenantScoped.GET("/service-accounts/:principal_id", h.Principal.Read)                                 // TS-3
 	tenantScoped.POST("/service-accounts/:principal_id/credentials", h.Credential.IssueOrRotate)          // TS-1
 	tenantScoped.POST("/service-accounts/:principal_id/credentials/:version/revoke", h.Credential.Revoke) // TS-2

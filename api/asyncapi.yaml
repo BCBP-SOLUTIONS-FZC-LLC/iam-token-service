@@ -128,7 +128,7 @@ operations:
     action: send
     channel:
       $ref: '#/channels/iamServiceAccountEvents'
-    summary: TS-2, the overlap-expiry sweep, or the offboarding cascade emits ServiceAccountCredentialRevoked for one revoked version.
+    summary: TS-2, TS-7 (once per version it revokes), the overlap-expiry sweep, or the offboarding cascade emits ServiceAccountCredentialRevoked for one revoked version.
     messages:
       - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountCredentialRevoked'
 
@@ -136,7 +136,7 @@ operations:
     action: send
     channel:
       $ref: '#/channels/iamServiceAccountEvents'
-    summary: The offboarding cascade emits ServiceAccountRevoked when a principal is fully revoked.
+    summary: The offboarding cascade (hard delete) or TS-7 (status revoked, row kept) emits ServiceAccountRevoked when a principal is fully revoked.
     messages:
       - $ref: '#/channels/iamServiceAccountEvents/messages/ServiceAccountRevoked'
 

@@ -103,6 +103,11 @@ func (f *fakePrincipalRepository) DeleteByTenant(_ context.Context, tenantID uui
 	return nil
 }
 
+// UpdateStatus is not on the offboarding cascade's path (it hard-deletes).
+func (f *fakePrincipalRepository) UpdateStatus(context.Context, *domain.ServiceAccountPrincipal) error {
+	return nil
+}
+
 var _ port.PrincipalRepository = (*fakePrincipalRepository)(nil)
 
 type fakeCredentialRepository struct {

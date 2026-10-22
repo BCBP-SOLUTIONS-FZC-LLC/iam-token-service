@@ -46,7 +46,8 @@ principal `iam-system` (`00000000-0000-0000-0000-0000000000a1`) as
 in-mesh pod could set that header, outside local/dev/test the Helm chart
 requires the Istio `AuthorizationPolicy` that limits callers by namespace:
 mesh namespaces on every route, Keycloak namespaces on the JWKS route
-only, Workflow namespaces on TS-6 only.
+only, Workflow namespaces on TS-6 only (`GET`, exact suffix — TS-7 is out of
+reach for them).
 
 ## 5.3 Endpoint catalogue
 
@@ -60,6 +61,7 @@ Paths are relative to `/api/v1/internal/tenants/:id`.
 | TS-3 | `GET /service-accounts/:principal_id` | Principal metadata + every credential's version/status/path/`expires_at`/cadence — never a secret | `200` | Read |
 | TS-5 | `GET /service-accounts?principal_sub=<uuid>` | Find by Keycloak `sub` (AUTH-9, TS-D16) — identity/status only; used by org-membership's non-member defense-in-depth check | `200` / `404` | Read |
 | TS-6 | `GET /service-accounts/platform-automation` | Read the tenant's automation principal (TS-D17) — the reverse of TS-5, returns `principal_sub` and `keycloak_client_id`; used by the Workflow Service's connector workers. `principal_sub` changes on an RP-3/RP-4 re-mint, `principal_id` doesn't | `200` / `404` | Read |
+| TS-7 | `POST /service-accounts/platform-automation/revoke` | Revoke the tenant's automation principal (TS-D29, LLD rev 1.5): every live version revoked (OpenBao material deleted, cadence cleared), uncommitted material under the client prefix erased, principal `status=revoked`. No body. Under the principal lock (`409 ROTATION_IN_FLIGHT` past `PG_LOCK_TIMEOUT`), `record_version`-guarded. Caller: Realm Provisioner's `orphaned-signup-reap`. Response: `principal_id`, `tenant_id`, `keycloak_client_id`, `status`, `record_version`, `revoked_at`, `revoked_versions`, `keycloak_invalidation` | `200` / `404` | Yes (already revoked → `200`, same body) |
 | EXT-6 | `GET /service-accounts/platform-automation/jwks.json` | Public JWK Set for Keycloak's client-jwt authenticator. No identity headers; rate-limited | `200` | Read |
 | TS-H | `GET /healthz`, `GET /readyz` | Liveness / readiness (database, OpenBao, outbox, and JWKS known-tenant refresher — TS-RP-GAP-001; 2s per check; 503 while draining) | | Read |
 | TS-D | `GET /asyncapi`, `/asyncapi.yaml`, `/swagger/*any` | Contracts; always on in local/dev/test, elsewhere only with `DOCS_ENABLED=true` and a bearer `DOCS_AUTH_TOKEN` (the server refuses to start without it) | | Read |
@@ -102,7 +104,7 @@ The former `details` travel in `detail` (or `validationErrors` for `field`).
 | `errorCode` | HTTP | in `detail` / `validationErrors` | Status |
 |---|---|---|---|
 | `MISSING_IDENTITY_HEADERS` | 401 | — | frozen §17 |
-| `PRINCIPAL_NOT_FOUND` | 404 | — | frozen |
+| `PRINCIPAL_NOT_FOUND` | 404 | — (TS-7: no principal for the tenant; the caller treats it as done) | frozen |
 | `ROTATION_IN_FLIGHT` | 409 | `active_rotation_id` (best effort, also on the `55P03` lock-timeout path) | frozen |
 | `OPTIMISTIC_LOCK_CONFLICT` | 409 | `expected_version` | frozen |
 | `PRINCIPAL_REVOKED` | 422 | — | frozen |
@@ -189,8 +191,8 @@ without reading the envelope header.
 | `ServiceAccountRegistered` | TS-4 creates a principal, or updates it for a re-minted client (RP-3/RP-4; new `principal_sub`, same `principal_id`); not on a no-op repeat | Audit; Workflow may use it to refresh a cached TS-6 sub |
 | `ServiceAccountCredentialIssued` | TS-1 when the principal has no active credential | Audit |
 | `ServiceAccountCredentialRotated` | TS-1 rotation (`prior_version`, `expires_prior_at`) | Audit |
-| `ServiceAccountCredentialRevoked` | TS-2, the TS-1 opportunistic sweep, or the rotator sweep | Audit |
-| `ServiceAccountRevoked` | Offboarding cascade, one per principal | Audit |
+| `ServiceAccountCredentialRevoked` | TS-2, TS-7 (one per version it revokes), the TS-1 opportunistic sweep, or the rotator sweep | Audit |
+| `ServiceAccountRevoked` | Offboarding cascade (one per principal, rows hard-deleted) or TS-7 (principal kept as `revoked`) | Audit |
 
 **No payload ever carries a secret** (TS-INV-2/EVT-2) — a contract test
 (`test/contract/no_secret_payload_test.go`) asserts this. No downstream

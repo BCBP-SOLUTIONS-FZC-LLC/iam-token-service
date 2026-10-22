@@ -128,3 +128,22 @@ func TestRLSViolationRepository_CountSince_ScanErrorKeepsCursor(t *testing.T) {
 	assert.Nil(t, counts)
 	assert.Equal(t, int64(7), cursor)
 }
+
+// UpdateStatus (TS-7): no row back from the record_version-guarded UPDATE is
+// an optimistic-lock conflict; any other scan failure is passed through.
+func TestPrincipalRepository_UpdateStatus_Errors(t *testing.T) {
+	r := NewPrincipalRepository(nil)
+
+	tx := &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: pgx.ErrNoRows}}}
+	err := r.UpdateStatus(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{ID: uuid.New(), RecordVersion: 3})
+	var de *domain.Error
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, domain.ErrOptimisticLockConflict, de.Code)
+	assert.Equal(t, 3, de.Details["expected_version"])
+
+	boom := errors.New("scan boom")
+	tx = &fakeRepoTx{queryRowResults: []pgx.Row{errRow{err: boom}}}
+	err = r.UpdateStatus(ctxWithFakeTx(tx), &domain.ServiceAccountPrincipal{ID: uuid.New()})
+	require.ErrorIs(t, err, boom)
+	assert.False(t, errors.As(err, &de))
+}

@@ -9,7 +9,7 @@
 #   validate-quality ───────────────────┘
 #
 # This repo ships FOUR binaries from ONE image (see Dockerfile's header
-# comment): /iam-token-service-server (HTTP API TS-1..TS-6 + the
+# comment): /iam-token-service-server (HTTP API TS-1..TS-7 + the
 # outbox.Runner SNS-publish loop) is the image's default ENTRYPOINT;
 # /iam-token-service-consumer (the offboarding-cascade consumer) and
 # /iam-token-service-rotator (the overlap-expiry sweep / orphan-material

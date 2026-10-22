@@ -18,7 +18,7 @@
 # and then fail verification; preflight refuses it up front instead.
 #
 # This service ships FOUR binaries from ONE image (see ci.yml's header
-# comment): /iam-token-service-server (HTTP API TS-1..TS-6 + outbox runner,
+# comment): /iam-token-service-server (HTTP API TS-1..TS-7 + outbox runner,
 # the default ENTRYPOINT), /iam-token-service-consumer (offboarding
 # cascade), /iam-token-service-rotator (overlap-expiry sweep /
 # orphan-material reconciler / prune), and /iam-token-service-scheduler

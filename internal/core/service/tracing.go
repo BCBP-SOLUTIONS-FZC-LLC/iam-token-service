@@ -79,3 +79,26 @@ func withTraceID(ctx context.Context, fields map[string]interface{}) map[string]
 	}
 	return fields
 }
+
+// RevokePrincipal is the exported TS-7 entry point: starts the
+// "principal.revoke" span (§11.3, attrs tenant_id/op) around
+// revokePrincipal's business logic.
+func (s *CredentialService) RevokePrincipal(ctx context.Context, tenantID, actor uuid.UUID) (*RevokePrincipalResult, error) {
+	ctx, span := tracer.Start(ctx, "principal.revoke", oteltrace.WithAttributes(
+		attribute.String("tenant_id", tenantID.String()),
+		attribute.String("op", "revoke_principal"),
+	))
+	defer span.End()
+
+	result, err := s.revokePrincipal(ctx, tenantID, actor)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+	span.SetAttributes(
+		attribute.String("principal_id", result.PrincipalID.String()),
+		attribute.Int("newly_revoked", result.NewlyRevoked),
+	)
+	return result, nil
+}

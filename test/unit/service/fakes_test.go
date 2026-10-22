@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,6 +64,15 @@ type fakePrincipalRepository struct {
 	// forceLockErr, when non-nil, is returned by LockForUpdate — e.g. the
 	// principal-lock wait timeout (rotation_in_flight with no details).
 	forceLockErr error
+
+	// forceUpdateStatusErr, when non-nil, is returned by UpdateStatus
+	// instead of applying the write.
+	forceUpdateStatusErr error
+
+	// onLock, when set, runs once (then cleared) at the start of
+	// LockForUpdate — lets a test simulate a concurrent writer that commits
+	// while this call waits for the lock.
+	onLock func(f *fakePrincipalRepository)
 }
 
 func newFakePrincipalRepository() *fakePrincipalRepository {
@@ -89,6 +99,11 @@ func (f *fakePrincipalRepository) FindByID(_ context.Context, tenantID, principa
 func (f *fakePrincipalRepository) LockForUpdate(ctx context.Context, tenantID, principalID uuid.UUID) (*domain.ServiceAccountPrincipal, error) {
 	if f.forceLockErr != nil {
 		return nil, f.forceLockErr
+	}
+	if f.onLock != nil {
+		hook := f.onLock
+		f.onLock = nil
+		hook(f)
 	}
 	return f.FindByID(ctx, tenantID, principalID)
 }
@@ -172,6 +187,24 @@ func (f *fakePrincipalRepository) DeleteByTenant(_ context.Context, tenantID uui
 			delete(f.byID, k)
 		}
 	}
+	return nil
+}
+
+// UpdateStatus mirrors the postgres adapter's record_version-guarded UPDATE
+// and the touch_row trigger (record_version+1, updated_at=now).
+func (f *fakePrincipalRepository) UpdateStatus(_ context.Context, p *domain.ServiceAccountPrincipal) error {
+	if f.forceUpdateStatusErr != nil {
+		return f.forceUpdateStatusErr
+	}
+	existing, ok := f.byID[principalKey{p.TenantID, p.ID}]
+	if !ok || existing.RecordVersion != p.RecordVersion {
+		return domain.NewError(domain.ErrOptimisticLockConflict, "record_version conflict").
+			WithDetails(map[string]any{"expected_version": p.RecordVersion})
+	}
+	p.RecordVersion = existing.RecordVersion + 1
+	p.UpdatedAt = time.Now().UTC()
+	cp := *p
+	f.put(&cp)
 	return nil
 }
 
@@ -353,10 +386,17 @@ type fakeSecretStore struct {
 	// call).
 	deleteErr error
 
+	// deleteErrFor / listErrFor fail Delete / List for one exact path only.
+	deleteErrFor map[string]error
+	listErrFor   map[string]error
+
 	// writeErr, when set, is returned by Write instead of succeeding — for
 	// exercising issueOrRotate's OpenBao-write-failure branch (nothing
 	// committed in Postgres, §9.3).
 	writeErr error
+
+	// deleted records every successful Delete, in order.
+	deleted []string
 }
 
 func newFakeSecretStore() *fakeSecretStore {
@@ -383,16 +423,37 @@ func (f *fakeSecretStore) Delete(_ context.Context, path string) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
+	if err := f.deleteErrFor[path]; err != nil {
+		return err
+	}
 	delete(f.data, path)
+	f.deleted = append(f.deleted, path)
 	return nil
 }
 
+// List mirrors KV v2 LIST: the immediate children of pathPrefix, with
+// sub-folders suffixed "/".
 func (f *fakeSecretStore) List(_ context.Context, pathPrefix string) ([]string, error) {
+	if err := f.listErrFor[pathPrefix]; err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
 	var out []string
 	for k := range f.data {
-		out = append(out, k)
+		rest, ok := strings.CutPrefix(k, pathPrefix+"/")
+		if !ok {
+			continue
+		}
+		child := rest
+		if i := strings.Index(rest, "/"); i >= 0 {
+			child = rest[:i+1]
+		}
+		if !seen[child] {
+			seen[child] = true
+			out = append(out, child)
+		}
 	}
-	_ = pathPrefix
+	sort.Strings(out)
 	return out, nil
 }
 

@@ -215,7 +215,7 @@ serve `/metrics` for `*_METRICS_SCRAPE_GRACE` (15s) before exiting.
    every credential's OpenBao path.
 5. Delete every collected path, then walk the tenant's whole OpenBao
    subtree (`iam/serviceaccount/<tenant_id>`, depth ≤ 4) and delete
-   anything left — all **before** the commit (§9.3/§15.2): once the
+   anything left (`service.EraseSecretMaterial`, shared with TS-7) — all **before** the commit (§9.3/§15.2): once the
    principal rows are gone the §8.6 reconciler can never find this
    tenant's material again. Then `DeleteByTenant` (FK-cascades credentials)
    → enqueue `ServiceAccountRevoked` per principal → COMMIT (claim
@@ -227,6 +227,34 @@ serve `/metrics` for `*_METRICS_SCRAPE_GRACE` (15s) before exiting.
    Postgres rows remain while some material is gone — the §8.6 reconciler
    reports the missing entries as `missing_material` (page) rather than
    losing them silently.
+
+## 8.10 TS-7 — revoke the tenant's automation principal (TS-D29)
+
+`CredentialService.RevokePrincipal` (`service/principal_revoke.go`):
+
+1. `FindByType(platform_automation)` — none → `404 principal_not_found`
+   (RP's reap treats it as done); already `revoked` → `200` with the same
+   body (every field is read back from the rows), nothing written.
+2. `RunInTx`: `LockForUpdate` — the TS-1/TS-2 lock, so an in-flight
+   rotation is waited for (`409 rotation_in_flight` + `active_rotation_id`
+   past `PG_LOCK_TIMEOUT`); `revoked` under the lock → `200`.
+3. `ListByPrincipal`, then `service.EraseSecretMaterial` — the
+   offboarding cascade's own step (§8.4): every row's path, then the
+   principal's client prefix `iam/serviceaccount/<tenant>/<client>`
+   (uncommitted material). Each OpenBao call bounded at 5 s under the lock.
+4. Each `active`/`rotating` row → `markCredentialRevoked` (shared with
+   TS-2: `revoked`, `revoked_at`, cadence cleared, `record_version`
+   guard) + `ServiceAccountCredentialRevoked`.
+5. `PrincipalRepository.UpdateStatus(revoked)` (`record_version` guard)
+   + `ServiceAccountRevoked` → COMMIT.
+
+Failure: everything in Postgres and the outbox rolls back together; an
+OpenBao failure is `502` before any row is written; a retry converges
+(deleting a missing path is a no-op). A credential `record_version`
+conflict (the rotator sweep revokes without the principal lock) is `409
+optimistic_lock_conflict` unless the principal reached `revoked`
+meanwhile. A revoked principal is terminal (TS-1 → `422`; TS-4 cannot
+reactivate it); only the offboarding cascade removes the row.
 
 ## JWKS fetch (EXT-6)
 
@@ -249,7 +277,7 @@ next DB reload. The known-tenant set reloads every
 | Crash after OpenBao write, before commit | Material no row claims — overwritten by the next attempt or reclaimed by §8.6 under the principal lock |
 | Lost TS-1 response | Retry same `rotation_id` within the replay window → same version + key, no double-rotation |
 | Replay past the window / of a revoked version | `409 credential_replay_expired` / `409 credential_replay_revoked` |
-| Concurrent TS-1/TS-2/offboarding for one principal | Serialized on the principal row lock; `409 rotation_in_flight` only if the lock isn't free within `PG_LOCK_TIMEOUT` |
+| Concurrent TS-1/TS-2/TS-7/offboarding for one principal | Serialized on the principal row lock; `409 rotation_in_flight` only if the lock isn't free within `PG_LOCK_TIMEOUT` |
 | Concurrent-revoke race (TS-2 vs sweep) | Re-checked, idempotent outcome returned / `Skipped`, never `409` or `Failed` |
 | Issue against a revoked principal | `422 principal_revoked` |
 | Postgres unavailable / statement timeout | `503 db_unavailable` (SQLSTATE class 08/53/57/58) |

@@ -26,9 +26,11 @@ import (
 type CredentialService interface {
 	IssueOrRotate(ctx context.Context, tenantID, principalID uuid.UUID, req service.IssueOrRotateRequest, actor uuid.UUID) (*service.IssueOrRotateResult, error)
 	Revoke(ctx context.Context, tenantID, principalID uuid.UUID, version int, actor uuid.UUID) (*service.RevokeResult, error)
+	RevokePrincipal(ctx context.Context, tenantID, actor uuid.UUID) (*service.RevokePrincipalResult, error)
 }
 
-// CredentialHandler implements TS-1 (issue/rotate) and TS-2 (revoke) (§5.4).
+// CredentialHandler implements TS-1 (issue/rotate), TS-2 (revoke one
+// version) and TS-7 (revoke the tenant's automation principal) (§5.4).
 type CredentialHandler struct {
 	svc            CredentialService
 	defaultOverlap int
@@ -225,6 +227,63 @@ func (h *CredentialHandler) Revoke(c *gin.Context) {
 	c.JSON(http.StatusOK, revokeResponseBody{
 		Version: res.Version, Status: string(res.Status),
 		RevokedAt:            res.RevokedAt.UTC().Format(time.RFC3339),
+		KeycloakInvalidation: "caller_responsibility",
+	})
+}
+
+type revokePrincipalResponseBody struct {
+	PrincipalID          uuid.UUID `json:"principal_id"`
+	TenantID             uuid.UUID `json:"tenant_id"`
+	KeycloakClientID     string    `json:"keycloak_client_id"`
+	Status               string    `json:"status"`
+	RecordVersion        int       `json:"record_version"`
+	RevokedAt            string    `json:"revoked_at"`
+	RevokedVersions      []int     `json:"revoked_versions"`
+	KeycloakInvalidation string    `json:"keycloak_invalidation"`
+}
+
+// RevokePrincipal implements TS-7: POST
+// …/service-accounts/platform-automation/revoke (§5.4) — retires the
+// tenant's automation principal: every credential version revoked, its
+// OpenBao material deleted, rotation unscheduled and the principal set
+// `revoked`. Addressed by the frozen principal name, like TS-6. Idempotent:
+// an already-revoked principal returns 200 with the same body.
+//
+// @Summary      TS-7 — Revoke the tenant's platform-automation principal
+// @Description  Revokes every credential version of the tenant's platform-automation principal (deleting its OpenBao material and clearing its rotation cadence, one ServiceAccountCredentialRevoked per version), then sets the principal to revoked (ServiceAccountRevoked) — the same material erasure and principal-level event as the TenantMembershipsPurged cascade, without the hard delete. For the Realm Provisioner's orphaned-signup-reap, whose tenant never reaches O&M and so never gets a purge. Idempotent: an already-revoked principal returns 200 with the same body; no principal is 404 PRINCIPAL_NOT_FOUND. A revoked principal is terminal (TS-1 then returns 422 PRINCIPAL_REVOKED). keycloak_invalidation is always "caller_responsibility" (TS-INV-7): the caller deletes or disables the Keycloak client. No request body. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).
+// @Tags         ServiceAccounts
+// @Produce      json
+// @Param        id   path      string  true  "Tenant UUID"  format(uuid)
+// @Success      200  {object}  revokePrincipalResponseBody  "revoked, or already revoked (idempotent)"
+// @Failure      400  {object}  ProblemDetails  "INVALID_REQUEST"
+// @Failure      401  {object}  ProblemDetails  "MISSING_IDENTITY_HEADERS"
+// @Failure      403  {object}  ProblemDetails  "TENANT_PATH_MISMATCH"
+// @Failure      404  {object}  ProblemDetails  "PRINCIPAL_NOT_FOUND"
+// @Failure      409  {object}  ProblemDetails  "ROTATION_IN_FLIGHT (retryable; principal lock wait timeout) | OPTIMISTIC_LOCK_CONFLICT (retryable)"
+// @Failure      415  {object}  ProblemDetails  "UNSUPPORTED_MEDIA_TYPE (only when a body is sent)"
+// @Failure      500  {object}  ProblemDetails
+// @Failure      502  {object}  ProblemDetails  "SECRET_STORE_UNAVAILABLE — nothing committed; retry"
+// @Failure      503  {object}  ProblemDetails  "DB_UNAVAILABLE"
+// @Security     TenantID && UserID
+// @Router       /tenants/{id}/service-accounts/platform-automation/revoke [post]
+func (h *CredentialHandler) RevokePrincipal(c *gin.Context) {
+	rc, ok := requestctx.FromContext(c.Request.Context())
+	if !ok {
+		writeMissingIdentityHeaders(c)
+		return
+	}
+
+	res, err := h.svc.RevokePrincipal(c.Request.Context(), rc.TenantID, rc.UserID)
+	if err != nil {
+		HandleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, revokePrincipalResponseBody{
+		PrincipalID: res.PrincipalID, TenantID: res.TenantID, KeycloakClientID: res.KeycloakClientID,
+		Status: string(res.Status), RecordVersion: res.RecordVersion,
+		RevokedAt:            res.RevokedAt.UTC().Format(time.RFC3339),
+		RevokedVersions:      res.Versions,
 		KeycloakInvalidation: "caller_responsibility",
 	})
 }

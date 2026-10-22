@@ -251,8 +251,9 @@ func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 		automationResult: &service.AutomationPrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusActive},
 	}
 	credentialSvc := &fakeCredentialService{
-		issueResult:  &service.IssueOrRotateResult{Version: 1, Secret: "s"},
-		revokeResult: &service.RevokeResult{Version: 1, Status: domain.CredentialStatusRevoked},
+		issueResult:           &service.IssueOrRotateResult{Version: 1, Secret: "s"},
+		revokeResult:          &service.RevokeResult{Version: 1, Status: domain.CredentialStatusRevoked},
+		revokePrincipalResult: &service.RevokePrincipalResult{PrincipalID: principalID, TenantID: tenantID, Status: domain.PrincipalStatusRevoked},
 	}
 	r := newFullTestRouter(t, DocsConfig{}, principalSvc, credentialSvc, fakePinger{}, fakePinger{}, fakePinger{})
 	headers := sysHeaders(tenantID)
@@ -269,6 +270,7 @@ func TestRouter_InternalRoutes_Smoke(t *testing.T) {
 		{"TS-3 read", http.MethodGet, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String(), nil, http.StatusOK},
 		{"TS-1 issue", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String() + "/credentials", []byte(`{"rotation_id":"` + uuid.New().String() + `"}`), http.StatusCreated},
 		{"TS-2 revoke", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/" + principalID.String() + "/credentials/1/revoke", nil, http.StatusOK},
+		{"TS-7 revoke principal", http.MethodPost, "/api/v1/internal/tenants/" + tenantID.String() + "/service-accounts/platform-automation/revoke", nil, http.StatusOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

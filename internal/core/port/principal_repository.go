@@ -76,6 +76,13 @@ type PrincipalRepository interface {
 	// cascade commits. MUST be called inside a transaction.
 	LockByTenant(ctx context.Context, tenantID uuid.UUID) ([]*domain.ServiceAccountPrincipal, error)
 
+	// UpdateStatus writes p.Status, guarded by p.RecordVersion (WHERE id AND
+	// record_version, §9.1), and scans the trigger-bumped record_version and
+	// updated_at back into p. TS-7 uses it to set a principal `revoked`,
+	// inside the transaction that holds the principal lock. Returns
+	// domain.ErrOptimisticLockConflict on a stale record_version.
+	UpdateStatus(ctx context.Context, p *domain.ServiceAccountPrincipal) error
+
 	// DeleteByTenant hard-deletes every principal row for tenantID; the
 	// composite (principal_id, tenant_id) FK's ON DELETE CASCADE removes
 	// its credential rows with it (§4.2, §8.4 offboarding cascade).

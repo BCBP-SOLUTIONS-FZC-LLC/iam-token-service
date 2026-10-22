@@ -290,11 +290,13 @@ networkPolicy:
 
 # authorizationPolicy: Istio L7 policy for the server.
 # NetworkPolicy admits Keycloak (and Workflow) at L4 to the WHOLE HTTP port,
-# and the only identity check on TS-1..TS-6 is the reserved x-user-id header
+# and the only identity check on TS-1..TS-7 is the reserved x-user-id header
 # (LLD §5.2), which any caller can set — so without this policy a pod in the
-# Keycloak/Workflow namespace can call TS-1/TS-2/TS-4 as the system
+# Keycloak/Workflow namespace can call TS-1/TS-2/TS-4/TS-7 as the system
 # principal. This policy limits Keycloak to GET …/jwks.json and Workflow to
-# GET …/platform-automation (TS-6); only meshNamespaces get every route.
+# GET …/platform-automation (TS-6); only meshNamespaces get every route
+# (including TS-7, POST …/platform-automation/revoke, which the Realm
+# Provisioner calls — the Workflow rule's exact GET path never matches it).
 # REQUIRED (the render fails otherwise) when networkPolicy.enabled and appEnv
 # is not local/dev/test.
 # Keycloak MUST be in the mesh (sidecar-injected, mTLS to this server):
@@ -348,7 +350,7 @@ podDisruptionBudget:
   minAvailable: 1
 
 # Ingress — disabled by default. No public/edge route exists today (§5.6,
-# all 7 routes are /api/v1/internal/*, gated to in-mesh callers by
+# all 8 routes are /api/v1/internal/*, gated to in-mesh callers by
 # networkPolicy and authorizationPolicy above); kept as dormant scaffolding matching the sibling
 # IAM services' chart shape, for if that ever changes.
 # type: HTTPRoute  — Envoy Gateway / any Gateway API-compatible controller (recommended)
