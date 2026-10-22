@@ -45,7 +45,7 @@ All four binaries ship in one image (`/iam-token-service-server` is the default 
 
 | Binary | Entrypoint | Kind | What it does |
 |---|---|---|---|
-| `cmd/server` | `/iam-token-service-server` | Deployment | HTTP API (the 7 routes below) and the outbox relay to SNS. Background loops: the rotation-overlap exporter, the RLS-violation exporter, the `keys_refresh_pending` exporter and the JWKS known-tenant refresher. With `MIGRATE_ONLY=true` it migrates and exits (the Helm migrate Job) |
+| `cmd/server` | `/iam-token-service-server` | Deployment | HTTP API (the 8 routes below) and the outbox relay to SNS. Background loops: the rotation-overlap exporter, the RLS-violation exporter, the `keys_refresh_pending` exporter and the JWKS known-tenant refresher. With `MIGRATE_ONLY=true` it migrates and exits (the Helm migrate Job) |
 | `cmd/consumer` | `/iam-token-service-consumer` | Deployment | SQS consumer for `TenantMembershipsPurged`, the offboarding cascade |
 | `cmd/rotator` | `/iam-token-service-rotator` | CronJob (`*/5 * * * *`) | Retries owed RP-17 refreshes, then the overlap-expiry sweep (revoke + RP-17 per tenant), the orphan-material reconciler and the retention prunes. Never rotates |
 | `cmd/scheduler` | `/iam-token-service-scheduler` | CronJob (`*/5 * * * *`) | Retries owed RP-17 refreshes, then cadence-driven rotation: calls `CredentialService.IssueOrRotate` in-process for every principal past `next_rotation_at`, then RP-17 (§16 TSQ-6, TS-D14) |
@@ -57,7 +57,7 @@ The two CronJobs process their batch (`*_BATCH_LIMIT`, default 500) **tenant by 
 
 ## API overview
 
-Seven routes, all registered in `internal/adapter/inbound/http/router.go` (`NewRouter`), plus health and docs. The Swagger spec in `docs/swagger/` is generated from handler annotations (`make swag`), never hand-written. Full contracts: LLD §5 and [`.claude/api-events.md`](.claude/api-events.md).
+Eight routes, all registered in `internal/adapter/inbound/http/router.go` (`NewRouter`), plus health and docs. The Swagger spec in `docs/swagger/` is generated from handler annotations (`make swag`), never hand-written. Full contracts: LLD §5 and [`.claude/api-events.md`](.claude/api-events.md).
 
 | # | Method & path (under `/api/v1/internal/tenants/:id`) | Idempotency | Purpose | Emits |
 |---|---|---|---|---|
@@ -67,11 +67,12 @@ Seven routes, all registered in `internal/adapter/inbound/http/router.go` (`NewR
 | TS-3 | `GET /service-accounts/:principal_id` | Read-only | Principal + credential **metadata** (never a key) | — |
 | TS-5 | `GET /service-accounts?principal_sub=<uuid>` | Read-only | Find a principal by Keycloak `sub` (AUTH-9 defense-in-depth for org-membership, TS-D16). Identity/status only | — |
 | TS-6 | `GET /service-accounts/platform-automation` | Read-only | Read the tenant's automation principal including its `sub` (TS-D17), for the Workflow Service's connector workers. The sub is stable across rotation and changes on an RP-3/RP-4 re-mint; `principal_id` is the stable handle | — |
+| TS-7 | `POST /service-accounts/platform-automation/revoke` | Revoking an already-revoked principal is `200` with the same body; no principal is `404 PRINCIPAL_NOT_FOUND` | Revoke the tenant's automation principal (TS-D29): every live version revoked and its OpenBao material deleted, rotation unscheduled, principal `status=revoked`. No body. Called by the Realm Provisioner's `orphaned-signup-reap` | `…CredentialRevoked` per version, `ServiceAccountRevoked` |
 | EXT-6 | `GET /service-accounts/platform-automation/jwks.json` | Read-only, **public** | The JWK Set Keycloak's `client-jwt` authenticator fetches | — |
 
 ### Auth model
 
-- **TS-1..TS-6** accept exactly one caller identity: `x-user-id` = the reserved iam-system principal `00000000-0000-0000-0000-0000000000a1`, and `x-tenant-id` = the path tenant. There is no operator-vs-system distinction. Which caller may reach which route is enforced at the mesh: NetworkPolicy (L4) plus the Istio `AuthorizationPolicy` (L7), which is required outside dev (see [Security](#security)).
+- **TS-1..TS-7** accept exactly one caller identity: `x-user-id` = the reserved iam-system principal `00000000-0000-0000-0000-0000000000a1`, and `x-tenant-id` = the path tenant. There is no operator-vs-system distinction. Which caller may reach which route is enforced at the mesh: NetworkPolicy (L4) plus the Istio `AuthorizationPolicy` (L7), which is required outside dev (see [Security](#security)).
 - **Middleware chain:** 1 MB body cap → `gincommon.ObservabilityMiddlewares` (ends with the 30s request timeout, so metrics, logs and spans record the same `503` the client gets) → on the protected group only: `RequireIdentityHeaders` (`401 missing_identity_headers` for a missing, repeated or non-UUID `x-user-id`/`x-tenant-id`; it also drops `x-tenant-roles`, which this service never reads) → `gincommon.ProtectedMiddlewares` → `GUCBridgeMiddleware` (rejects any principal other than iam-system, binds `SET LOCAL app.tenant_id`) → `RequireJSONContentType` → `RequireTenantPathMatch` (`403 tenant_path_mismatch`, never silently corrected).
 - **The JWKS route** has no header auth by design: Keycloak's outbound fetch carries no caller identity. RLS is bound from the path tenant instead. It is protected by rate limits and, in deployed environments, by the `AuthorizationPolicy` that admits Keycloak to this one path only.
   - **Known-tenant set:** reloaded from Postgres every `JWKS_KNOWN_TENANTS_REFRESH` (15s) over the BYPASSRLS reconciler pool. The pod blocks `/readyz` until the first reload completes (TS-RP-GAP-001), ensuring a newly-provisioned tenant's first Keycloak JWKS fetch is served from the global bucket, not the tighter unknown-tenant one. Tracked by `iam_token_service_jwks_known_tenants_refresh_total{result=success|error}` and `iam_token_service_jwks_known_tenants_last_refresh_age_seconds`. The alert `IAMTokenServiceJWKSKnownTenantsStale` fires when age > 120 s for 5 minutes.
@@ -84,7 +85,7 @@ TS-1's idempotency key is a **body field**, `rotation_id`, not an `Idempotency-K
 
 ### Concurrency
 
-TS-1, TS-2 and the offboarding cascade serialize per principal on a row lock (`LockForUpdate`; offboarding uses `LockByTenant`). A caller that cannot get the lock within `PG_LOCK_TIMEOUT` (SQLSTATE `55P03`) gets `409 rotation_in_flight`; when an active rotation exists, its ID is included in the RFC 9457 `detail` field. TS-1 takes the next version as `MaxVersion + 1` over every row (a version number is never reused), generates the keypair before the transaction, closes any older open overlaps, and after commit runs an opportunistic sweep of expired overlaps. The JWKS route reads without locking. Details: LLD §9, [`.claude/request-flows.md`](.claude/request-flows.md).
+TS-1, TS-2, TS-7 and the offboarding cascade serialize per principal on a row lock (`LockForUpdate`; offboarding uses `LockByTenant`). A caller that cannot get the lock within `PG_LOCK_TIMEOUT` (SQLSTATE `55P03`) gets `409 rotation_in_flight`; when an active rotation exists, its ID is included in the RFC 9457 `detail` field. TS-1 takes the next version as `MaxVersion + 1` over every row (a version number is never reused), generates the keypair before the transaction, closes any older open overlaps, and after commit runs an opportunistic sweep of expired overlaps. The JWKS route reads without locking. Details: LLD §9, [`.claude/request-flows.md`](.claude/request-flows.md).
 
 ### Error codes
 
@@ -95,7 +96,7 @@ Every non-2xx response is an **RFC 9457 Problem Details** object (`application/p
 | `INVALID_REQUEST` | 400 | A UUID/integer parse failure or a business-rule field check | Frozen | `validationErrors[].field` / `.message` |
 | `MISSING_IDENTITY_HEADERS` | 401 | `x-user-id`/`x-tenant-id` missing, repeated or not a UUID, or `x-user-id` is not iam-system | Frozen | — |
 | `TENANT_PATH_MISMATCH` | 403 | Path `:id` differs from `x-tenant-id` | Additive | — |
-| `PRINCIPAL_NOT_FOUND` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6) | Frozen | — |
+| `PRINCIPAL_NOT_FOUND` | 404 | Unknown `principal_id` (or no principal for TS-5/TS-6/TS-7) | Frozen | — |
 | `ROTATION_IN_FLIGHT` | 409 | Principal row lock not obtained within `PG_LOCK_TIMEOUT` (active rotation in `detail`) | Frozen | `detail` |
 | `OPTIMISTIC_LOCK_CONFLICT` | 409 | A concurrent writer changed `record_version` (expected version in `detail`) | Frozen | `detail` |
 | `CREDENTIAL_REPLAY_REVOKED` | 409 | `rotation_id` replay of a since-revoked version (TS-D13) | Additive | — |
@@ -152,7 +153,7 @@ iam-token-service/
 │   ├── core/
 │   │   ├── domain/      # Entities, ErrorCode taxonomy (§17), event payloads
 │   │   ├── port/        # Repositories, SecretStore, EventPublisher, RealmProvisionerClient, TxRunner, Inbox (inbox.go)
-│   │   └── service/     # CredentialService (TS-1/TS-2), PrincipalService (TS-3..TS-6), JWKSService, secret_generator (RSA-2048)
+│   │   └── service/     # CredentialService (TS-1/TS-2/TS-7), PrincipalService (TS-3..TS-6), JWKSService, secret_generator (RSA-2048)
 │   └── adapter/
 │       ├── inbound/
 │       │   ├── http/      # router.go, middleware.go, errors.go, credential/principal/jwks handlers, /swagger, /asyncapi
@@ -246,7 +247,7 @@ Event contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), LLD §7.
 
 | Direction | Service | Relationship |
 |---|---|---|
-| Called by | Realm Provisioner | TS-4 after it mints the client (RP-1/RP-2); TS-1 for provisioning. It discards the returned private key and calls RP-17 so Keycloak fetches the public key from this service's JWKS |
+| Called by | Realm Provisioner | TS-4 after it mints the client (RP-1/RP-2); TS-1 for provisioning; TS-7 from `orphaned-signup-reap` (a trial signup that never reached O&M). It discards the returned private key and calls RP-17 so Keycloak fetches the public key from this service's JWKS |
 | Called by | Operators, O&M tooling | TS-1 (on-demand / break-glass rotation, then RP-17 by hand), TS-2 (revoke), TS-3 (read) |
 | Called by | Org & Membership | TS-5 (find by sub, AUTH-9) |
 | Called by | Workflow Service | TS-6 (the tenant's automation subject, TS-D17) |
@@ -262,7 +263,7 @@ Things to know as a caller:
 2. **Retry TS-1 with the same `rotation_id`**, within the replay window, to recover a lost response without generating new material. Use a new `rotation_id` only for a genuinely new rotation.
 3. **TS-1 and TS-2 alone change nothing at Keycloak** (TS-INV-7). An operator-driven rotate or revoke must be followed by RP-17. The scheduler and rotator do this themselves.
 4. **Optimistic locking:** both tables carry `record_version`, bumped by the `touch_row()` trigger. A `409 optimistic_lock_conflict` includes the expected version in the RFC 9457 `detail` field. TS-2 and the sweep re-check after a conflict and report the idempotent outcome when two actors converged on the same result (TS-D13).
-5. **Rate limits:** TS-1..TS-6 apply none (in-mesh callers only). Only the JWKS route is rate-limited (above).
+5. **Rate limits:** TS-1..TS-7 apply none (in-mesh callers only). Only the JWKS route is rate-limited (above).
 
 ---
 
@@ -454,7 +455,7 @@ Canonical suites (do not break):
 | RLS violations | `rls_check_tenant()` fails closed and samples rejections into `rls_violation_log`, exported as `iam_rls_violations_total` (TS-D18) |
 | No Keycloak credential | No `gocloak`, no Admin credential (TS-INV-1, CI-enforced) |
 | Secrets in Postgres or logs | Impossible by design (TS-INV-2); the `no-secret-log` gate also covers error strings and span attributes |
-| **Istio `AuthorizationPolicy`** | **Required outside `local`/`dev`/`test`** (render fails). NetworkPolicy admits Keycloak and Workflow to the whole HTTP port, and TS-1..TS-6 authenticate only by the `x-user-id` header, which any pod can set. The policy limits `keycloakNamespaces` to `GET …/jwks.json`, `workflowNamespaces` to TS-6, and gives `meshNamespaces` every route. Keycloak and callers **must be in the mesh**: `source.namespaces` matches only mTLS peers |
+| **Istio `AuthorizationPolicy`** | **Required outside `local`/`dev`/`test`** (render fails). NetworkPolicy admits Keycloak and Workflow to the whole HTTP port, and TS-1..TS-7 authenticate only by the `x-user-id` header, which any pod can set. The policy limits `keycloakNamespaces` to `GET …/jwks.json`, `workflowNamespaces` to TS-6, and gives `meshNamespaces` every route. Keycloak and callers **must be in the mesh**: `source.namespaces` matches only mTLS peers |
 | `PeerAuthentication` | `authorizationPolicy.strictMTLS` (default `true`) renders STRICT mTLS on the server; the metrics port stays PERMISSIVE for a non-mesh Prometheus |
 | Sidecar injection | With the policy enabled, server and consumer pods are force-injected (the policy is enforced by the server's own sidecar), as **native sidecars** by default (`authorizationPolicy.nativeSidecar`, Istio ≥ 1.20 on Kubernetes ≥ 1.29) so the proxy outlives the app's drain. CronJobs are not injected unless `cronjobs.istioInject: true`; the migrate Job never is |
 | NetworkPolicy | Ingress from `ingressNamespaceSelector` (mesh), `keycloakNamespaceSelector`, optional `workflowNamespaceSelector`; metrics port only from `monitoringNamespaceSelector`. Egress allow-list: DNS, Postgres (`postgresPort` and `postgresDirectPort`), OpenBao, AWS HTTPS, OTel, istiod (when injected), RP-17 (CronJobs only). Off-cluster targets by CIDR (`networkPolicy.egress.*CIDRs`) |

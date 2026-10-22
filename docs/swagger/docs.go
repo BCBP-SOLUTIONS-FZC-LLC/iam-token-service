@@ -321,6 +321,96 @@ const docTemplate = `{
                 }
             }
         },
+        "/tenants/{id}/service-accounts/platform-automation/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "TenantID": [],
+                        "UserID": []
+                    }
+                ],
+                "description": "Revokes every credential version of the tenant's platform-automation principal (deleting its OpenBao material and clearing its rotation cadence, one ServiceAccountCredentialRevoked per version), then sets the principal to revoked (ServiceAccountRevoked) — the same material erasure and principal-level event as the TenantMembershipsPurged cascade, without the hard delete. For the Realm Provisioner's orphaned-signup-reap, whose tenant never reaches O\u0026M and so never gets a purge. Idempotent: an already-revoked principal returns 200 with the same body; no principal is 404 PRINCIPAL_NOT_FOUND. A revoked principal is terminal (TS-1 then returns 422 PRINCIPAL_REVOKED). keycloak_invalidation is always \"caller_responsibility\" (TS-INV-7): the caller deletes or disables the Keycloak client. No request body. Requires x-user-id = the fixed iam-system principal UUID 00000000-0000-0000-0000-0000000000a1 (domain.SystemPrincipalID; any other value is 401 missing_identity_headers) and x-tenant-id equal to the {id} path segment (else 403 tenant_path_mismatch).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "ServiceAccounts"
+                ],
+                "summary": "TS-7 — Revoke the tenant's platform-automation principal",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Tenant UUID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "revoked, or already revoked (idempotent)",
+                        "schema": {
+                            "$ref": "#/definitions/http.revokePrincipalResponseBody"
+                        }
+                    },
+                    "400": {
+                        "description": "INVALID_REQUEST",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "MISSING_IDENTITY_HEADERS",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "TENANT_PATH_MISMATCH",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "PRINCIPAL_NOT_FOUND",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "ROTATION_IN_FLIGHT (retryable; principal lock wait timeout) | OPTIMISTIC_LOCK_CONFLICT (retryable)",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "415": {
+                        "description": "UNSUPPORTED_MEDIA_TYPE (only when a body is sent)",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "502": {
+                        "description": "SECRET_STORE_UNAVAILABLE — nothing committed; retry",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    },
+                    "503": {
+                        "description": "DB_UNAVAILABLE",
+                        "schema": {
+                            "$ref": "#/definitions/http.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/tenants/{id}/service-accounts/{principal_id}": {
             "get": {
                 "security": [
@@ -846,6 +936,38 @@ const docTemplate = `{
                 }
             }
         },
+        "http.revokePrincipalResponseBody": {
+            "type": "object",
+            "properties": {
+                "keycloak_client_id": {
+                    "type": "string"
+                },
+                "keycloak_invalidation": {
+                    "type": "string"
+                },
+                "principal_id": {
+                    "type": "string"
+                },
+                "record_version": {
+                    "type": "integer"
+                },
+                "revoked_at": {
+                    "type": "string"
+                },
+                "revoked_versions": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
         "http.revokeResponseBody": {
             "type": "object",
             "properties": {
@@ -887,7 +1009,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/api/v1/internal",
 	Schemes:          []string{},
 	Title:            "IAM Token Service API",
-	Description:      "Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-6 plus the EXT-6 JWKS route).\n\n**Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).\n**Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).\n**No Keycloak dependency:** This service manages its own credential material independently — it never calls the Keycloak Admin API (TS-INV-1).",
+	Description:      "Token Service microservice — custodian of the platform-automation service account's rotating credential material (issue, rotate, revoke; TS-1..TS-7 plus the EXT-6 JWKS route).\n\n**Tenant isolation:** All resource access is strictly scoped by x-tenant-id. Cross-tenant access is never permitted (RLS-6).\n**Secret handling:** The generated credential plaintext is returned exactly once, on TS-1's response body, and never logged, traced, or echoed again (TS-INV-2).\n**No Keycloak dependency:** This service manages its own credential material independently — it never calls the Keycloak Admin API (TS-INV-1).",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

@@ -249,6 +249,28 @@ func (r *PrincipalRepository) listByTenant(ctx context.Context, tenantID uuid.UU
 	return out, nil
 }
 
+// UpdateStatus writes p.Status under an optimistic lock on record_version
+// (port.PrincipalRepository). The touch_row trigger (§4.5) bumps
+// record_version and updated_at; both are scanned back into p.
+func (r *PrincipalRepository) UpdateStatus(ctx context.Context, p *domain.ServiceAccountPrincipal) error {
+	return withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			UPDATE service_account_principals SET status = $4
+			WHERE id = $1 AND tenant_id = $2 AND record_version = $3 AND deleted_at IS NULL
+			RETURNING record_version, updated_at`,
+			p.ID, p.TenantID, p.RecordVersion, p.Status,
+		).Scan(&p.RecordVersion, &p.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.ErrOptimisticLockConflict, "service_account_principals record_version conflict").
+					WithDetails(map[string]any{"expected_version": p.RecordVersion})
+			}
+			return err
+		}
+		return nil
+	})
+}
+
 // DeleteByTenant hard-deletes every principal row for tenantID; the
 // composite (principal_id, tenant_id) FK's ON DELETE CASCADE removes its
 // credential rows with it (§4.2, §8.4 offboarding cascade).

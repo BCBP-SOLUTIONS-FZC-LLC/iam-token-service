@@ -59,7 +59,7 @@ groups:
           summary: iam-token-service server has no healthy instances
           description: >-
             No iam-token-service server pods have been scraped as healthy
-            for 2 minutes — this blocks TS-1..TS-6 and the JWKS route. Check pod readiness:
+            for 2 minutes — this blocks TS-1..TS-7 and the JWKS route. Check pod readiness:
             kubectl get pods -l app.kubernetes.io/component=server,app.kubernetes.io/name=iam-token-service
 
       - alert: IAMTokenServiceConsumerDown

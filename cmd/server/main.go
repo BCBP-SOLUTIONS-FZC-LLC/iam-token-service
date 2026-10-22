@@ -1,5 +1,5 @@
 // Package main is the composition root for the Token Service's HTTP API
-// process (§5): the 7 internal routes — TS-1..TS-6 plus EXT-6's public
+// process (§5): the 8 internal routes — TS-1..TS-7 plus EXT-6's public
 // JWKS route — and the outbox runner that publishes every process's
 // enqueued events. cmd/consumer (the offboarding cascade, §8.4),
 // cmd/rotator (overlap-expiry sweep, orphan-material reconciler, retention

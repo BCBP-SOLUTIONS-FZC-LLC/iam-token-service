@@ -99,6 +99,13 @@ func (f *fakePrincipalRepository) ListByTenant(context.Context, uuid.UUID) ([]*d
 }
 func (f *fakePrincipalRepository) DeleteByTenant(context.Context, uuid.UUID) error { return nil }
 
+func (f *fakePrincipalRepository) UpdateStatus(_ context.Context, p *domain.ServiceAccountPrincipal) error {
+	p.RecordVersion++
+	cp := *p
+	f.put(&cp)
+	return nil
+}
+
 var _ port.PrincipalRepository = (*fakePrincipalRepository)(nil)
 
 type fakeCredentialRepository struct {
@@ -400,4 +407,34 @@ func TestInstrumentedCredentialService_IssueOrRotate_CountsReplaysByResult(t *te
 		require.Error(t, err)
 		assert.InDelta(t, before+1, replays(ReplayExpired), 0)
 	})
+}
+
+// TS-7 counts one op=revoke per version it actually revoked, and nothing on
+// an idempotent repeat or an error.
+func TestInstrumentedCredentialService_RevokePrincipal_CountsNewlyRevokedVersions(t *testing.T) {
+	Register("test")
+	ctx := context.Background()
+	actor := uuid.New()
+	revokes := func() float64 { return testutilCounterValue(t, CredentialsIssuedTotal.WithLabelValues("revoke")) }
+
+	inner, tenantID, principalID := newTestCredentialService(t)
+	decorated := NewInstrumentedCredentialService(inner)
+	for range 2 { // v1 rotating (300s overlap), v2 active
+		_, err := decorated.IssueOrRotate(ctx, tenantID, principalID, service.IssueOrRotateRequest{RotationID: uuid.New(), OverlapSeconds: 300}, actor)
+		require.NoError(t, err)
+	}
+
+	before := revokes()
+	res, err := decorated.RevokePrincipal(ctx, tenantID, actor)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.NewlyRevoked)
+	assert.InDelta(t, before+2, revokes(), 0)
+
+	_, err = decorated.RevokePrincipal(ctx, tenantID, actor)
+	require.NoError(t, err)
+	assert.InDelta(t, before+2, revokes(), 0, "an idempotent repeat counts nothing")
+
+	_, err = decorated.RevokePrincipal(ctx, uuid.New(), actor)
+	require.Error(t, err)
+	assert.InDelta(t, before+2, revokes(), 0, "an error counts nothing")
 }

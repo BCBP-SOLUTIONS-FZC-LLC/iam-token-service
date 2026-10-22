@@ -14,12 +14,12 @@ Provisioner never sets key material at Keycloak; it only clears Keycloak's
 key cache (RP-17, `ClearServiceAccountKeysCache`), which `cmd/rotator` and
 `cmd/scheduler` call themselves after their own revokes/rotations.
 
-The signed-off design is `docs/lld/iam-lld-token-service.md` (rev 1.4,
+The signed-off design is `docs/lld/iam-lld-token-service.md` (rev 1.5,
 Approved) — the tie-breaker on any discrepancy. A frozen name (LLD §25) or
 a resolved open question (§16) cannot change in place; that needs a new LLD
 revision. Prose, the Decision Register (§22) and the runbooks (§24) are
-living documents. The §22 entries TS-D13..TS-D26 are the changelog of the
-hardening passes since sign-off; TS-D24/25/26 are the most recent passes.
+living documents. The §22 entries TS-D13..TS-D29 are the changelog of the
+hardening passes since sign-off; TS-D29 (TS-7, rev 1.5) is the most recent.
 
 ## What this repo is
 
@@ -63,7 +63,7 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 Clean Architecture (`domain` → `port` → `service` → adapters → `cmd`),
 enforced by `.go-arch-lint.yml`. Four binaries share one distroless image:
 
-- `cmd/server` — the HTTP API (7 routes) and the outbox relay, plus four
+- `cmd/server` — the HTTP API (8 routes) and the outbox relay, plus four
   background loops: rotation-overlap exporter, RLS-violation exporter,
   `keys_refresh_pending` exporter, JWKS known-tenant refresher. With
   `MIGRATE_ONLY=true` it applies migrations and exits (the Helm hook Job).
@@ -81,6 +81,13 @@ dependency rules: [architecture.md](architecture.md).
 
 ## Key files to know
 
+- **`internal/core/service/principal_revoke.go`, `secret_erasure.go`** —
+  TS-7 (`revokePrincipal`, TS-D29): under the principal lock, erase
+  material via `EraseSecretMaterial` (shared with the offboarding
+  cascade), revoke each live version via `markCredentialRevoked` (shared
+  with TS-2), set the principal `revoked` via `UpdateStatus`
+  (record_version-guarded), emit per-version `…CredentialRevoked` +
+  `ServiceAccountRevoked`. Idempotent `200`; `404` when absent.
 - **`internal/core/service/credential_service.go`** — TS-1
   (`issueOrRotate`) and TS-2 (`revokeCredential`). Each runs in one
   transaction that first locks the principal row (`LockForUpdate`,
@@ -230,9 +237,10 @@ search_path pinned + PUBLIC revoked, RLS-log prune TTL ≥ 7 days, TS-D21),
 
 ## API & events
 
-7 routes under `/api/v1/internal/tenants/:id/…`: TS-4 register, TS-1
+8 routes under `/api/v1/internal/tenants/:id/…`: TS-4 register, TS-1
 issue/rotate, TS-2 revoke, TS-3 read, TS-5 find by `principal_sub`
-(TS-D16), TS-6 read the platform-automation principal (TS-D17), and the
+(TS-D16), TS-6 read the platform-automation principal (TS-D17), TS-7
+revoke the platform-automation principal (TS-D29), and the
 EXT-6 JWKS route (public). Every TS route needs `x-user-id` = the iam-system
 UUID `00000000-0000-0000-0000-0000000000a1` and `x-tenant-id` = the path
 tenant. One inbound subscription (`TenantMembershipsPurged`), 5 frozen

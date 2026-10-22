@@ -7,7 +7,7 @@ Common starting points:
 - Rollouts: `count by (version) (platform_build_info{service="iam-token-service",environment="$environment"})`
 - Logs (Loki): `{service="iam-token-service"} | json`, then follow `trace_id` into Tempo. Logs carry `tenant_id` / `principal_id` / `version`, never key material (TS-INV-2).
 - Readiness: `GET /readyz` on the server checks Postgres, OpenBao, and the JWKS known-tenant refresher concurrently. The pod is not Ready until the refresher completes its first successful DB query (TS-RP-GAP-001): a newly-provisioned tenant's first Keycloak JWKS fetch must be served from the global rate-limit bucket, not the tighter unknown-tenant one. Track refresh failures with `iam_token_service_jwks_known_tenants_refresh_total{result="error"}` (alert: `IAMTokenServiceJWKSKnownTenantRefreshErrors`).
-- Binaries: `server` (TS-1..TS-6, JWKS), `consumer` (offboarding cascade), `rotator` and `scheduler` (CronJobs; Prometheus `job` = `iam-token-service-<binary>`).
+- Binaries: `server` (TS-1..TS-7, JWKS), `consumer` (offboarding cascade), `rotator` and `scheduler` (CronJobs; Prometheus `job` = `iam-token-service-<binary>`).
 - Labels: the alerts that select on `service="iam-token-service"` (`IAMTokenServiceOutboxStuck`, `IAMTokenServiceOutboxBacklogGrowing`, `IAMTokenServiceSQSReceiveErrors`, `IAMTokenServicePostgresPoolExhaustion`) depend on the series keeping their own `service` label, so the ServiceMonitor and PodMonitor set `honorLabels: true`. Without it the Prometheus Operator's `service=<Kubernetes Service name>` target label wins, the series' label is renamed `exported_service`, and those alerts can never fire. If one of them looks silent, check a raw series for `exported_service`.
 - Owed RP-17 refreshes: `SELECT * FROM keys_refresh_pending;` (one row per tenant whose Keycloak key cache still needs a refresh, with `requested_at`). The rotator and the scheduler write a row with every revoke/rotation, clear it when RP-17 succeeds, and retry owed rows at the start of each run: committed rows (`intent_until` NULL) at once, the scheduler's pre-rotation intent rows only after their `intent_until` passes. A row that keeps getting older means RP-17 is still failing for that tenant. The server exports the backlog as `iam_token_service_keys_refresh_pending` (rows) and `iam_token_service_keys_refresh_oldest_age_seconds` (every `KEYS_REFRESH_EXPORTER_INTERVAL`, Helm `exporters.keysRefreshInterval`, default 30s); `IAMTokenServiceKeysRefreshBacklog` alerts on the age.
 
@@ -15,7 +15,7 @@ Common starting points:
 
 ### IAMTokenServiceServerDown
 
-**Meaning.** No server pod has been scraped as healthy for 2 minutes. TS-1..TS-6 are unavailable, and so is the JWKS route: Keycloak cannot validate any `platform-automation` client assertion while it is down (EXT-6).
+**Meaning.** No server pod has been scraped as healthy for 2 minutes. TS-1..TS-7 are unavailable, and so is the JWKS route: Keycloak cannot validate any `platform-automation` client assertion while it is down (EXT-6).
 
 **Triage.**
 1. `kubectl get pods -l app.kubernetes.io/component=server,app.kubernetes.io/name=iam-token-service` and `kubectl describe pod` for crash loops and probe failures.

@@ -22,7 +22,7 @@ suffix, see below).
 
 | In scope (SemVer applies) | Out of scope (free to change without a version bump) |
 |---|---|
-| The 7 route paths and methods (TS-1..TS-6 and the EXT-6 JWKS route) and their request/response JSON shapes | Internal package layout, function/type names inside `internal/` |
+| The 8 route paths and methods (TS-1..TS-7 and the EXT-6 JWKS route) and their request/response JSON shapes | Internal package layout, function/type names inside `internal/` |
 | The 5 frozen event names (`ServiceAccountRegistered`, `…CredentialIssued`, `…CredentialRotated`, `…CredentialRevoked`, `ServiceAccountRevoked`) and their JSON Schemas | The Glue schema *version id* for a given event name (additive-only churn, not consumer-visible as a break) |
 | The `error` codes in the §17 taxonomy (`missing_identity_headers`, `principal_not_found`, `rotation_in_flight`, `optimistic_lock_conflict`, `principal_revoked`, `secret_store_unavailable`, `invalid_request`), plus the additive `db_unavailable`, `credential_replay_revoked`, `credential_replay_expired`, `jwks_keys_unavailable`, `rate_limited`, `tenant_path_mismatch`, `unsupported_media_type` and `internal_error` codes (`internal/core/domain/errors.go` documents each as additive to the frozen taxonomy, same pattern), and their HTTP status | Log line formats, trace span names beyond `credential.issue_rotate`/`credential.revoke` |
 | The frozen OpenBao path shape `iam/serviceaccount/<tenant_id>/<keycloak_client_id>/v<version>` | The OpenBao SDK version pinned in `go.mod` |

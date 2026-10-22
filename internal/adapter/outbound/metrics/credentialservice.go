@@ -76,3 +76,16 @@ func (s *InstrumentedCredentialService) Revoke(ctx context.Context, tenantID, pr
 	}
 	return res, err
 }
+
+// RevokePrincipal delegates to inner (TS-7) and adds the number of
+// credential versions it actually moved to `revoked` to
+// credentials_issued_total{op="revoke"} — one per version transition, as
+// TS-2 counts one; an idempotent repeat (NewlyRevoked 0) or an error adds
+// nothing.
+func (s *InstrumentedCredentialService) RevokePrincipal(ctx context.Context, tenantID, actor uuid.UUID) (*service.RevokePrincipalResult, error) {
+	res, err := s.inner.RevokePrincipal(ctx, tenantID, actor)
+	if err == nil && res.NewlyRevoked > 0 {
+		CredentialsIssuedTotal.WithLabelValues("revoke").Add(float64(res.NewlyRevoked))
+	}
+	return res, err
+}

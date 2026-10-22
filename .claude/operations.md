@@ -28,7 +28,7 @@ pod could set, so the caller restriction lives in the platform:
   outside local/dev/test (`templates/validate.yaml` fails the render):
   `meshNamespaces` (RP, O&M, operator gateway) on every route,
   `keycloakNamespaces` on the JWKS route only, `workflowNamespaces` on TS-6
-  only, and `/healthz`, `/readyz`, `/metrics` for probes/scrapes. Keycloak
+  only (`GET`, exact suffix, so not TS-7), and `/healthz`, `/readyz`, `/metrics` for probes/scrapes. Keycloak
   must be in the mesh. With it enabled the server and consumer are
   force-injected (native sidecars by default, `nativeSidecar`), and
   `strictMTLS` adds a STRICT `PeerAuthentication`.
@@ -61,6 +61,7 @@ typed-parsed (`400`); request bodies capped at 1 MiB; a POST body must be
 | TS-3 read | Org & Membership, operators |
 | TS-5 find-by-sub | Org & Membership (AUTH-9 non-member defense-in-depth, TS-D16) |
 | TS-6 read platform-automation | Workflow Service connector workers (TS-D17) |
+| TS-7 revoke platform-automation | Realm Provisioner `orphaned-signup-reap` (TS-D29) |
 | JWKS (no header auth) | Keycloak's outbound client-jwt fetch (EXT-6), limited by the AuthorizationPolicy and rate limiters |
 
 `cmd/rotator` and the offboarding consumer call no HTTP route — they drive
@@ -368,7 +369,7 @@ the quality + test path locally.
 
 | Service | Relationship |
 |---|---|
-| Realm Provisioner | Calls TS-4 and TS-1 (discards the private key, EXT-6); serves RP-17 (`POST …/tenants/:id/service-account/keys/refresh`), which this service's CronJobs call after their own revokes/rotations |
+| Realm Provisioner | Calls TS-4 and TS-1 (discards the private key, EXT-6), and TS-7 from its `orphaned-signup-reap`; serves RP-17 (`POST …/tenants/:id/service-account/keys/refresh`), which this service's CronJobs call after their own revokes/rotations |
 | Org & Membership / operators | TS-3 (read metadata), TS-5 (find-by-sub, AUTH-9) |
 | Workflow Service | TS-6 (the tenant's automation `principal_sub`) |
 | O&M / Core | Publishes `TenantMembershipsPurged` — the one inbound subscription |

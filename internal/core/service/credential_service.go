@@ -1,4 +1,4 @@
-// Package service implements the business logic behind TS-1..TS-6, the
+// Package service implements the business logic behind TS-1..TS-7, the
 // EXT-6 JWKS route and the reconciler jobs — domain + port only, no
 // adapter/Gin/pgx/OpenBao-SDK import (§3.2, enforced by .go-arch-lint.yml).
 package service
@@ -482,24 +482,11 @@ func (s *CredentialService) revokeCredential(ctx context.Context, tenantID, prin
 			return err
 		}
 		now := time.Now().UTC()
-		latest.Status = domain.CredentialStatusRevoked
-		latest.RevokedAt = &now
-		if err := s.credentials.Update(ctx, latest); err != nil {
+		if err := s.markCredentialRevoked(ctx, tenantID, principalID, latest, actor, now); err != nil {
 			return err
 		}
 		result = &RevokeResult{Version: latest.Version, Status: latest.Status, RevokedAt: now}
-
-		pub, ok := port.EventPublisherFromContext(ctx)
-		if !ok {
-			return nil
-		}
-		return pub.Enqueue(ctx, &domain.Event{
-			Type: domain.EventServiceAccountCredentialRevoked, TenantID: tenantID, Actor: actor,
-			Data: domain.ServiceAccountCredentialRevokedPayload{
-				TenantID: tenantID, PrincipalID: principalID, Version: latest.Version,
-				ActorID: actor, RevokedAt: now.Format(time.RFC3339),
-			},
-		})
+		return nil
 	})
 	if err != nil {
 		// Defense in depth for a writer that does not take the principal lock
@@ -515,6 +502,36 @@ func (s *CredentialService) revokeCredential(ctx context.Context, tenantID, prin
 		return nil, s.enrichRotationInFlight(ctx, err, tenantID, principalID)
 	}
 	return result, nil
+}
+
+// markCredentialRevoked is the Postgres-and-event half of a credential
+// revoke, shared by TS-2 (revokeCredential) and TS-7 (revokePrincipal) so the
+// two cannot drift: the row goes to `revoked` with revoked_at, its cadence
+// state is cleared (only the current `active` version is ever "due", §4.2 —
+// a revoked row must never be picked up by cmd/scheduler), and one
+// ServiceAccountCredentialRevoked is enqueued in the same transaction
+// (EVT-1). The caller holds the principal lock and has already deleted the
+// version's OpenBao material (material-first, CUST-2). Update is guarded by
+// the row's record_version (§9.1).
+func (s *CredentialService) markCredentialRevoked(ctx context.Context, tenantID, principalID uuid.UUID, cred *domain.Credential, actor uuid.UUID, now time.Time) error {
+	cred.Status = domain.CredentialStatusRevoked
+	cred.RevokedAt = &now
+	cred.RotationCadenceDays = nil
+	cred.NextRotationAt = nil
+	if err := s.credentials.Update(ctx, cred); err != nil {
+		return err
+	}
+	pub, ok := port.EventPublisherFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return pub.Enqueue(ctx, &domain.Event{
+		Type: domain.EventServiceAccountCredentialRevoked, TenantID: tenantID, Actor: actor,
+		Data: domain.ServiceAccountCredentialRevokedPayload{
+			TenantID: tenantID, PrincipalID: principalID, Version: cred.Version,
+			ActorID: actor, RevokedAt: now.Format(time.RFC3339),
+		},
+	})
 }
 
 // rotationInFlightLookupTimeout bounds enrichRotationInFlight's read: it

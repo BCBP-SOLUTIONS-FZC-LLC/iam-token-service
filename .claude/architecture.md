@@ -7,7 +7,7 @@ Deep-dive narrative + diagrams: root `ARCHITECTURE.md`.
 
 ```
 cmd/
-  server/      HTTP API (TS-1..TS-6 + EXT-6 JWKS route) + outbox runner;
+  server/      HTTP API (TS-1..TS-7 + EXT-6 JWKS route) + outbox runner;
                MIGRATE_ONLY=true = the Helm migrate hook Job's mode.
                exporters.go: rotation-overlap gauge, RLS-violation counter,
                keys_refresh_pending gauges; the JWKS known-tenant refresher

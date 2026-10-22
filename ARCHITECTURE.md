@@ -1523,7 +1523,7 @@ the role both present and absent.
   `openbao`.
 - **Istio.** `authorizationPolicy.enabled` renders an `AuthorizationPolicy`
   on the server: mesh namespaces (RP, O&M, operator gateway) reach every
-  route, Keycloak only `GET` on the JWKS route, Workflow only TS-6, and
+  route (TS-7 included), Keycloak only `GET` on the JWKS route, Workflow only TS-6, and
   anyone the probe/metrics paths. With `strictMTLS` (default) a `STRICT`
   `PeerAuthentication` rejects plaintext callers on every port but metrics.
   Server and consumer are then force-injected, as native sidecars by
