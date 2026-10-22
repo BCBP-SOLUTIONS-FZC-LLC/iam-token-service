@@ -201,7 +201,7 @@ The rule worth remembering: **`cmd/rotator` may not depend on `service`**. It dr
 
 ### Shared libraries
 
-`platform-pgcommon/v2` v2.0.2 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.1.0 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon/v2` v2.1.0 (middleware, logging, tracing, metrics registry, `/metrics`, RFC 9457 Problem Details), `openbao/openbao/api/v2` v2.7.1.
+`platform-pgcommon/v2` v2.0.2 (pool, RLS GUCs, per-transaction timeouts, `platform_db_*`), `platform-events/v2` v2.2.1 (envelope, outbox, inbox, SNS/SQS, queue-depth sampler), `platform-gincommon/v2` v2.1.0 (middleware, logging, tracing, metrics registry, `/metrics`, RFC 9457 Problem Details), `openbao/openbao/api/v2` v2.7.1.
 
 ---
 
