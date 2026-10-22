@@ -6,6 +6,10 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Security (TS-7 restricted to the Realm Provisioner at the mesh — LLD rev 1.6 — 2026-10-22)
+
+- The Istio `AuthorizationPolicy` no longer lets every `meshNamespaces` caller reach TS-7 (`POST …/service-accounts/platform-automation/revoke`): the namespace rule now excludes it (`notPaths`), and a new rule admits it only for `authorizationPolicy.revokeCallerPrincipals` (default `cluster.local/ns/iam/sa/iam-realm-provisioner`; required when the policy is enabled). Revocation is terminal, so it no longer rests on the forgeable `x-user-id` header alone. The Realm Provisioner's reconciler CronJob (the caller) must be mesh-injected.
+
 ### Added (TS-7 — revoke the tenant's automation principal, TS-D29 / LLD rev 1.5 — 2026-10-22)
 
 - **New route TS-7 `POST /api/v1/internal/tenants/:id/service-accounts/platform-automation/revoke`** (no body). Revokes every live credential version of the tenant's `platform-automation` principal (OpenBao material deleted, `revoked_at` set, rotation cadence cleared so `cmd/scheduler` never picks it up), erases any uncommitted material under the principal's client prefix, and sets the principal `status=revoked`. Before this the only way a principal left `active` was the `TenantMembershipsPurged` cascade, which never fires for a trial signup that never reached O&M — the Realm Provisioner's `orphaned-signup-reap` (RP#29/#30) is the caller.

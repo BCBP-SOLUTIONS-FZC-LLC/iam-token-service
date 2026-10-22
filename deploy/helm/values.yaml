@@ -314,7 +314,15 @@ networkPolicy:
 # (networkPolicy.istiodNamespaceSelector / istiodPort).
 authorizationPolicy:
   enabled: false
-  meshNamespaces: []      # RP / O&M / operator gateway — every route (required when enabled)
+  meshNamespaces: []      # RP / O&M / operator gateway — every route except TS-7 (required when enabled)
+  # TS-7 (POST …/service-accounts/platform-automation/revoke) callers, as Istio
+  # source principals (<trust-domain>/ns/<namespace>/sa/<serviceaccount>).
+  # Only the Realm Provisioner's ServiceAccount: its orphaned-signup-reap
+  # CronJob is the one caller, and it shares the server's ServiceAccount
+  # (iam-realm-provisioner chart: serviceAccountName = the release fullname).
+  # Required when enabled; an empty list would make TS-7 unreachable.
+  revokeCallerPrincipals:
+    - cluster.local/ns/iam/sa/iam-realm-provisioner
   keycloakNamespaces: []  # JWKS route only (required when enabled)
   workflowNamespaces:     # TS-6 only — Workflow services (Execution API, connector workers), TS-D17 / Workflow I5
     - workflow-app

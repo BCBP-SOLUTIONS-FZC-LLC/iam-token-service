@@ -4,8 +4,11 @@ path-level granularity, so the namespaces it admits only for one route —
 Keycloak (EXT-6 JWKS fetch) and Workflow (TS-6, TS-D17) — could otherwise
 call every route on the HTTP port, protected only by the reserved
 x-user-id header (LLD §5.2). With a mesh, this policy narrows each source to
-its one route; the mesh callers (RP, O&M, operator gateway) keep every route,
-TS-7 included (the Realm Provisioner's orphaned-signup-reap calls it).
+its one route; the mesh callers (RP, O&M, operator gateway) keep every route
+EXCEPT TS-7, which is admitted only for the Realm Provisioner's own
+ServiceAccount principal(s) (revokeCallerPrincipals — its orphaned-signup-reap
+job is the only caller). Revocation is terminal, so it is not left to the
+forgeable x-user-id header alone.
 The x-user-id header is not a boundary on its own (any caller can set it), so
 this policy is required outside local/dev/test whenever networkPolicy is on
 (templates/validate.yaml). source.namespaces matches only mTLS-authenticated
@@ -24,10 +27,26 @@ spec:
       {{- include "iam-token-service.componentSelectorLabels" (dict "component" "server" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
   action: ALLOW
   rules:
-    # In-mesh callers (Realm Provisioner, O&M, operator gateway): every route.
+    # In-mesh callers (Realm Provisioner, O&M, operator gateway): every route
+    # except TS-7. The suffix is unique to TS-7 (TS-2 ends
+    # …/credentials/:version/revoke).
     - from:
         - source:
             namespaces: {{ required "authorizationPolicy.meshNamespaces is required when authorizationPolicy.enabled" .Values.authorizationPolicy.meshNamespaces | toJson }}
+      to:
+        - operation:
+            notPaths: ["*/service-accounts/platform-automation/revoke"]
+    # TS-7 (revoke the tenant's automation principal, TS-D29): the Realm
+    # Provisioner's ServiceAccount only — its server and its reconciler
+    # CronJob share it. Principals match only mTLS-authenticated peers, so the
+    # reconciler pod must be in the mesh (RP chart cronjobs.istioInject).
+    - from:
+        - source:
+            principals: {{ required "authorizationPolicy.revokeCallerPrincipals is required when authorizationPolicy.enabled (TS-7 would be unreachable)" .Values.authorizationPolicy.revokeCallerPrincipals | toJson }}
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["*/service-accounts/platform-automation/revoke"]
     # Keycloak: the JWKS route only.
     {{- with .Values.authorizationPolicy.keycloakNamespaces }}
     - from:
