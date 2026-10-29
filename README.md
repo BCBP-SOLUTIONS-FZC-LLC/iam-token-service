@@ -250,7 +250,8 @@ Event contract: [`api/asyncapi.yaml`](api/asyncapi.yaml), LLD §7.
 | Called by | Realm Provisioner | TS-4 after it mints the client (RP-1/RP-2); TS-1 for provisioning; TS-7 from `orphaned-signup-reap` (a trial signup that never reached O&M). It discards the returned private key and calls RP-17 so Keycloak fetches the public key from this service's JWKS |
 | Called by | Operators, O&M tooling | TS-1 (on-demand / break-glass rotation, then RP-17 by hand), TS-2 (revoke), TS-3 (read) |
 | Called by | Org & Membership | TS-5 (find by sub, AUTH-9) |
-| Called by | Workflow Service | TS-6 (the tenant's automation subject, TS-D17) |
+| Called by | Workflow Service (Execution Service API + connector workers) | TS-6: `GET /service-accounts/platform-automation` — resolves `principal_id` (stable across re-mints), `principal_sub` (changes on RP-3/RP-4 re-mint) and `keycloak_client_id`. Must run in `workflow-app` namespace (the `authorizationPolicy.workflowNamespaces` rule). **Required headers on every call:** `x-user-id: 00000000-0000-0000-0000-0000000000a1` (synthetic iam-system UUID — never forward the gateway-injected user UUID) and `x-tenant-id: <tenant_id>` (dynamic, per-request, must equal the `:id` path segment). **Error responses use `errorCode` (not `code`)** — platform-gincommon v2 wire format. Subscribe to `ServiceAccountRegistered` on `iam-serviceaccount-events` via `serviceaccount-workflow-q` to invalidate cached `principal_sub` after an RP-3/RP-4 realm re-mint |
+| Called by | Tender Service (Automation-mode only) | TS-6: `GET /service-accounts/platform-automation` — resolves the per-tenant `platform-automation` `principal_id` (stored as `actor_principal_id` on evidence log entries) and `principal_sub` (stored as `actor_sub_at_time`, point-in-time snapshot only). Must run in `tender` namespace (the `authorizationPolicy.tenderNamespaces` rule). **Required headers:** `x-user-id: 00000000-0000-0000-0000-0000000000a1` (synthetic — never forward the gateway user UUID; doing so returns `401 MISSING_IDENTITY_HEADERS`) and `x-tenant-id: <tenant_id>` (dynamic per-request from the automation task's tenant context). **Error responses use `errorCode` (not `code`)**. Subscribe to `ServiceAccountRegistered` via `serviceaccount-tender-q` (EventType filter, `maxReceiveCount=5`, DLQ `serviceaccount-tender-q-dlq`) to invalidate the cached TS-6 result on RP-3/RP-4 re-mints. Tender must be admitted as an onboarding step per environment (TND-Q23, Tender HLD §14.1) |
 | Called by | Keycloak | The EXT-6 JWKS route |
 | Calls | Realm Provisioner | RP-17 from `cmd/rotator` (after automatic revokes) and `cmd/scheduler` (after cadence rotations). 2 attempts, retries 429/502/503/504, any 2xx is success, 3s per attempt |
 | Consumes | Org & Membership / Core | `TenantMembershipsPurged` |
@@ -264,6 +265,12 @@ Things to know as a caller:
 3. **TS-1 and TS-2 alone change nothing at Keycloak** (TS-INV-7). An operator-driven rotate or revoke must be followed by RP-17. The scheduler and rotator do this themselves.
 4. **Optimistic locking:** both tables carry `record_version`, bumped by the `touch_row()` trigger. A `409 optimistic_lock_conflict` includes the expected version in the RFC 9457 `detail` field. TS-2 and the sweep re-check after a conflict and report the idempotent outcome when two actors converged on the same result (TS-D13).
 5. **Rate limits:** TS-1..TS-7 apply none (in-mesh callers only). Only the JWKS route is rate-limited (above).
+6. **TS-6 (Workflow Service) — synthetic headers, not forwarded gateway headers.** Every TS-6 call must send:
+   - `x-user-id: 00000000-0000-0000-0000-0000000000a1` — the iam-system UUID, frozen in §5.2. **Do not forward the gateway-injected user UUID** (e.g. the ID of the human who triggered the workflow). Forwarding a real user UUID returns `401 MISSING_IDENTITY_HEADERS` unconditionally.
+   - `x-tenant-id: <tenant_id>` — set **dynamically per request** from the connector task's tenant context; must equal the `:id` path segment. A static env-var value causes `403 TENANT_PATH_MISMATCH` for every other tenant.
+   The Istio `AuthorizationPolicy` admits only the `workflow-app` namespace on this path; pods outside that namespace receive a mesh-layer `403` before the application is reached.
+7. **TS-6 (Workflow Service) — error field name is `errorCode`, not `code`.** RFC 9457 responses from this service use the platform-gincommon v2 wire format: the error identifier field is named **`errorCode`** (UPPER_SNAKE). Parsers that look for `code` will silently receive `null` and misclassify every upstream error as `INTERNAL_ERROR`. Key codes to handle: `PRINCIPAL_NOT_FOUND` (404) — no principal yet for the tenant; `DB_UNAVAILABLE` (503) — Postgres unreachable; `MISSING_IDENTITY_HEADERS` (401) — wrong or missing `x-user-id`; `TENANT_PATH_MISMATCH` (403) — `x-tenant-id` / path mismatch.
+8. **TS-6 (Workflow Service) — invalidate cached `principal_sub` on re-mints.** Subscribe to `ServiceAccountRegistered` on `iam-serviceaccount-events`. That event is emitted by TS-4 when a principal is re-registered after an RP-3/RP-4 Keycloak realm re-mint (trial-to-paid conversion), and carries the new `principal_sub`. Without active cache invalidation on this event, a stale `principal_sub` in the caller's cache causes connector authentication failures until the cache TTL expires. `principal_id` is stable across re-mints and safe to cache indefinitely.
 
 ---
 
@@ -331,6 +338,11 @@ curl -s -X POST localhost:8080/api/v1/internal/tenants/$TENANT_ID/service-accoun
 # TS-3 read, and the public JWKS
 curl -s localhost:8080/api/v1/internal/tenants/$TENANT_ID/service-accounts/$PRINCIPAL_ID "${H[@]}"
 curl -s localhost:8080/api/v1/internal/tenants/$TENANT_ID/service-accounts/platform-automation/jwks.json
+
+# TS-6 read automation principal (Workflow Service pattern)
+# H already sets x-user-id=iam-system UUID and x-tenant-id=TENANT_ID — both required, per-request
+curl -s localhost:8080/api/v1/internal/tenants/$TENANT_ID/service-accounts/platform-automation "${H[@]}"
+# Returns: {"principal_id":"<uuid>","principal_sub":"<keycloak-sub>","keycloak_client_id":"platform-automation[…]"}
 ```
 
 ### Testing events locally
@@ -548,7 +560,7 @@ SLOs (LLD §11): SLO-1 TS-1 p99 ≤ 500 ms; SLO-2 99.9% of TS-1/TS-2/TS-4 non-5x
 3. All 5 schema definitions are registered and `AVAILABLE` (`make schema-verify`); otherwise the server refuses to start. The release pipeline registers them before deploying.
 4. IRSA roles for server and consumer (`deploy/iam/`), wired through `serviceAccount.workloadAnnotations`.
 5. The OpenBao role (`deploy/openbao/role.tf.example`) binds the four workload ServiceAccounts with audience `openbao`; the policy is `deploy/openbao/policy.hcl`.
-6. Keycloak, the Realm Provisioner, O&M and Workflow are in the mesh; set the `authorizationPolicy` namespaces and the matching NetworkPolicy selectors.
+6. Keycloak, the Realm Provisioner, O&M, Workflow and Tender are in the mesh; set the `authorizationPolicy` namespaces (`meshNamespaces`, `keycloakNamespaces`, `workflowNamespaces`, `tenderNamespaces`) and the matching NetworkPolicy selectors (`ingressNamespaceSelector`, `keycloakNamespaceSelector`, `workflowNamespaceSelector`, `tenderNamespaceSelector`). Confirm Tender Service runs in the `tender` namespace; confirm Workflow Execution Service runs in `workflow-app`.
 7. NetworkPolicy egress CIDRs for Postgres (required) and, if off-cluster, OpenBao, OTel and DNS.
 8. If the Realm Provisioner enforces STRICT mTLS, set `cronjobs.istioInject: true`, or every RP-17 call fails and refreshes pile up in `keys_refresh_pending`.
 

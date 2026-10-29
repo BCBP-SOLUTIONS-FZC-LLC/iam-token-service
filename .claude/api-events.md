@@ -35,7 +35,7 @@ status codes, and the event contract, at LLD §5/§7 depth.
   includes a stored secret except TS-1's private key — fresh, or replayed
   within the replay window. TS-1 responses carry `Cache-Control:
   no-store` and `Pragma: no-cache`.
-- Error body: `{error, status, trace_id, request_id, details}`.
+- Error body (`application/problem+json`, RFC 9457): `{errorCode, status, detail, trace_id, request_id}`; `validationErrors` replaces `detail` on `INVALID_REQUEST`. The wire field is **`errorCode`** (UPPER_SNAKE, platform-gincommon v2) — **not** `code` or `error`. Callers that look for a `code` field will silently fall back to `INTERNAL_ERROR` classification.
 
 ## 5.2 Authorization rules
 
@@ -60,7 +60,7 @@ Paths are relative to `/api/v1/internal/tenants/:id`.
 | TS-2 | `POST /service-accounts/:principal_id/credentials/:version/revoke` | Revoke one version (custody half only, TS-INV-7) | `200` | Yes (re-revoke is a no-op `200`) |
 | TS-3 | `GET /service-accounts/:principal_id` | Principal metadata + every credential's version/status/path/`expires_at`/cadence — never a secret | `200` | Read |
 | TS-5 | `GET /service-accounts?principal_sub=<uuid>` | Find by Keycloak `sub` (AUTH-9, TS-D16) — identity/status only; used by org-membership's non-member defense-in-depth check | `200` / `404` | Read |
-| TS-6 | `GET /service-accounts/platform-automation` | Read the tenant's automation principal (TS-D17) — the reverse of TS-5, returns `principal_sub` and `keycloak_client_id`; used by the Workflow Service's connector workers. `principal_sub` changes on an RP-3/RP-4 re-mint, `principal_id` doesn't | `200` / `404` | Read |
+| TS-6 | `GET /service-accounts/platform-automation` | Read the tenant's automation principal (TS-D17). Returns `principal_id` (stable across re-mints), `principal_sub` (changes on RP-3/RP-4), and `keycloak_client_id`. Used by the Workflow Service's Execution API and connector workers. **Caller contract:** `x-user-id` must be the iam-system UUID (`00000000-0000-0000-0000-0000000000a1`) — never a forwarded gateway user UUID; `x-tenant-id` must match the `:id` path segment and be set dynamically per request. Caller must be in the `workflow-app` namespace (Istio `workflowNamespaces` policy). Subscribe to `ServiceAccountRegistered` to invalidate cached `principal_sub` on re-mints | `200` / `404` | Read |
 | TS-7 | `POST /service-accounts/platform-automation/revoke` | Revoke the tenant's automation principal (TS-D29, LLD rev 1.5): every live version revoked (OpenBao material deleted, cadence cleared), uncommitted material under the client prefix erased, principal `status=revoked`. No body. Under the principal lock (`409 ROTATION_IN_FLIGHT` past `PG_LOCK_TIMEOUT`), `record_version`-guarded. Caller: Realm Provisioner's `orphaned-signup-reap`. Response: `principal_id`, `tenant_id`, `keycloak_client_id`, `status`, `record_version`, `revoked_at`, `revoked_versions`, `keycloak_invalidation` | `200` / `404` | Yes (already revoked → `200`, same body) |
 | EXT-6 | `GET /service-accounts/platform-automation/jwks.json` | Public JWK Set for Keycloak's client-jwt authenticator. No identity headers; rate-limited | `200` | Read |
 | TS-H | `GET /healthz`, `GET /readyz` | Liveness / readiness (database, OpenBao, outbox, and JWKS known-tenant refresher — TS-RP-GAP-001; 2s per check; 503 while draining) | | Read |

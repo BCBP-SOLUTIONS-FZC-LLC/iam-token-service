@@ -81,6 +81,17 @@ spec:
       ports:
         - port: http
     {{- end }}
+    {{- with .Values.networkPolicy.tenderNamespaceSelector }}
+    # Tender Service reading TS-6 (TND-Q23, Tender HLD §8.5/§14.1;
+    # Automation-mode principal resolution). Like Workflow, this admits the
+    # whole HTTP port at L4 — the AuthorizationPolicy (tenderNamespaces)
+    # limits Tender to TS-6 GET only. Rendered only with the policy (fail closed).
+    - from:
+        - namespaceSelector:
+            {{- . | toYaml | nindent 12 }}
+      ports:
+        - port: http
+    {{- end }}
     {{- end }}
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
