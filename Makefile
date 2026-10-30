@@ -225,15 +225,17 @@ sast:
 # trivy: local mirror of ci.yml's "Trivy CVE scan" gate — build the amd64
 # image, then fail on CRITICAL/HIGH/UNKNOWN CVEs that have a fix (.trivyignore
 # applies automatically). The Dockerfile needs the go_private_token build
-# secret from the .go_private_token file (gitignored).
+# secret: GO_PRIVATE_TOKEN from the environment, else `gh auth token`.
 TRIVY_IMAGE ?= iam-token-service-trivy
+GO_PRIVATE_TOKEN ?= $(shell gh auth token 2>/dev/null)
+export GO_PRIVATE_TOKEN
 
 .PHONY: trivy
 trivy:
 	@command -v trivy >/dev/null || { echo "trivy not found (brew install trivy)"; exit 1; }
-	@test -f .go_private_token || { echo "ERROR: .go_private_token missing — write a GitHub PAT with read access to BCBP-SOLUTIONS-FZC-LLC private repos into this file (gitignored)"; exit 1; }
+	@test -n "$$GO_PRIVATE_TOKEN" || { echo "GO_PRIVATE_TOKEN is empty: export it or run 'gh auth login'"; exit 1; }
 	docker build --platform linux/amd64 \
-	  --secret id=go_private_token,src=.go_private_token \
+	  --secret id=go_private_token,env=GO_PRIVATE_TOKEN \
 	  -t $(TRIVY_IMAGE) .
 	trivy image --severity CRITICAL,HIGH,UNKNOWN --ignore-unfixed --exit-code 1 $(TRIVY_IMAGE)
 
