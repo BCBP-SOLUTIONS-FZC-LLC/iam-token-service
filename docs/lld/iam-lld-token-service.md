@@ -1898,14 +1898,26 @@ Workflow's connector workers name the tenant's `platform-automation` principal a
 
 | Direction | Interface | Purpose | Failure posture |
 |---|---|---|---|
-| Realm Provisioner → this | TS-4 (register), TS-1 (issue/rotate), TS-7 (revoke principal) | Provision + rotate the automation credential; RP refreshes Keycloak's key cache (RP-17, EXT-6) | RP retries; TS-1 idempotent per `rotation_id` |
+| Realm Provisioner → this | TS-4 (register), TS-1 (issue/rotate), TS-3 (read), TS-7 (revoke principal) | Provision + rotate the automation credential; RP refreshes Keycloak's key cache (RP-17, EXT-6); read metadata (RP-18); revoke on `orphaned-signup-reap` (TS-D29) | RP retries; TS-1 idempotent per `rotation_id`; TS-7 idempotent (`200`/`404`) |
 | this → OpenBao | KV v2 read/write/delete/list | Custody of key material | `502 secret_store_unavailable`; nothing committed; JWKS `503 jwks_keys_unavailable` |
 | this → Realm Provisioner | RP-17 (`cmd/rotator`, `cmd/scheduler`) | Make Keycloak re-fetch the JWKS after an automatic revoke/rotate | 2 attempts; durable `keys_refresh_pending` marker, retried every run; `failed` pages, backlog alert after 15 min (§8.8) |
 | Core (events) → this | `TenantMembershipsPurged` (`tenant-lifecycle-tokensvc-q`) | Offboarding cascade | at-least-once; exactly-once processing via the inbox over `processed_events` |
-| this → Audit Log (events) | `iam.serviceaccount.events` | Credential-lifecycle audit trail | outbox at-least-once; deterministic-`id` dedup |
-| O&M / operator → this | TS-3 | Read credential metadata | plain read; no side effect |
-| Workflow Service → this | TS-6 | Resolve the tenant's automation subject for connector callbacks (TS-D17) | plain read; `404` when not minted; cache and invalidate on `ServiceAccountRegistered` |
-| Keycloak → this | JWKS route | Fetch the public keys for `client-jwt` validation | rate-limited per tenant/global/unknown bucket; on `503` Keycloak keeps its cached keys |
+| this → Audit Log (events) | `iam.serviceaccount.events` (all 5 event types) | Credential-lifecycle audit trail | outbox at-least-once; deterministic-`id` dedup |
+| O&M / operator → this | TS-1, TS-2, TS-3 | On-demand rotation, revoke, read credential metadata | plain read/write; operator must follow TS-1/TS-2 with RP-17 by hand |
+| Org & Membership → this | TS-5 | Find principal by `sub` for AUTH-9 non-member guard | plain read; `404` when absent |
+| Workflow Service → this | TS-6 | Resolve the tenant's automation subject for connector callbacks (TS-D17) | plain read; `404` when not minted; cache `principal_id`, invalidate `principal_sub` on `ServiceAccountRegistered` |
+| Tender Service → this | TS-6 | Resolve `principal_id` / `principal_sub` for automation-mode evidence log entries | plain read; `404` when not minted; subscribe to `ServiceAccountRegistered` via `serviceaccount-tender-q` for cache invalidation on RP-3/RP-4 re-mints |
+| Keycloak → this | JWKS route (EXT-6, unauthenticated) | Fetch the public keys for `client-jwt` / `client_assertion` validation | rate-limited per tenant/global/unknown bucket; on `503` Keycloak keeps its cached keys until RP-17 clears them |
+
+### 18.7 Infrastructure dependencies
+
+| System | Role |
+|---|---|
+| **PostgreSQL** (`serviceaccount` DB, shared RDS Multi-AZ) | Primary store — 2 tenant-scoped tables (`FORCE ROW LEVEL SECURITY`), 4 RLS-exempt operational tables (`outbox_events`, `processed_events`, `rls_violation_log`, `keys_refresh_pending`), PgBouncer transaction pooling |
+| **OpenBao** (KV v2) | Sole custody of RSA private key material — per-tenant/per-version paths (`iam/serviceaccount/<tenant>/<client>/v<n>`); material never persisted in Postgres |
+| **AWS SNS** | One topic: `iam.serviceaccount.events` (5 event types via transactional outbox relay) |
+| **AWS SQS** | `tenant-lifecycle-tokensvc-q` (offboarding consumer, concurrency 2, visibility 60s) with `tenant-lifecycle-tokensvc-q-dlq` (`maxReceiveCount=5`) |
+| **AWS Glue Schema Registry** | `iam-serviceaccount-events` — 5 schema definitions; version UUIDs resolved once at startup (publish); consumer decodes via `GlueDecoder`, validates against embedded consumed schemas |
 
 ---
 

@@ -6,6 +6,24 @@ This service has never been deployed to any environment — there is no released
 
 ## [Unreleased]
 
+### Changed (developer tooling + Claude Code automation — 2026-10-30)
+
+- **`make trivy`** — new Makefile target that builds the `linux/amd64` image and runs `trivy image --severity CRITICAL,HIGH,UNKNOWN --ignore-unfixed`, mirroring the CI Trivy gate locally. Uses `.go_private_token` (same secret the `docker-run-*` targets use). `TRIVY_IMAGE ?= iam-token-service-trivy`.
+- **`.githooks/pre-push`** — new local push gate: runs `make trivy` before every `git push`. Requires Docker to be running. Skip with `SKIP_TRIVY=1 git push` or `git push --no-verify`.
+- **`make install-hooks`** updated to install both `pre-commit` and `pre-push` (was pre-commit only). **`make setup`** updated the same way so a fresh clone gets both hooks with one command.
+- **`.github/dependabot.yml`** renamed to `.github/dependabot.yml.disabled` (same pattern as `iam-org-membership`). Also fixed the registry `url` field from `https://github.com/BCBP-SOLUTIONS-FZC-LLC` → `https://github.com` (the correct value for `type: git`; the org-scoped URL breaks Dependabot's module-graph resolution).
+- **Claude Code automation** — the `.claude/` directory now has a full automation layer:
+  - **`.claude/hooks/guard-invariants.sh`** (PreToolUse): blocks 8 categories of CI-rejectable edits at write time — protected files (`.env`, `go.sum`), immutable migrations (MIG-1), RLS-6, pgcommon bypass, platform-events bypass, TS-INV-1 (gocloak), gincommon-obs, and arch-lint (`internal/core/*` + `cmd/rotator→service`). Patterns match the corresponding `.github/scripts/check-*.sh` gate scripts exactly.
+  - **`.claude/hooks/gofmt.sh`** (PostToolUse): auto-formats edited `.go` files so `make fmt-check` never fails on Claude's edits.
+  - **`.claude/agents/invariants-reviewer.md`**: read-only agent reviewing diffs against all 10+ service invariants before CI catches them.
+  - **`.claude/agents/security-reviewer.md`**: read-only agent for credential-lifecycle security review (key material safety, lock ordering, cascade atomicity, RLS isolation).
+  - **`.claude/skills/new-migration/SKILL.md`**: `/new-migration` skill that scaffolds correctly structured `deploy/iam/migrations/000NNN_*.{up,down}.sql` pairs (RLS, grants, `REVOKE FROM PUBLIC`, `app_tenant_id()` policy).
+  - **`.claude/settings.json`**: wires both hooks.
+  - **MCP servers**: `github` (`gh mcp serve`) and `context7` (`npx @upstash/context7-mcp`) registered for this project.
+- **README `## Cross-service dependencies`**: restructured from the flat `## Integrating with other services` table into Org Membership's 4-part format (1 — synchronous outbound, 2 — inbound callers, 3 — async event dependencies, 4 — infrastructure dependencies). Infrastructure dependencies table was previously absent.
+- **LLD §18.6**: added Tender Service and O&M/operator rows; expanded Realm Provisioner row to cover TS-3 and TS-7. **LLD §18.7** (new): infrastructure dependencies table (PostgreSQL, OpenBao, SNS, SQS, Glue).
+- Docs: `CLAUDE.md` make-commands table updated (`make setup`, new `make trivy` and `make install-hooks` entries). README repo-tree and CI section updated for `dependabot.yml.disabled`.
+
 ### Security (TS-7 restricted to the Realm Provisioner at the mesh — LLD rev 1.6 — 2026-10-22)
 
 - The Istio `AuthorizationPolicy` no longer lets every `meshNamespaces` caller reach TS-7 (`POST …/service-accounts/platform-automation/revoke`): the namespace rule now excludes it (`notPaths`), and a new rule admits it only for `authorizationPolicy.revokeCallerPrincipals` (default `cluster.local/ns/iam/sa/iam-realm-provisioner`; required when the policy is enabled). Revocation is terminal, so it no longer rests on the forgeable `x-user-id` header alone. The Realm Provisioner's reconciler CronJob (the caller) must be mesh-injected.

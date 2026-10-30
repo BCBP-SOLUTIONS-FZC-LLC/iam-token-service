@@ -40,7 +40,7 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 
 | Command | Purpose |
 |---|---|
-| `make setup` | Copy `.env-example` → `.env`, install git hooks |
+| `make setup` | Copy `.env-example` → `.env`, install git hooks (`pre-commit` + `pre-push`) |
 | `make docker-up` / `make docker-down` | Start/stop local infra (Postgres, PgBouncer, OpenBao, Floci SNS/SQS/Glue + UI) |
 | `make run` / `make run-consumer` / `make run-scheduler` | Run `cmd/server` / `cmd/consumer` / `cmd/scheduler` natively against that infra |
 | `make docker-run-rotator` / `make docker-run-scheduler` | One CronJob-style run in Docker Compose |
@@ -53,6 +53,8 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 | `make gates` | Ten invariant gates: `no-gocloak` (TS-INV-1), `no-secret-log` (TS-INV-2), `set-local-only` (RLS-6), `gincommon-obs` (negative: rejects slog/stdlib-log/direct-zap/DefaultRegisterer/hand-rolled TracerProvider), `gincommon-wired` (positive: all 8 required gincommon init functions present in every binary), `pgcommon-obs` (negative: rejects raw pgxpool/pgx.Connect/database/sql), `pgcommon-wired` (positive: ConfigFromEnv/NewPool/GUCSetFromContext/NewLoggerAdapter in every binary), `platform-events-obs` (negative: rejects sqs.ReceiveMessage/sns.Publish), `platform-events-wired` (positive: server wires SNS+outbox; consumer wires SQS+inbox), `metrics-taxonomy` (Tier-1/2/3 prefixes, `_total`/`_seconds` suffixes) |
 | `make metrics-lint` / `make metrics-inventory` | `metricslint` on a real scrape + `metric-registry.md` drift check / regenerate it |
 | `make sast` / `make vuln-check` | `gosec` / `govulncheck ./...` |
+| `make trivy` | Build the `linux/amd64` image and scan for `CRITICAL`/`HIGH`/`UNKNOWN` CVEs (mirrors CI; needs Docker + `.go_private_token`) |
+| `make install-hooks` | Install `.githooks/pre-commit` + `pre-push` into `.git/hooks/` |
 | `make swag` / `make swag-check` | Regenerate / staleness-check `docs/swagger/` |
 | `make schema-validate` / `schema-register` / `schema-verify` / `schema-prune` | Glue schema governance (schema-gov) |
 | `make ci` | `tidy fmt-check vet lint arch-lint gates metrics-lint test-ci build` — local CI rehearsal |
