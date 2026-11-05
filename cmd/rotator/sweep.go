@@ -174,7 +174,13 @@ func revokeExpiredRotating(ctx context.Context, credentials port.CredentialRepos
 		if cred == nil || cred.Status != domain.CredentialStatusRotating {
 			return errAlreadyHandled
 		}
-		if err := secrets.Delete(ctx, cred.OpenBaoPath); err != nil {
+		// Bounded like TS-2's in-lock delete (inLockSecretTimeout, defined in
+		// orphan_reconciler.go, same package): the credential row is locked
+		// across this call, and every TS-1/TS-2 for the principal is waiting
+		// on the same lock (M-1).
+		dctx, dcancel := context.WithTimeout(ctx, inLockSecretTimeout)
+		defer dcancel()
+		if err := secrets.Delete(dctx, cred.OpenBaoPath); err != nil {
 			return err
 		}
 

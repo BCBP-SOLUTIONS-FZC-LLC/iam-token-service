@@ -242,6 +242,16 @@ networkPolicy:
   workflowNamespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: workflow-app
+  # TS-D17 / TND-Q23 — Tender Service calls TS-6 (GET .../service-accounts/
+  # platform-automation) to resolve the per-tenant automation principal for
+  # Automation-mode attribution (Tender HLD §8.5, §14.1). Like workflowNamespaceSelector
+  # this admits the whole HTTP port at L4; the Istio AuthorizationPolicy
+  # (authorizationPolicy.tenderNamespaces) limits Tender to TS-6 only.
+  # Rendered only when authorizationPolicy.enabled (fail closed without it).
+  # Default: tender, the platform namespace for the Tender Service.
+  tenderNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: tender
   # postgresPort: the port DATABASE_URL connects to (PgBouncer's, when
   # database.pgBouncerMode). postgresDirectPort: the port the direct, non-
   # PgBouncer DSNs connect to — RECONCILER_DATABASE_URL (the server's DB-state
@@ -289,12 +299,13 @@ networkPolicy:
   additionalEgressRules: []
 
 # authorizationPolicy: Istio L7 policy for the server.
-# NetworkPolicy admits Keycloak (and Workflow) at L4 to the WHOLE HTTP port,
-# and the only identity check on TS-1..TS-7 is the reserved x-user-id header
-# (LLD §5.2), which any caller can set — so without this policy a pod in the
-# Keycloak/Workflow namespace can call TS-1/TS-2/TS-4/TS-7 as the system
-# principal. This policy limits Keycloak to GET …/jwks.json and Workflow to
-# GET …/platform-automation (TS-6); only meshNamespaces get every route
+# NetworkPolicy admits Keycloak, Workflow and Tender at L4 to the WHOLE HTTP
+# port, and the only identity check on TS-1..TS-7 is the reserved x-user-id
+# header (LLD §5.2), which any caller can set — so without this policy a pod in
+# the Keycloak/Workflow/Tender namespace can call TS-1/TS-2/TS-4/TS-7 as the
+# system principal. This policy limits Keycloak to GET …/jwks.json, Workflow to
+# GET …/platform-automation (TS-6), and Tender to GET …/platform-automation
+# (TS-6, TND-Q23); only meshNamespaces get every route
 # (including TS-7, POST …/platform-automation/revoke, which the Realm
 # Provisioner calls — the Workflow rule's exact GET path never matches it).
 # REQUIRED (the render fails otherwise) when networkPolicy.enabled and appEnv
@@ -326,6 +337,14 @@ authorizationPolicy:
   keycloakNamespaces: []  # JWKS route only (required when enabled)
   workflowNamespaces:     # TS-6 only — Workflow services (Execution API, connector workers), TS-D17 / Workflow I5
     - workflow-app
+  # TS-6 only — Tender Service Automation-mode principal resolution (TND-Q23,
+  # Tender HLD §8.5/§14.1). Same path restriction as workflowNamespaces above
+  # (GET …/service-accounts/platform-automation, suffix match); TS-7 POST stays
+  # unreachable. Set to [] to disable (fail closed — Tender cannot call TS-6
+  # without this rule when the AuthorizationPolicy is enabled). Default: tender,
+  # the platform namespace for the Tender Service.
+  tenderNamespaces:
+    - tender
   # strictMTLS: a STRICT PeerAuthentication on the server (enabled: true
   # only). Under the mesh-wide default (PERMISSIVE) the sidecar still accepts
   # plaintext; a plaintext request has no source namespace, so this ALLOW
@@ -631,3 +650,20 @@ rotationEpoch: "0"
 #     render (migrations.enabled: false) adopts it instead of failing on
 #     "already exists".
 secretValues: {}
+
+# externalSecret: optional ExternalSecret CRD template (M-20). Requires the
+# External Secrets Operator (ESO) CRD (external-secrets.io/v1beta1) to be
+# installed in the cluster. When enabled, the chart renders an ExternalSecret
+# that ESO will use to pull DATABASE_URL / MIGRATION_DATABASE_URL /
+# RECONCILER_DATABASE_URL from an external secret store (AWS Secrets Manager,
+# HashiCorp Vault, etc.) into a Kubernetes Secret named targetSecretName.
+# Set database.existingSecretName to that same targetSecretName so the
+# workloads mount it. secretValues must remain empty when this is enabled
+# (the H-3 guard above rejects both together outside local/dev/test anyway).
+externalSecret:
+  enabled: false
+  secretStoreName: ""             # required when enabled — name of the SecretStore / ClusterSecretStore resource
+  secretStoreKind: ClusterSecretStore  # ClusterSecretStore (cluster-scoped) or SecretStore (namespace-scoped)
+  secretPath: ""                  # path/key in the external store, e.g. "iam/token-service/db-credentials"
+  targetSecretName: ""            # defaults to <fullname>-db-credentials when empty
+  refreshInterval: "1h"           # how often ESO re-reads from the external store

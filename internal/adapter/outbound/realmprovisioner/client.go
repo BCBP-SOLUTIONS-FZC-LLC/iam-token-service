@@ -99,10 +99,12 @@ func (c *Client) RefreshKeys(ctx context.Context, tenantID uuid.UUID) error {
 		if !retryable || attempt == len(retryBackoff) {
 			break
 		}
+		t := time.NewTimer(retryBackoff[attempt])
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return ctx.Err()
-		case <-time.After(retryBackoff[attempt]):
+		case <-t.C:
 		}
 	}
 	return lastErr

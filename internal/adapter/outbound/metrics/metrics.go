@@ -194,6 +194,12 @@ var (
 	// is an offboarding cascade that did not run. Use IncConsumerDLQReject.
 	ConsumerDLQRejectsTotal *prometheus.CounterVec
 
+	// InlineSweepErrorsTotal counts failures of the opportunistic post-TS-1
+	// expired-overlap sweep (sweepExpiredRotating). A nonzero rate means
+	// expired rotating credentials may linger until cmd/rotator's next run,
+	// but the TS-1 rotation itself succeeded. Use IncInlineSweepError.
+	InlineSweepErrorsTotal prometheus.Counter
+
 	// ProcessedEventsDuplicates counts SQS redeliveries the platform-events
 	// inbox found already claimed in processed_events, matching
 	// iam-org-membership. Authoritative until the Tier 1
@@ -464,6 +470,12 @@ func registerMetrics() {
 		ConstLabels: t3,
 	}, []string{"reason"})
 
+	InlineSweepErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        tier3Prefix + "rotation_inline_sweep_errors_total",
+		Help:        "Opportunistic post-TS-1 sweep failures that did not prevent the rotation from completing. A nonzero rate means expired rotating credentials may linger until cmd/rotator's next run.",
+		ConstLabels: t3,
+	})
+
 	gincommon.MetricsRegisterer().MustRegister(
 		CredentialsIssuedTotal,
 		RotationOverlapActive,
@@ -471,11 +483,7 @@ func registerMetrics() {
 		OffboardingCascadeTotal,
 		RotationSweepTotal,
 		MaterialReconcileTotal,
-		// CadenceRotationTotal was defined but never registered until this
-		// production-readiness review (TS-D15) — iam_token_service_
-		// cadence_rotation_total never actually reached /metrics, so the
-		// IAMTokenServiceCadenceRotationFailures alert added alongside it
-		// could never have fired.
+		// CadenceRotationTotal — was unregistered before TS-D15; now registered.
 		CadenceRotationTotal,
 		JWKSKeyErrorsTotal,
 		JWKSKnownTenantsRefreshTotal,
@@ -490,6 +498,7 @@ func registerMetrics() {
 		UnknownEventAcknowledged,
 		ConsumedSchemaViolationsTotal,
 		RLSViolations,
+		InlineSweepErrorsTotal,
 	)
 
 	// Pre-initialize labels so dashboards show 0 rather than "no data".
@@ -663,6 +672,15 @@ func AddRLSViolations(violationType string, n float64) {
 		violationType = "other"
 	}
 	RLSViolations.WithLabelValues(violationType).Add(n)
+}
+
+// IncInlineSweepError increments rotation_inline_sweep_errors_total.
+// Nil-safe.
+func IncInlineSweepError() {
+	if InlineSweepErrorsTotal == nil {
+		return
+	}
+	InlineSweepErrorsTotal.Inc()
 }
 
 // registryEntry returns name's Platform Observability Registry entry; a

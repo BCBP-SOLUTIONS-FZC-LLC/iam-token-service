@@ -1,11 +1,11 @@
 {{/*
 Optional L7 restriction (Istio AuthorizationPolicy). NetworkPolicy has no
 path-level granularity, so the namespaces it admits only for one route —
-Keycloak (EXT-6 JWKS fetch) and Workflow (TS-6, TS-D17) — could otherwise
-call every route on the HTTP port, protected only by the reserved
-x-user-id header (LLD §5.2). With a mesh, this policy narrows each source to
-its one route; the mesh callers (RP, O&M, operator gateway) keep every route
-EXCEPT TS-7, which is admitted only for the Realm Provisioner's own
+Keycloak (EXT-6 JWKS fetch), Workflow (TS-6, TS-D17), and Tender (TS-6,
+TND-Q23) — could otherwise call every route on the HTTP port, protected only
+by the reserved x-user-id header (LLD §5.2). With a mesh, this policy narrows
+each source to its one route; the mesh callers (RP, O&M, operator gateway) keep
+every route EXCEPT TS-7, which is admitted only for the Realm Provisioner's own
 ServiceAccount principal(s) (revokeCallerPrincipals — its orphaned-signup-reap
 job is the only caller). Revocation is terminal, so it is not left to the
 forgeable x-user-id header alone.
@@ -63,6 +63,18 @@ spec:
     # path is a suffix match and the method is GET, so TS-7 (POST
     # …/platform-automation/revoke) and every other route stay out of reach.
     {{- with .Values.authorizationPolicy.workflowNamespaces }}
+    - from:
+        - source:
+            namespaces: {{ . | toJson }}
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["*/service-accounts/platform-automation"]
+    {{- end }}
+    # Tender Service: TS-6 only (Automation-mode principal resolution, TND-Q23,
+    # Tender HLD §8.5/§14.1). Same GET-only suffix match as Workflow above —
+    # TS-7 POST …/platform-automation/revoke stays out of reach.
+    {{- with .Values.authorizationPolicy.tenderNamespaces }}
     - from:
         - source:
             namespaces: {{ . | toJson }}

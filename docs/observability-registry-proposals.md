@@ -138,6 +138,8 @@ cascade metric until this proposal is added to the registry. Note for the
 reviewer: the registry's `outcome` vocabulary is `success | failure |
 error`, so `ok` below should become `success` on ratification.
 
+**Tracking:** Waiting on Platform Observability Registry ratification (requires precedent from iam-org-membership ratification). Open ticket: IAM-OBSERVABILITY-001. Until ratified, Tier-3 `iam_token_service_offboarding_cascade_total` is emitted and all production alerts use it.
+
 ### Semantic definition
 
 Outcome of one IAM service's own reaction to a tenant-offboarding signal

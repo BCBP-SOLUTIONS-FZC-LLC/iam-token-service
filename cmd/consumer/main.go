@@ -110,6 +110,10 @@ func main() {
 		log.Warn("postgres config warning", map[string]interface{}{"key": w.Key, "reason": w.Reason})
 	}
 	dsn := pgadapter.DSNFromEnv()
+	if dsn == "" {
+		log.Error("startup aborted: DATABASE_URL (or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME) is not set", nil)
+		os.Exit(1)
+	}
 	migrationDSN := pgadapter.MigrationDSNFromEnv()
 
 	pgCfg.DSN = dsn
@@ -164,6 +168,13 @@ func main() {
 		principalRepo, credentialRepo, instrumentedSecrets, inboxRepo, log,
 	)
 
+	// lastConsumedAt records the Unix nanosecond timestamp of the most recent
+	// SQS poll delivery. Zero means no message has been received yet (freshly
+	// started pod). Used by /readyz to detect a silently-stalled consumer
+	// (L-6): a pod that is Ready but consuming nothing is worse than a pod
+	// that is Not Ready, because it hides the stall from alerting.
+	var lastConsumedAt atomic.Int64
+
 	// handleWithMetrics wraps offboardingConsumer.Handle to record
 	// iam_token_service_offboarding_cascade_total{result} (§8.4, §11.2)
 	// around every delivery, success or failure. (The proposed Tier-2
@@ -171,8 +182,13 @@ func main() {
 	// the Platform Observability Registry.)
 	// validated runs the consumed-schema check (inbound_schema.go) before
 	// the cascade; a violation is counted as a failed cascade too.
+	//
+	// OffboardingCascadeTotal{result="error"} is a superset of ConsumedSchemaViolationsTotal:
+	// schema violations are counted in both. Do NOT sum these two counters to get
+	// "total events that did not complete" — use OffboardingCascadeTotal alone.
 	validated := validateConsumed(offboardingConsumer.Handle, enqueueCodec, log)
 	handleWithMetrics := func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+		lastConsumedAt.Store(time.Now().UnixNano())
 		err := validated(ctx, env)
 		result := "ok"
 		if err != nil {
@@ -220,13 +236,19 @@ func main() {
 	health := gin.New()
 	health.Use(gincommon.ObservabilityMiddlewares(cfg)...)
 	health.GET("/healthz", gincommon.HealthHandler())
+	// SQS visibility timeout: 2× is the stale-consumer threshold in /readyz.
+	// Parsed once here so a bad env value fails at startup before the
+	// readyz handler is ever called.
+	sqsVisibilityTimeout := envDuration("SQS_VISIBILITY_TIMEOUT", 60*time.Second)
 	health.GET("/readyz", readyzHandler(&draining,
 		func(ctx context.Context) bool { return pool.Health(ctx).Healthy },
-		openbaoClient.Health))
+		openbaoClient.Health, &lastConsumedAt, sqsVisibilityTimeout))
 	healthServer := &http.Server{
 		Addr:              ":" + envOr("APP_PORT", "8080"),
 		Handler:           health,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
 	}
 
 	metricsMux := http.NewServeMux()
@@ -235,6 +257,8 @@ func main() {
 		Addr:              ":" + envOr("METRICS_PORT", "9090"),
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
 	}
 
 	quit := make(chan os.Signal, 1)
@@ -256,19 +280,21 @@ func main() {
 
 	exitCode := awaitStop(quit, consumerDone, &draining, envDuration("SHUTDOWN_DRAIN_DELAY", 5*time.Second), time.Sleep, log)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer httpCancel()
+	if err := healthServer.Shutdown(httpCtx); err != nil {
 		log.Error("health server shutdown error", map[string]interface{}{"error": err.Error()})
 	}
-	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+	if err := metricsServer.Shutdown(httpCtx); err != nil {
 		log.Error("metrics server shutdown error", map[string]interface{}{"error": err.Error()})
 	}
 	if err := sqsConsumer.Stop(); err != nil {
 		log.Error("offboarding consumer stop error", map[string]interface{}{"error": err.Error()})
 	}
 	cancelBackground()
-	if err := pool.DrainAndClose(shutdownCtx); err != nil {
+	poolCtx, poolCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer poolCancel()
+	if err := pool.DrainAndClose(poolCtx); err != nil {
 		log.Error("app pool drain error", map[string]interface{}{"error": err.Error()})
 	}
 	shutdownTracing()
@@ -314,12 +340,28 @@ const readinessCheckTimeout = 2 * time.Second
 
 // readyzHandler is the consumer's /readyz: 503 "draining" as soon as
 // draining is set (SIGTERM or a dead receive loop) without touching the
-// dependencies, otherwise ready only when Postgres and OpenBao both answer.
-func readyzHandler(draining *atomic.Bool, dbHealthy func(context.Context) bool, baoHealth func(context.Context) error) gin.HandlerFunc {
+// dependencies, otherwise ready only when Postgres, OpenBao, and the SQS
+// consumer liveness check all pass.
+//
+// The stale-consumer check (L-6): if lastConsumedAt is non-zero and the
+// consumer has been silent for more than 2× sqsVisibilityTimeout, the pod
+// is considered stalled and /readyz returns 503. Zero means the pod has
+// not consumed any message yet (freshly started) — no failure on startup.
+func readyzHandler(draining *atomic.Bool, dbHealthy func(context.Context) bool, baoHealth func(context.Context) error, lastConsumedAt *atomic.Int64, sqsVisibilityTimeout time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if draining.Load() {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "draining"})
 			return
+		}
+		// Stale-consumer liveness check: a silently-stalled SQS receive loop
+		// leaves the pod Ready while consuming nothing. Only check when at least
+		// one message has been received (last != 0) so a freshly-started pod
+		// does not fail readyz on startup.
+		if last := lastConsumedAt.Load(); last != 0 {
+			if time.Since(time.Unix(0, last)) > 2*sqsVisibilityTimeout {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "consumer_stalled"})
+				return
+			}
 		}
 		checkCtx, cancel := context.WithTimeout(c.Request.Context(), readinessCheckTimeout)
 		defer cancel()

@@ -82,15 +82,29 @@ func (s *CredentialService) revokePrincipal(ctx context.Context, tenantID, actor
 	var (
 		revoked      *domain.ServiceAccountPrincipal
 		newlyRevoked int
+		// txCreds holds the credential rows read inside the transaction so the
+		// result builder never re-reads them outside it (M-19). It is set by
+		// the closure below, populated from the ListByPrincipal already
+		// performed there, and consumed by buildRevokedResult after the
+		// transaction commits.
+		txCreds []*domain.Credential
 	)
 	err = s.tx.RunInTx(ctx, func(ctx context.Context) error {
 		revoked, newlyRevoked = nil, 0
+		txCreds = nil
 		locked, err := s.principals.LockForUpdate(ctx, tenantID, p.ID)
 		if err != nil {
 			return err
 		}
 		if locked.IsRevoked() {
 			// A concurrent TS-7 won while this one waited for the lock.
+			// Read credentials here, inside the tx, so the race path also
+			// avoids a second ListByPrincipal outside the transaction (M-19).
+			creds, err := s.credentials.ListByPrincipal(ctx, tenantID, locked.ID)
+			if err != nil {
+				return err
+			}
+			txCreds = creds
 			revoked = locked
 			return nil
 		}
@@ -99,6 +113,7 @@ func (s *CredentialService) revokePrincipal(ctx context.Context, tenantID, actor
 		if err != nil {
 			return err
 		}
+		txCreds = creds
 		paths := make([]string, 0, len(creds))
 		for _, c := range creds {
 			paths = append(paths, c.OpenBaoPath)
@@ -145,16 +160,31 @@ func (s *CredentialService) revokePrincipal(ctx context.Context, tenantID, actor
 		}
 		return nil, s.enrichRotationInFlight(ctx, err, tenantID, p.ID)
 	}
-	return s.revokedPrincipalResult(ctx, revoked, newlyRevoked)
+	if s.log != nil {
+		s.log.Info("principal: revoked", map[string]any{
+			"tenant_id": tenantID.String(), "principal_id": revoked.ID.String(),
+			"newly_revoked": newlyRevoked,
+		})
+	}
+	return buildRevokedResult(revoked, txCreds, newlyRevoked), nil
 }
 
-// revokedPrincipalResult builds TS-7's response from a revoked principal and
-// its credential rows.
+// revokedPrincipalResult builds TS-7's response from a revoked principal,
+// re-reading its credential rows from the database. Used only for the
+// pre-lock idempotent path (principal already `revoked` before we took the
+// lock), where we have no in-transaction creds list to reuse.
 func (s *CredentialService) revokedPrincipalResult(ctx context.Context, p *domain.ServiceAccountPrincipal, newlyRevoked int) (*RevokePrincipalResult, error) {
 	creds, err := s.credentials.ListByPrincipal(ctx, p.TenantID, p.ID)
 	if err != nil {
 		return nil, err
 	}
+	return buildRevokedResult(p, creds, newlyRevoked), nil
+}
+
+// buildRevokedResult assembles the RevokePrincipalResult from a principal and
+// its already-fetched credential list (M-19: callers supply the list they read
+// inside the transaction instead of letting this function re-read it outside).
+func buildRevokedResult(p *domain.ServiceAccountPrincipal, creds []*domain.Credential, newlyRevoked int) *RevokePrincipalResult {
 	versions := make([]int, 0, len(creds))
 	for _, c := range creds {
 		versions = append(versions, c.Version)
@@ -164,5 +194,5 @@ func (s *CredentialService) revokedPrincipalResult(ctx context.Context, p *domai
 		PrincipalID: p.ID, TenantID: p.TenantID, KeycloakClientID: p.KeycloakClientID,
 		Status: p.Status, RecordVersion: p.RecordVersion, RevokedAt: p.UpdatedAt,
 		Versions: versions, NewlyRevoked: newlyRevoked,
-	}, nil
+	}
 }

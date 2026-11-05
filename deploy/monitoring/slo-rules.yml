@@ -1,5 +1,11 @@
 # SLO recording + burn-rate alerts for iam-token-service.
 #
+# Burn-rate windows: this service uses a 2-window pattern (5m + 1h) rather than the
+# SRE book's 4-window approach (5m+1h, 30m+6h, 2h+24h, 6h+72h). Rationale: low write
+# volume (a few principals per tenant, writes only at provisioning/rotation) means
+# a slower burn is recoverable without a 6h/72h slow-burn ticket. Revisit if
+# write volume increases materially.
+#
 # Targets come from the signed-off LLD (docs/lld/iam-lld-token-service.md
 # §11, "SLOs"): internal API availability 99.9% monthly (HLD §3.4); TS-1
 # issue/rotate p99 ≤ 500 ms excluding the OpenBao round-trip; TS-3 read
@@ -121,6 +127,34 @@ groups:
             method=~"POST|PUT|PATCH|DELETE"
           }[5m])), 0.001)
 
+      - record: iam_token_service:write_error_rate:ratio_rate_1h
+        expr: |
+          sum by (domain, service, environment) (rate(platform_http_requests_total{
+            job="iam-token-service-server",
+            method=~"POST|PUT|PATCH|DELETE",
+            status_class="5xx"
+          }[1h]))
+          /
+          clamp_min(sum by (domain, service, environment) (rate(platform_http_requests_total{
+            job="iam-token-service-server",
+            method=~"POST|PUT|PATCH|DELETE"
+          }[1h])), 0.001)
+
+      # JWKS availability error rate (SLO-5, EXT-6 hot path).
+      # Tracks 5xx responses on the JWKS route — a Keycloak token verification
+      # hot path; 99.9% availability target matching SLO-1/SLO-2.
+      - record: iam_token_service:jwks_error_rate:ratio_rate_5m
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="iam-token-service",route=~".*/jwks.json",code=~"5.."}[5m]))
+            /
+          sum(rate(http_server_requests_seconds_count{service="iam-token-service",route=~".*/jwks.json"}[5m]))
+
+      - record: iam_token_service:jwks_error_rate:ratio_rate_1h
+        expr: |
+          sum(rate(http_server_requests_seconds_count{service="iam-token-service",route=~".*/jwks.json",code=~"5.."}[1h]))
+            /
+          sum(rate(http_server_requests_seconds_count{service="iam-token-service",route=~".*/jwks.json"}[1h]))
+
       # Rotation sweep success ratio (§8.3) — result label matches
       # IAMTokenServiceRotationSweepFailures' iam_token_service_rotation_sweep_total.
       # Counts RUNS, not a rate: every rotator run is its own short-lived pod
@@ -157,6 +191,7 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo1-ts1latencyfastburn"
           summary: "SLO-1 fast-burn: TS-1 issue/rotate p99 above 500 ms (LLD §11)"
           description: |
             TS-1 (issue/rotate) is missing the 500 ms target (LLD §11) for
@@ -176,6 +211,7 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo1-ts1latencyslowburn"
           summary: "SLO-1 slow-burn: TS-1 p99 above 500 ms for 15m+ (LLD §11)"
 
       # SLO-2: write-path 5xx spike.
@@ -188,11 +224,30 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo2-writeerrorratefastburn"
           summary: "SLO-2 fast-burn: write-path 5xx burning the 99.9% budget (LLD §11)"
           description: |
             {{ $value | humanizePercentage }} of mutating requests are
             returning 5xx. Likely Postgres or OpenBao failure — cross-reference
             IAMTokenServiceOpenBaoCallLatencyHigh and /readyz.
+
+      # SLO-2: write-path slow burn (sustained degradation → ticket).
+      - alert: IAMTokenServiceSLO2_WriteErrorRateSlowBurn
+        expr: |
+          iam_token_service:write_error_rate:ratio_rate_1h > (6 * 0.001)
+            and
+          iam_token_service:write_error_rate:ratio_rate_5m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-2
+          team: platform
+          metric_status: proposed  # platform_http_* awaits registry ratification
+        annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo2-writeerrorrateslowburn"
+          summary: "SLO-2 write error budget slow burn"
+          description: |
+            Write error rate burning error budget at 6× over the last hour. No page needed yet, but investigate before it reaches fast-burn threshold.
 
       # SLO-3: rotation sweep success ratio degraded.
       - alert: IAMTokenServiceSLO3_SweepSuccessRateLow
@@ -203,6 +258,7 @@ groups:
           slo: SLO-3
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo3-sweepsuccessratelow"
           summary: "SLO-3: §8.3 overlap-expiry sweep success ratio below 99% (operational proxy)"
           description: |
             Sweep success ratio = {{ $value | humanizePercentage }} over the
@@ -223,6 +279,7 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo4-ts3latencyfastburn"
           summary: "SLO-4 fast-burn: TS-3 read p99 above 100 ms (LLD §11)"
           description: |
             TS-3 (read principal + credential metadata) is missing the 100 ms
@@ -242,4 +299,39 @@ groups:
           team: platform
           metric_status: proposed  # platform_http_* awaits registry ratification
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo4-ts3latencyslowburn"
           summary: "SLO-4 slow-burn: TS-3 p99 above 100 ms for 15m+ (LLD §11)"
+
+      # SLO-5: JWKS availability fast burn (EXT-6 hot path, 99.9% target).
+      - alert: IAMTokenServiceSLO5_JWKSAvailabilityFastBurn
+        expr: |
+          iam_token_service:jwks_error_rate:ratio_rate_5m > (14.4 * 0.001)
+            and
+          iam_token_service:jwks_error_rate:ratio_rate_1h > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-5
+          team: platform
+        annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo5-jwksavailabilityfastburn"
+          summary: "SLO-5 JWKS availability fast burn"
+          description: |
+            JWKS 5xx rate burning error budget at 14.4× — Keycloak token verification is degraded. Check OpenBao availability and JWKS handler rate limits.
+
+      # SLO-5: JWKS availability slow burn.
+      - alert: IAMTokenServiceSLO5_JWKSAvailabilitySlowBurn
+        expr: |
+          iam_token_service:jwks_error_rate:ratio_rate_1h > (6 * 0.001)
+            and
+          iam_token_service:jwks_error_rate:ratio_rate_5m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-5
+          team: platform
+        annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceslo5-jwksavailabilityslowburn"
+          summary: "SLO-5 JWKS availability slow burn"
+          description: |
+            JWKS error budget slow burn over the last hour. Investigate OpenBao read latency and known-tenant bucket exhaustion.

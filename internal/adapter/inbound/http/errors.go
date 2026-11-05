@@ -63,6 +63,13 @@ func HandleError(c *gin.Context, err error) {
 		c.Abort()
 		return
 	}
+	// Defense in depth: SQLSTATE class 22 (data exception — numeric overflow,
+	// invalid text representation, etc.) → 400. The adapter layer should have
+	// caught these; a leaked one must still produce 400, not 500.
+	if isDataException(err) {
+		c.JSON(http.StatusBadRequest, problem.NewError(problemTypeInvalidRequest, "invalid parameter value"))
+		return
+	}
 	gincommon.AbortWithProblem(c, toProblem(err))
 }
 
@@ -105,7 +112,7 @@ func domainErrToProblem(de *domain.Error) *problem.Error {
 	case domain.ErrMissingIdentityHeaders:
 		return problem.NewError(problemTypeMissingIdentityHeaders, "")
 	case domain.ErrPrincipalNotFound:
-		return problem.NewError(problemTypePrincipalNotFound, de.Message)
+		return problem.NewError(problemTypePrincipalNotFound, "No principal found for this tenant.")
 	case domain.ErrRotationInFlight:
 		detail := de.Message
 		if rid, ok := de.Details["active_rotation_id"].(string); ok && rid != "" {
@@ -119,7 +126,7 @@ func domainErrToProblem(de *domain.Error) *problem.Error {
 		}
 		return problem.NewError(problemTypeOptimisticLockConflict, detail)
 	case domain.ErrCredentialReplayRevoked:
-		return problem.NewError(problemTypeCredentialReplayRevoked, de.Message)
+		return problem.NewError(problemTypeCredentialReplayRevoked, "The credential version has been revoked; issue a new rotation.")
 	case domain.ErrCredentialReplayExpired:
 		detail := de.Message
 		if v, ok := de.Details["version"]; ok {
@@ -164,4 +171,13 @@ func isUnavailableSQLState(err error) bool {
 func isLockNotAvailable(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
+}
+
+// isDataException reports whether err is a *pgconn.PgError whose SQLSTATE
+// class is 22 (data exception — numeric overflow, invalid text representation,
+// etc.). Used for defense-in-depth classification of validation errors the
+// adapter layer should have handled.
+func isDataException(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && len(pgErr.Code) >= 2 && pgErr.Code[:2] == "22"
 }

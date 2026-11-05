@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -213,7 +214,7 @@ func (h *CredentialHandler) Revoke(c *gin.Context) {
 		return
 	}
 	version, err := strconv.Atoi(c.Param("version"))
-	if err != nil || version < 1 {
+	if err != nil || version < 1 || version > math.MaxInt32 {
 		writeInvalidRequest(c, "version", "must be a positive integer")
 		return
 	}

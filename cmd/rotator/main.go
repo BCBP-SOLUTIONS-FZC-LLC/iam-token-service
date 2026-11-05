@@ -105,7 +105,12 @@ func main() {
 	}
 	migrationDSN := pgadapter.MigrationDSNFromEnv()
 
-	pgCfg.DSN = pgadapter.DSNFromEnv()
+	appDSN := pgadapter.DSNFromEnv()
+	if appDSN == "" {
+		log.Error("startup aborted: DATABASE_URL (or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME) is not set", nil)
+		os.Exit(1)
+	}
+	pgCfg.DSN = appDSN
 	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
 	pgCfg.Logger = pgadapter.NewLoggerAdapter(log)
 	pgCfg.Tracer = gincommon.NewSpanTracer(cfg.ServiceName)
@@ -116,6 +121,13 @@ func main() {
 	defer appPool.Close()
 
 	reconDSN := pgadapter.ReconcilerDSNFromEnv()
+	if os.Getenv("RECONCILER_DATABASE_URL") == "" {
+		if !isDevEnv(appEnv) {
+			log.Error("startup aborted: RECONCILER_DATABASE_URL is not set; in non-dev environments the reconciler pool must use a BYPASSRLS role or the rotator will process zero tenants", nil)
+			os.Exit(1)
+		}
+		log.Warn("RECONCILER_DATABASE_URL not set, falling back to app DSN; cross-tenant enumeration returns zero rows under RLS (safe in dev)", nil)
+	}
 	reconCfg := pgadapter.SystemPoolConfig(reconDSN, log)
 	reconCfg.Tracer = gincommon.NewSpanTracer(cfg.ServiceName)
 	reconcilerPool, err := pgcommon.NewPool(context.Background(), reconCfg)
@@ -123,9 +135,6 @@ func main() {
 		panic(fmt.Sprintf("connect reconciler pool: %v", err))
 	}
 	defer reconcilerPool.Close()
-	if reconDSN == pgCfg.DSN {
-		log.Warn("RECONCILER_DATABASE_URL not set — reconciler pool reuses app DSN; cross-tenant queries will be RLS-filtered", nil)
-	}
 
 	// Deliberately shorter than the CronJob's activeDeadlineSeconds (240s
 	// default, deploy/helm/values.yaml) — production-readiness review,

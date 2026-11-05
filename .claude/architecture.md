@@ -36,7 +36,7 @@ internal/
                   inbox_repository.go (platform-events pkg/inbox),
                   reconciler_repository.go, jwks_tenants_repository.go,
                   keys_refresh_repository.go, rls_violation_repository.go,
-                  migrate.go, migrations/ (000001..000005)
+                  migrate.go, migrations/ (000001_schema)
       openbao/    KV v2 client, Kubernetes auth (client.go)
       httpx/      shared outbound-HTTP transport (traceparent injection, client spans)
       realmprovisioner/  RP-17 client (ClearServiceAccountKeysCache) — the one outbound

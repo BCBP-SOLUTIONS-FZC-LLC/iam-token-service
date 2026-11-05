@@ -12,8 +12,15 @@ info:
     All 5 events describe the platform-automation service-account
     credential lifecycle (register / issue / rotate / revoke) and are
     audit-only — no downstream authorization consumer subscribes, because
-    the automation principal carries no roles (TS-INV-4). The one consumer
-    at MVP is Audit Log, via `serviceaccount-audit-q`.
+    the automation principal carries no roles (TS-INV-4). Known consumers:
+
+    - Audit Log — `serviceaccount-audit-q` (all 5 event types)
+    - Workflow Execution Service — `serviceaccount-workflow-q` (EventType
+      filter: ServiceAccountRegistered only) — refreshes its per-tenant
+      TS-6 cache when `principal_sub` changes on an RP-3/RP-4 re-mint
+    - Tender Service — `serviceaccount-tender-q` (EventType filter:
+      ServiceAccountRegistered only) — refreshes its per-tenant TS-6
+      Automation-mode cache on re-mint (TND-Q23 / Tender HLD §8.5)
 
     No payload — ever — carries a secret or a secret-derived value
     (TS-INV-2, EVT-2); a negative contract test enforces this.
@@ -55,7 +62,10 @@ servers:
     protocol: sns
     description: |
       The `iam-serviceaccount-events` SNS topic (single producer, this
-      service — frozen name, §25). Fans out to one consumer queue at MVP.
+      service — frozen name, §25). Fans out to three consumer queues:
+      `serviceaccount-audit-q` (Audit Log, all events),
+      `serviceaccount-workflow-q` (Workflow Execution, ServiceAccountRegistered only),
+      `serviceaccount-tender-q` (Tender Service, ServiceAccountRegistered only).
     security:
       - $ref: '#/components/securitySchemes/iamRole'
 
@@ -73,9 +83,19 @@ channels:
     servers:
       - $ref: '#/servers/snsServiceAccountEvents'
     description: |
-      This service's 5 published events (§7.5, frozen §25). Fans out to
-      `serviceaccount-audit-q` (DLQ `serviceaccount-audit-q-dlq`,
-      maxReceiveCount=5), owned by Audit Log — audit-only, §7.4.
+      This service's 5 published events (§7.5, frozen §25). Three SNS subscribers:
+
+      1. `serviceaccount-audit-q` (DLQ `serviceaccount-audit-q-dlq`, maxReceiveCount=5)
+         — Audit Log; all 5 event types; audit-only, §7.4.
+      2. `serviceaccount-workflow-q` (DLQ `serviceaccount-workflow-q-dlq`, maxReceiveCount=5)
+         — Workflow Execution Service; SNS filter EventType=ServiceAccountRegistered;
+         refreshes the per-tenant TS-6 principal_sub cache on RP-3/RP-4 re-mint.
+         Consumer key: `iam_serviceaccount`. Dedup via `processed_events`.
+      3. `serviceaccount-tender-q` (DLQ `serviceaccount-tender-q-dlq`, maxReceiveCount=5)
+         — Tender Service; SNS filter EventType=ServiceAccountRegistered;
+         refreshes the per-tenant Automation-mode TS-6 cache on RP-3/RP-4 re-mint
+         (Tender HLD §8.5, TND-Q23). Consumer key: `iam_serviceaccount`.
+         Dedup via `processed_events`.
     messages:
       ServiceAccountRegistered:
         $ref: '#/components/messages/ServiceAccountRegistered'

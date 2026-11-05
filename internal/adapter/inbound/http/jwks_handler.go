@@ -123,7 +123,7 @@ func (h *JWKSHandler) RunKnownTenantRefresher(ctx context.Context, src KnownTena
 	if interval <= 0 {
 		interval = DefaultKnownTenantsRefresh
 	}
-	h.refreshKnownTenants(ctx, src)
+	h.refreshKnownTenants(ctx, src, interval)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -131,14 +131,16 @@ func (h *JWKSHandler) RunKnownTenantRefresher(ctx context.Context, src KnownTena
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			h.refreshKnownTenants(ctx, src)
+			h.refreshKnownTenants(ctx, src, interval)
 		}
 	}
 }
 
-func (h *JWKSHandler) refreshKnownTenants(ctx context.Context, src KnownTenantSource) {
+func (h *JWKSHandler) refreshKnownTenants(ctx context.Context, src KnownTenantSource, interval time.Duration) {
 	started := h.known.now()
-	ids, err := src.ListTenantsWithLiveCredentials(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, interval)
+	defer cancel()
+	ids, err := src.ListTenantsWithLiveCredentials(callCtx)
 	if err != nil {
 		if ctx.Err() == nil {
 			metrics.IncJWKSKnownTenantsRefresh(metrics.OutcomeError)
@@ -167,6 +169,13 @@ func (h *JWKSHandler) Health(_ context.Context) error {
 		return errJWKSNotReady
 	}
 	return nil
+}
+
+// ResetLastRefreshedAt zeroes lastRefreshedAt so Health() returns not-ready
+// and the kubelet liveness probe restarts the pod. Called from the panic
+// recovery wrapper in cmd/server when the refresher goroutine panics (L-7).
+func (h *JWKSHandler) ResetLastRefreshedAt() {
+	h.lastRefreshedAt.Store(0)
 }
 
 // exportRefreshAge sets the jwks_known_tenants_last_refresh_age_seconds gauge

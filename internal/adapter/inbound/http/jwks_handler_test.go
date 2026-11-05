@@ -403,9 +403,9 @@ func TestJWKSHandler_RefreshReplacesKnownSet(t *testing.T) {
 	a, b := uuid.New(), uuid.New()
 	h := NewJWKSHandler(&fakeJWKSService{})
 	src := &fakeKnownTenantSource{sets: [][]uuid.UUID{{a}, {b}}}
-	h.refreshKnownTenants(context.Background(), src)
+	h.refreshKnownTenants(context.Background(), src, DefaultKnownTenantsRefresh)
 	assert.True(t, h.known.has(a))
-	h.refreshKnownTenants(context.Background(), src)
+	h.refreshKnownTenants(context.Background(), src, DefaultKnownTenantsRefresh)
 	assert.False(t, h.known.has(a))
 	assert.True(t, h.known.has(b))
 }

@@ -31,3 +31,27 @@ DLA-4845-1 exp:2026-11-21
 # :nonroot digest (sha256:afa5c872…) still ships tzdata 2026b. Remove this
 # entry and re-pin once distroless ships tzdata >= 2026e.
 DLA-4854-1 exp:2026-11-30
+
+# DLA-4867-1: tzdata 2026b-0+deb12u1 → 2026f-0+deb12u1, a further
+# timezone-database refresh in the same chain as DLA-4792-1 / DLA-4854-1
+# (Trivy: UNKNOWN; the CI gate fails on UNKNOWN). Same package and situation:
+# gcr.io/distroless/static-debian12:nonroot (sha256:afa5c872…) still ships
+# tzdata 2026b as of 2026-10-30. Not exploitable: the service never calls
+# time.LoadLocation, imports time/tzdata, or reads time.Local — all
+# timestamps are UTC. Remove once distroless ships tzdata >= 2026f.
+DLA-4867-1 exp:2026-12-07
+
+# GO-2026-5932: golang.org/x/crypto/openpgp is unmaintained and unsafe by
+# design. The "fix" recorded in the advisory is a pre-release pseudo-version
+# (v0.58.1-0.20261009181718-2f1f834330b2) that has never been tagged as a
+# stable release and cannot be pinned in a module that uses go get / GOPROXY
+# without side-effects. This service does NOT import x/crypto/openpgp directly;
+# the dependency is transitive (via platform-gincommon / OpenBao SDK).
+# govulncheck v1.x confirms our code does not call any vulnerable symbol:
+#   "Your code is affected by 0 vulnerabilities."
+# Trivy reports it because --ignore-unfixed sees the pseudo-version as "fixed"
+# and the local Trivy DB was stale when the pre-push gate ran (CI always pulls
+# a fresh DB, hence the CI failure). This entry is intentionally short-lived:
+# when x/crypto cuts a stable release >= v0.59.0 that includes the openpgp
+# removal, upgrade x/crypto and drop this line.
+GO-2026-5932 exp:2027-02-05

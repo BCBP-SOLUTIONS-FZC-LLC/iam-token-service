@@ -40,7 +40,7 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 
 | Command | Purpose |
 |---|---|
-| `make setup` | Copy `.env-example` → `.env`, install git hooks |
+| `make setup` | Copy `.env-example` → `.env`, install git hooks (`pre-commit` + `pre-push`) |
 | `make docker-up` / `make docker-down` | Start/stop local infra (Postgres, PgBouncer, OpenBao, Floci SNS/SQS/Glue + UI) |
 | `make run` / `make run-consumer` / `make run-scheduler` | Run `cmd/server` / `cmd/consumer` / `cmd/scheduler` natively against that infra |
 | `make docker-run-rotator` / `make docker-run-scheduler` | One CronJob-style run in Docker Compose |
@@ -53,6 +53,8 @@ AUTH-9); membership grants; tenant-owned bots or user PAT self-service
 | `make gates` | Ten invariant gates: `no-gocloak` (TS-INV-1), `no-secret-log` (TS-INV-2), `set-local-only` (RLS-6), `gincommon-obs` (negative: rejects slog/stdlib-log/direct-zap/DefaultRegisterer/hand-rolled TracerProvider), `gincommon-wired` (positive: all 8 required gincommon init functions present in every binary), `pgcommon-obs` (negative: rejects raw pgxpool/pgx.Connect/database/sql), `pgcommon-wired` (positive: ConfigFromEnv/NewPool/GUCSetFromContext/NewLoggerAdapter in every binary), `platform-events-obs` (negative: rejects sqs.ReceiveMessage/sns.Publish), `platform-events-wired` (positive: server wires SNS+outbox; consumer wires SQS+inbox), `metrics-taxonomy` (Tier-1/2/3 prefixes, `_total`/`_seconds` suffixes) |
 | `make metrics-lint` / `make metrics-inventory` | `metricslint` on a real scrape + `metric-registry.md` drift check / regenerate it |
 | `make sast` / `make vuln-check` | `gosec` / `govulncheck ./...` |
+| `make trivy` | Build the `linux/amd64` image and scan for `CRITICAL`/`HIGH`/`UNKNOWN` CVEs (mirrors CI; needs Docker + `GO_PRIVATE_TOKEN` env var, falls back to `gh auth token`) |
+| `make install-hooks` | Install `.githooks/pre-commit` + `pre-push` into `.git/hooks/` |
 | `make swag` / `make swag-check` | Regenerate / staleness-check `docs/swagger/` |
 | `make schema-validate` / `schema-register` / `schema-verify` / `schema-prune` | Glue schema governance (schema-gov) |
 | `make ci` | `tidy fmt-check vet lint arch-lint gates metrics-lint test-ci build` — local CI rehearsal |
@@ -227,12 +229,14 @@ dependency rules: [architecture.md](architecture.md).
 Two tenant-scoped tables under `FORCE ROW LEVEL SECURITY`
 (`service_account_principals`, `service_account_credentials`), plus
 RLS-exempt `processed_events`, `rls_violation_log`, `keys_refresh_pending`
-and platform-events' `outbox_events`/`outbox_dead_letters`. Five
-migrations (dev stage, nothing deployed): `000001_schema`,
-`000002_rotation_cadence` (TSQ-6), `000003_rls_violation_log`,
-`000004_hardening` (outbox dead-letter/sequence grants, `app_tenant_id()`
-search_path pinned + PUBLIC revoked, RLS-log prune TTL ≥ 7 days, TS-D21),
-`000005_keys_refresh_pending` (TS-D22/23). Full detail:
+and platform-events' `outbox_events`/`outbox_dead_letters`. One
+consolidated migration (dev stage, nothing deployed): `000001_schema`
+incorporates the full final schema — enums, all tables (including
+`rotation_cadence_days`/`next_rotation_at` from TSQ-6, `rls_violation_log`
+from TS-D18, `keys_refresh_pending` from TS-D22/23), all hardened
+functions (`app_tenant_id()` with pinned `search_path`, `prune_rls_violation_log`
+with 7-day minimum from TS-D21), and all grants. Future schema changes
+add a new `000002_<name>.{up,down}.sql`. Full detail:
 [database-schema.md](database-schema.md).
 
 ## API & events

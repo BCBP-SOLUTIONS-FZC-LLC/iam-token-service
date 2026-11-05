@@ -24,6 +24,10 @@
 # Prometheus --rule-files directory) in environments not installing this
 # service via the Helm chart; keep both in sync when adding a new alert.
 #
+# NOTE: Five alerts below hardcode `environment: prod` in absent()/kube-state expressions.
+# Change these labels to match your APP_ENV before deploying to non-prod environments.
+# The Helm prometheusrule.yaml renders this from appEnv — use that in production.
+#
 # Do not add an alert on a metric that doesn't exist in the code (grep
 # internal/adapter/outbound/metrics/metrics.go first).
 #
@@ -54,8 +58,10 @@ groups:
           # every environment route as prod.
           domain: iam
           service: iam-token-service
+          # EDIT: change 'prod' to match your APP_ENV before deploying to non-prod environments
           environment: prod
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceserverdown"
           summary: iam-token-service server has no healthy instances
           description: >-
             No iam-token-service server pods have been scraped as healthy
@@ -76,8 +82,10 @@ groups:
           # every environment route as prod.
           domain: iam
           service: iam-token-service
+          # EDIT: change 'prod' to match your APP_ENV before deploying to non-prod environments
           environment: prod
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceconsumerdown"
           summary: iam-token-service consumer has no healthy instances
           description: >-
             No iam-token-service consumer pods have been scraped as healthy
@@ -99,6 +107,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceserverreplicasmissing"
           summary: iam-token-service server running below configured replica count
           description: >-
             Fewer than the configured server replica count are healthy.
@@ -118,8 +127,10 @@ groups:
           # every environment route as prod.
           domain: iam
           service: iam-token-service
+          # EDIT: change 'prod' to match your APP_ENV before deploying to non-prod environments
           environment: prod
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicerotatornotrunning"
           summary: iam-token-service rotator has not completed successfully recently
           description: >-
             The rotator CronJob (overlap-expiry sweep §8.3, orphan-material
@@ -141,8 +152,10 @@ groups:
           # every environment route as prod.
           domain: iam
           service: iam-token-service
+          # EDIT: change 'prod' to match your APP_ENV before deploying to non-prod environments
           environment: prod
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceschedulernotrunning"
           summary: iam-token-service scheduler has not completed successfully recently
           description: >-
             The cadence-rotation CronJob has not had a successful run in over
@@ -178,8 +191,10 @@ groups:
           # every environment route as prod.
           domain: iam
           service: iam-token-service
+          # EDIT: change 'prod' to match your APP_ENV before deploying to non-prod environments
           environment: prod
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicecronjobrunfailed"
           summary: iam-token-service {{ $labels.cronjob }} run failed
           description: >-
             The latest scheduled run of {{ $labels.cronjob }} has not succeeded. Check the
@@ -204,6 +219,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicehigherrorrate"
           summary: iam-token-service 5xx error rate above 5%
           description: >-
             {{ $value | humanizePercentage }} of requests are returning 5xx errors
@@ -219,17 +235,40 @@ groups:
             sum by (le, op, domain, service, environment) (
               rate(iam_token_service_openbao_call_duration_seconds_bucket{job="iam-token-service-server"}[5m])
             )
-          ) > 5
+          ) > 2
         for: 5m
         labels:
           severity: warning
           team: platform
         annotations:
-          summary: iam-token-service OpenBao call p99 latency above 5s
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceopenbaoCalllatencyhigh"
+          summary: iam-token-service OpenBao call p99 latency above 2s
           description: >-
-            OpenBao KV v2 {{ $labels.op }} calls are taking over 5s at p99 —
-            approaching the 8s HTTPTimeout default. Check OpenBao health
-            and the Kubernetes auth login path (§10.5).
+            OpenBao KV v2 `{{ $labels.op }}` calls at p99 above 2s — the in-lock write timeout is 5s; sustained >2s means approaching failure territory.
+
+      # ── OpenBao read latency — JWKS hot path (EXT-6, Tier-1 metric) ────────
+      #    The Tier-3 IAMTokenServiceOpenBaoCallLatencyHigh only covers
+      #    op=write and op=delete. JWKS reads are only on the Tier-1
+      #    platform_dependency_request_seconds{dependency="openbao",operation="read"}.
+      - alert: IAMTokenServiceOpenBaoReadLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, environment, service, domain) (
+              rate(platform_dependency_request_seconds_bucket{dependency="openbao",operation="read"}[5m])
+            )
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+          service: iam-token-service
+          domain: iam
+        annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceopenbaoreadlatencyhigh"
+          summary: "IAM Token Service OpenBao read p99 latency is high (JWKS hot path)"
+          description: >-
+            OpenBao read calls at p99 above 2s — this is the JWKS route's hot path; a stall here
+            delays Keycloak token verification for every platform-automation assertion.
 
       # ── OpenBao call failures ─────────────────────────────────────────
       # platform_dependency_request_seconds_count{dependency="openbao",
@@ -250,6 +289,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceopenbaoerrors"
           summary: iam-token-service OpenBao calls are failing
           description: >-
             {{ $value | humanizePercentage }} of OpenBao KV v2 calls failed over
@@ -267,6 +307,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoffboardingcascadefailures"
           summary: iam-token-service offboarding cascade is failing
           description: >-
             {{ $value | humanize }} offboarding-cascade error(s) in the last 15
@@ -286,6 +327,7 @@ groups:
           severity: critical
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceconsumedschemaviolation"
           summary: iam-token-service is rejecting {{ $labels.event_type }} as a schema violation
           description: >-
             {{ $value | humanize }} {{ $labels.event_type }} event(s) in the
@@ -311,6 +353,7 @@ groups:
           team: platform
           compliance: gdpr-erasure
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoffboardinginvalidenveloperejected"
           summary: iam-token-service sent a TenantMembershipsPurged with no valid envelope id to the DLQ
           description: >-
             {{ $value | humanize }} TenantMembershipsPurged event(s) in the last
@@ -331,6 +374,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicerotationsweepfailures"
           summary: iam-token-service overlap-expiry sweep is failing
           description: >-
             {{ $value | humanize }} sweep run(s) with errors in the last hour (§8.3) —
@@ -350,6 +394,7 @@ groups:
           severity: critical
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceorphanmaterialmissing"
           summary: iam-token-service reconciler found a credential row with no OpenBao material
           description: >-
             {{ $value | humanize }} missing_material result(s) from the §8.6
@@ -370,6 +415,7 @@ groups:
           severity: critical
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicecadencerotationfailures"
           summary: iam-token-service automatic cadence-driven rotation is failing
           description: >-
             {{ $value | humanize }} failed result(s) from the §16 TSQ-6 cadence scheduler
@@ -393,6 +439,7 @@ groups:
           severity: critical
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicejwkskeyerrors"
           summary: iam-token-service JWKS route could not serve a live credential's key
           description: >-
             {{ $value | humanize }} unreadable/unparseable credential(s) in the last 15
@@ -422,6 +469,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicejwksknowntenantrefresherrors"
           summary: iam-token-service JWKS known-tenant refresher is failing
           description: >-
             {{ $value | humanizePercentage }} of JWKS known-tenant refresher runs
@@ -449,6 +497,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicejwksknowntenantsstale"
           summary: iam-token-service JWKS known-tenant set has not been refreshed for over 7 minutes
           description: >-
             The JWKS known-tenant refresher last succeeded {{ $value | humanizeDuration }} ago.
@@ -469,6 +518,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicejwksratelimited"
           summary: iam-token-service is rate-limiting JWKS requests
           description: >-
             {{ $value | humanize }} JWKS request(s) for known tenants answered
@@ -498,6 +548,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicehighlatency"
           summary: iam-token-service p99 latency above 1s
           description: >-
             The p99 request duration is {{ $value | humanizeDuration }}. Check
@@ -516,6 +567,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicerotationoverlapstuck"
           summary: iam-token-service has credentials stuck in the rotation overlap window
           description: >-
             {{ $value | humanize }} credential(s) have been `rotating` for over an
@@ -538,6 +590,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicekeysrefreshbacklog"
           summary: iam-token-service has RP-17 key-cache refreshes owed for over 15 minutes
           description: >-
             The oldest owed Keycloak key-cache refresh is
@@ -569,6 +622,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoutboxstuck"
           summary: iam-token-service outbox events moved to the dead-letter table
           description: >-
             One or more produced service-account-lifecycle events
@@ -599,6 +653,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicesqsreceiveerrors"
           summary: iam-token-service is failing to receive from SQS
           description: >-
             SQS ReceiveMessage error(s) (excludes context cancellation) in the
@@ -627,6 +682,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoutboxbackloggrowing"
           summary: iam-token-service outbox has a growing unrelayed backlog
           description: >-
             {{ $value | humanize }} outbox rows have been unrelayed for 15+
@@ -655,6 +711,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicepostgrespoolexhaustion"
           summary: iam-token-service Postgres connection pool is exhausted
           description: >-
             One or more requests on pool "{{ $labels.pool }}" had to wait
@@ -680,6 +737,7 @@ groups:
           severity: warning
           team: platform
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoffboardingqueuebackloggrowing"
           summary: iam-token-service's offboarding queue has a growing backlog
           description: >-
             The oldest unprocessed TenantMembershipsPurged message on
@@ -704,6 +762,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoffboardingqueuestalled"
           summary: iam-token-service's offboarding queue is not draining
           description: >-
             {{ $value }} TenantMembershipsPurged message(s) have been waiting on
@@ -727,6 +786,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenserviceoffboardingdlqbacklog"
           summary: Messages are waiting in the {{ $labels.queue }} DLQ
           description: >-
             {{ $value }} message(s) in the DLQ of {{ $labels.queue }} — those
@@ -752,6 +812,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicerlscrosstenantaccess"
           summary: RLS hid another tenant's row from a query
           description: >-
             A query running under one tenant's GUC touched a row belonging
@@ -773,6 +834,7 @@ groups:
           # successor metric awaits Platform Observability Registry ratification
           metric_status: proposed
         annotations:
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/blob/main/docs/observability/runbooks.md#iamtokenservicerlsmissingguc"
           summary: RLS violations from missing or invalid tenant GUC
           description: >-
             A caller path is not binding app.tenant_id via SET LOCAL (RLS-6)

@@ -4,14 +4,15 @@
 # cmd/server, cmd/consumer, cmd/rotator, cmd/scheduler):
 #
 #   connections   — pgcommon.NewPool (never pgxpool.Connect, pgxpool.New,
-#                   pgx.Connect, or pgx.ConnectConfig)
+#                   pgxpool.NewWithConfig, pgx.Connect, or pgx.ConnectConfig)
 #   configuration — pgcommon.ConfigFromEnv / pgadapter.SystemPoolConfig
 #                   (never hand-assembled pgxpool.Config or pgx.ConnConfig)
 #   transactions  — pgcommon.RunInTx / pgcommon.RunInTxWithRetryOpts /
 #                   withPool (never pgx.Conn.Begin or pgxpool.Pool.Begin)
 #   SQL driver    — pgcommon/pgx only (never database/sql, sql.Open)
-#   direct Conn   — pgxpool.Conn must NOT appear in production code; all
-#                   query execution goes through pgx.Tx obtained via pgcommon
+#   direct Conn   — pgxpool.Conn and pgx.Conn must NOT appear in production
+#                   code; all query execution goes through pgx.Tx obtained
+#                   via pgcommon
 #
 # Allowed patterns (pgcommon transitive-dependency error inspection):
 #   pgconn.PgError — SQLSTATE inspection in db.go and errors.go
@@ -28,7 +29,7 @@ set -euo pipefail
 echo "Checking database connections, config, and operations go through platform-pgcommon (negative gate)..."
 
 offenders=$(grep -rnE \
-  'pgxpool\.Connect\(|pgxpool\.New\(|pgx\.Connect\(|pgx\.ConnectConfig\(|pgxpool\.Pool\b|pgxpool\.Conn\b|"database/sql"|sql\.Open\(' \
+  'pgxpool\.Connect\(|pgxpool\.New\(|pgxpool\.NewWithConfig\(|pgx\.Connect\(|pgx\.ConnectConfig\(|pgxpool\.Pool\b|pgxpool\.Conn\b|pgx\.Conn\b|"database/sql"|sql\.Open\(' \
   --include='*.go' \
   --exclude='*_test.go' \
   cmd/ internal/ 2>/dev/null || true)
@@ -38,9 +39,9 @@ if [ -n "$offenders" ]; then
 	echo "  connections → use pgcommon.NewPool (config via pgcommon.ConfigFromEnv / pgadapter.SystemPoolConfig)"
 	echo "  transactions → use pgcommon.RunInTx / pgcommon.RunInTxWithRetryOpts / withPool helper"
 	echo "  SQL driver  → pgcommon/pgx only (never database/sql or sql.Open)"
-	echo "  direct Conn → pgxpool.Conn must NOT be in production code; use pgx.Tx from pgcommon.RunInTx"
+	echo "  direct Conn → pgxpool.Conn / pgx.Conn must NOT be in production code; use pgx.Tx from pgcommon.RunInTx"
 	echo ""
 	echo "$offenders"
 	exit 1
 fi
-echo "OK: no raw pgxpool.Connect/pgx.Connect/database/sql/pgxpool.Conn in production code (cmd/, internal/)"
+echo "OK: no raw pgxpool.Connect/pgx.Connect/pgxpool.NewWithConfig/pgx.Conn/database/sql in production code (cmd/, internal/)"

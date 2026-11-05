@@ -113,6 +113,10 @@ func main() {
 		log.Warn("postgres config warning", map[string]interface{}{"key": w.Key, "reason": w.Reason})
 	}
 	dsn := pgadapter.DSNFromEnv()
+	if dsn == "" {
+		log.Error("startup aborted: DATABASE_URL (or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME) is not set", nil)
+		os.Exit(1)
+	}
 	// Migrations must bypass PgBouncer — the migration runner acquires a
 	// pg_advisory_lock, which is session-scoped and breaks under
 	// transaction pooling (§4.4/TS-CONFIG-2).
@@ -213,7 +217,7 @@ func main() {
 	credentialSvc := service.NewCredentialService(principalRepo, credentialRepo, instrumentedSecrets, txRunner, log, nil).
 		WithCadenceDays(envInt("ROTATION_DEFAULT_CADENCE_DAYS", domain.DefaultCadenceDays)).
 		WithReplayWindow(replayWindowFromEnv())
-	principalSvc := service.NewPrincipalService(principalRepo, credentialRepo, txRunner)
+	principalSvc := service.NewPrincipalService(principalRepo, credentialRepo, txRunner).WithLogger(log)
 	instrumentedCredentialSvc := metrics.NewInstrumentedCredentialService(credentialSvc) // iam_token_service_credentials_issued_total
 	jwksSvc := service.NewJWKSService(principalRepo, credentialRepo, instrumentedSecrets, log)
 
@@ -250,8 +254,13 @@ func main() {
 		panic(fmt.Sprintf("create outbox runner: %v", err))
 	}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("outbox runner panicked", map[string]any{"panic": fmt.Sprintf("%v", r)})
+			}
+		}()
 		if err := outboxRunner.Start(ctx); err != nil {
-			log.Error("outbox runner stopped", map[string]interface{}{"error": err.Error()})
+			log.Error("outbox runner stopped unexpectedly", map[string]any{"error": err.Error()})
 		}
 	}()
 
@@ -295,6 +304,9 @@ func main() {
 				log.Error("jwks known-tenant refresher panicked — known-tenant set is frozen until pod restart", map[string]interface{}{
 					"panic": fmt.Sprintf("%v", r),
 				})
+				// Zero lastRefreshedAt so Health() returns not-ready and
+				// the pod is restarted by the kubelet liveness probe (L-7).
+				jwksHandler.ResetLastRefreshedAt()
 				// Set the staleness gauge to a large sentinel so the
 				// IAMTokenServiceJWKSKnownTenantsStale alert fires on the next
 				// scrape. Without this the gauge stays frozen at 0 (its last
@@ -361,6 +373,8 @@ func main() {
 		Addr:              ":" + envOr("METRICS_PORT", "9090"),
 		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      5 * time.Second,
 	}
 
 	quit := make(chan os.Signal, 1)
@@ -386,26 +400,38 @@ func main() {
 	log.Info("shutdown signal received — draining", map[string]interface{}{"drain_delay": drainDelay.String()})
 	drainThenWait(&draining, drainDelay, time.Sleep)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	// HTTP + metrics server drain — bounded at 20s so a slow Gin handler
+	// does not consume the whole 30s window and starve the pool drain.
+	httpCtx, httpCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer httpCancel()
+	if err := srv.Shutdown(httpCtx); err != nil {
 		log.Error("HTTP server shutdown error", map[string]interface{}{"error": err.Error()})
 	}
-	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+	if err := metricsServer.Shutdown(httpCtx); err != nil {
 		log.Error("metrics server shutdown error", map[string]interface{}{"error": err.Error()})
 	}
+
+	// Outbox drain (has its own internal timeout — does not need an outer one).
 	if err := outboxRunner.Stop(); err != nil {
 		log.Error("outbox runner drain error", map[string]interface{}{"error": err.Error()})
 	}
+
+	// Cancel background loops (exporters, JWKS refresher) before draining
+	// pools so goroutines that hold connections release them first.
 	cancelBackground()
+
+	// Pool drain — separate context so a slow HTTP shutdown above cannot
+	// have already consumed the shared deadline.
 	// DrainAndClose waits for in-flight WithConn/RunInTx callbacks then
 	// force-closes — pgcommon's documented graceful path. defer Close()
 	// above remains a safety net for panic/early-return and is idempotent
 	// after DrainAndClose returns (must not run concurrently).
-	if err := pool.DrainAndClose(shutdownCtx); err != nil {
+	poolCtx, poolCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer poolCancel()
+	if err := pool.DrainAndClose(poolCtx); err != nil {
 		log.Error("app pool drain error", map[string]interface{}{"error": err.Error()})
 	}
-	if err := reconcilerPool.DrainAndClose(shutdownCtx); err != nil {
+	if err := reconcilerPool.DrainAndClose(poolCtx); err != nil {
 		log.Error("reconciler pool drain error", map[string]interface{}{"error": err.Error()})
 	}
 	shutdownTracing()
@@ -471,21 +497,29 @@ func envOr(key, def string) string {
 }
 
 func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
+	s := os.Getenv(key)
+	if s == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		fmt.Fprintf(os.Stderr, "warn: %s=%q is set but not a positive integer — ignoring, using default %d\n", key, s, def)
+		return def
+	}
+	return n
 }
 
 func envFloat(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			return f
-		}
+	s := os.Getenv(key)
+	if s == "" {
+		return def
 	}
-	return def
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f <= 0 {
+		fmt.Fprintf(os.Stderr, "warn: %s=%q is set but not a positive float — ignoring, using default %g\n", key, s, def)
+		return def
+	}
+	return f
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
