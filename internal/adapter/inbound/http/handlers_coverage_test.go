@@ -41,8 +41,8 @@ func TestJWKSHandler_WithLogger_FailedRefreshIsLoggedAndKeepsSet(t *testing.T) {
 	require.Same(t, h, h.WithLogger(log))
 
 	src := &fakeKnownTenantSource{sets: [][]uuid.UUID{{known}}}
-	h.refreshKnownTenants(context.Background(), src) // succeeds
-	h.refreshKnownTenants(context.Background(), src) // script exhausted: "db down"
+	h.refreshKnownTenants(context.Background(), src, DefaultKnownTenantsRefresh) // succeeds
+	h.refreshKnownTenants(context.Background(), src, DefaultKnownTenantsRefresh) // script exhausted: "db down"
 
 	require.Len(t, log.warnCalls, 1)
 	assert.Equal(t, "db down", log.warnCalls[0]["error"])
@@ -57,7 +57,7 @@ func TestJWKSHandler_FailedRefreshAfterCancelIsNotLogged(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	h.refreshKnownTenants(ctx, &fakeKnownTenantSource{})
+	h.refreshKnownTenants(ctx, &fakeKnownTenantSource{}, DefaultKnownTenantsRefresh)
 
 	assert.Empty(t, log.warnCalls)
 }

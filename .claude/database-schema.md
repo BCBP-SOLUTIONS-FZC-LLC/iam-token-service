@@ -46,7 +46,7 @@ every row, never reused), `status`, `openbao_path` (the KV v2 path —
 (the caller's idempotency key), `record_version`, `issued_at`,
 `updated_at`, `rotated_at`, `expires_at` (the overlap cutoff for a
 `rotating` row), `revoked_at`, `deleted_at`, and
-`rotation_cadence_days`/`next_rotation_at` (`000002`, §16 TSQ-6 Resolved;
+`rotation_cadence_days`/`next_rotation_at` (§16 TSQ-6 Resolved;
 set on the `active` row at issue/rotate, default cadence 90 days, cleared
 to `NULL` when the row is demoted — only the current `active` version is
 ever "due").
@@ -83,7 +83,7 @@ retention prune (`inbox.Store.Prune` from `cmd/rotator`,
 `PROCESSED_EVENTS_TTL_DAYS`, default 8, must exceed the SQS message
 lifetime).
 
-### `rls_violation_log` (RLS-exempt, operational, `000003`)
+### `rls_violation_log` (RLS-exempt, operational)
 
 `id bigserial`, `table_name`, `row_tenant_id`, `app_tenant_id`,
 `violation_type` (`missing_or_invalid_guc` | `cross_tenant_access`),
@@ -93,13 +93,13 @@ checks, so a policy here would recurse). No grant to `serviceaccount_app`:
 rows are written only through `log_rls_violation()` and pruned only
 through `prune_rls_violation_log(ttl_days, limit)` (cmd/rotator,
 `RLS_VIOLATION_LOG_TTL_DAYS`, default 30; the function refuses
-`ttl_days < 7` since `000004`). `serviceaccount_reconciler` and
+`ttl_days < 7` (TS-D21). `serviceaccount_reconciler` and
 `admin_readonly` have `SELECT` — cmd/server's exporter reads it into
 `iam_rls_violations_total`. A cross-tenant write rejected by `WITH CHECK`
 is never logged: its error rolls the log row back with the caller's
 transaction.
 
-### `keys_refresh_pending` (RLS-exempt, operational, `000005`)
+### `keys_refresh_pending` (RLS-exempt, operational)
 
 The durable "RP-17 key-cache refresh owed for this tenant" marker (EXT-6,
 TS-INV-7, TS-D22/23). Columns: `tenant_id uuid PRIMARY KEY`,
@@ -129,7 +129,7 @@ index on `requested_at` (the retry pass reads oldest first).
 Created by `outbox.ApplySchema`, which `Migrate` runs **before** this
 service's migrations (MIG-1/MIG-2). `000001` only customizes
 `outbox_events` (`payload` → `text`, `trg_outbox_normalize_payload`),
-guarded `IF EXISTS`. `000004` grants `serviceaccount_app` CRUD on
+guarded `IF EXISTS`. The consolidated schema grants `serviceaccount_app` CRUD on
 `outbox_dead_letters` and `USAGE, SELECT` on `outbox_events_ordering_seq`,
 so the runner can dead-letter a poison event.
 
@@ -148,7 +148,7 @@ rls_check_tenant(tenant_id, table_name) →          -- STABLE STRICT SECURITY D
 ```
 
 `app_tenant_id()` is `STABLE SECURITY DEFINER` and fail-closed
-(`EXCEPTION WHEN OTHERS THEN RETURN NULL`); since `000004` its
+(`EXCEPTION WHEN OTHERS THEN RETURN NULL`); its
 `search_path` is pinned (`pg_catalog, public`) and `EXECUTE` is revoked
 from PUBLIC (granted to `serviceaccount_app`). The GUC is bound via
 `SET LOCAL` (never plain `SET` — RLS-6; CI gate `set-local-only`), so a
@@ -163,9 +163,9 @@ samples failures (1%, or `app.rls_violation_sample_rate`) into
 | Name | Kind | Purpose |
 |---|---|---|
 | `app_tenant_id()` | function | Reads the tenant GUC, fail-closed |
-| `rls_check_tenant(uuid, text)` | function | The RLS predicate on both tenant tables; logs failures (`000003`) |
+| `rls_check_tenant(uuid, text)` | function | The RLS predicate on both tenant tables; logs failures (TS-D18) |
 | `log_rls_violation(text, uuid, text)` | function | Sampled insert into `rls_violation_log` |
-| `prune_rls_violation_log(int, int)` | function | Batched delete; `ttl_days ≥ 7`, `limit ≥ 1` (`000004`); EXECUTE granted to `serviceaccount_app` |
+| `prune_rls_violation_log(int, int)` | function | Batched delete; `ttl_days ≥ 7`, `limit ≥ 1` (TS-D21); EXECUTE granted to `serviceaccount_app` |
 | `touch_row()` | trigger fn | `BEFORE UPDATE … WHEN (OLD.* IS DISTINCT FROM NEW.*)` on both tenant tables: bumps `record_version` and `updated_at`. The `WHEN` guard means an identical-row update never invalidates a concurrent optimistic-lock holder |
 | `outbox_normalize_payload()` | trigger fn | `BEFORE INSERT` on `outbox_events` |
 
@@ -184,13 +184,13 @@ roles.
 
 ## Migrations
 
-| Migration | Adds | Down |
+One consolidated migration (dev stage, nothing deployed). All schema that was
+previously split across five files (000001–000005) is now in a single file.
+Future schema changes add `000002_<name>.{up,down}.sql`.
+
+| Migration | Contents | Down |
 |---|---|---|
-| `000001_schema` | Enums, both tenant tables, RLS, `processed_events`, outbox customization, roles/grants, `touch_row` | Guarded `REVOKE … FROM admin_readonly` (`EXCEPTION WHEN undefined_object`) so rollback works where the role doesn't exist |
-| `000002_rotation_cadence` | `rotation_cadence_days`, `next_rotation_at`, `idx_sac_next_rotation` (additive; old rows stay `NULL` and are never due) | Drops them |
-| `000003_rls_violation_log` | `rls_violation_log`, `log_rls_violation()`, `prune_rls_violation_log()`, the logging `rls_check_tenant()` | Restores `000001`'s non-logging predicate |
-| `000004_hardening` (TS-D21) | Outbox dead-letter + ordering-sequence grants; `app_tenant_id()` search_path pinned, PUBLIC revoked; prune TTL ≥ 7 | Restores the previous function bodies, revokes the outbox grants |
-| `000005_keys_refresh_pending` (TS-D22/23) | `keys_refresh_pending` + grants | Drops the table — trigger RP-17 by hand for any tenant still listed first |
+| `000001_schema` | Enums; `service_account_principals`, `service_account_credentials` (with `rotation_cadence_days`/`next_rotation_at`, TSQ-6), `processed_events`, `rls_violation_log` (TS-D18), `keys_refresh_pending` (TS-D22/23); outbox customization; `app_tenant_id()` with pinned `search_path` (TS-D21); `rls_check_tenant()` with violation logging; `prune_rls_violation_log()` with 7-day minimum (TS-D21); outbox dead-letter + sequence grants; all roles/grants | Drops all tables, functions, and types in reverse dependency order |
 
 `Migrate` (`postgres/migrate.go`) runs `outbox.ApplySchema` then these.
 Helm runs them once per install/upgrade in a hook Job (`MIGRATE_ONLY=true`

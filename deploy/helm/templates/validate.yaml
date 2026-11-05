@@ -7,7 +7,7 @@ resource they protect.
 "Non-dev" means appEnv is not one of local | dev | test — i.e. staging and
 prod, the environments that must carry the production safety posture.
 */}}
-{{- $devEnvs := list "local" "dev" "test" }}
+{{- $devEnvs := list "local" "dev" "development" "test" }}
 {{- $nonDev := not (has .Values.appEnv $devEnvs) }}
 
 {{- /* Finding: Keycloak/Workflow could forge the system principal. NetworkPolicy
@@ -58,4 +58,43 @@ always has its own ServiceAccount (serviceaccount.yaml), so a `migrate` key
 still applies and is ignored here. */}}
 {{- if and (not .Values.serviceAccount.perWorkload) (omit (.Values.serviceAccount.workloadAnnotations | default dict) "migrate") }}
 {{- fail "serviceAccount.workloadAnnotations is set but serviceAccount.perWorkload is false — every workload then shares one ServiceAccount, so per-workload annotations (IRSA roles) cannot apply. Put the union IRSA role in serviceAccount.annotations and remove workloadAnnotations, or set perWorkload: true. See values.yaml." }}
+{{- end }}
+
+{{- /* H-3: Inline DB credentials must never appear outside local/dev/test —
+     secretValues is rendered verbatim into a Kubernetes Secret whose data
+     is base64, not encrypted, and Helm stores the full rendered manifest in
+     a release Secret (also base64, not encrypted). Any staging/prod deploy
+     with secretValues set has plaintext credentials in release history. */}}
+{{- if and $nonDev .Values.secretValues }}
+{{- fail "secretValues must not be used in non-dev environments: use existingSecret or database.existingSecretName to reference a pre-provisioned Kubernetes Secret or use ExternalSecretOperator. Plain-text credentials in Helm values are stored unencrypted in release history." }}
+{{- end }}
+
+{{- /* M-15: NetworkPolicy must not be disabled outside local/dev/test —
+     without it every pod in the cluster can reach every other pod, which
+     eliminates the network-layer isolation that AuthorizationPolicy depends
+     on (NetworkPolicy admits at L4; AuthorizationPolicy filters at L7). */}}
+{{- if and $nonDev (not .Values.networkPolicy.enabled) }}
+{{- fail "networkPolicy.enabled must not be false in non-dev environments: network policies are required for security isolation. Set networkPolicy.enabled=true and configure meshNamespaces/keycloakNamespaces." }}
+{{- end }}
+
+{{- /* L-12: image.digest must be set outside local/dev/test — a tag-only
+     deploy is mutable: the same tag can be overwritten at the registry,
+     making the deployment non-reproducible and bypassing image signing. */}}
+{{- if and $nonDev (or (not .Values.image.digest) (not (hasPrefix .Values.image.digest "sha256:"))) }}
+{{- fail "image.digest must be a content digest (sha256:<hash>) in non-dev environments: a tag value is mutable and can be overwritten at the registry, bypassing image signing. Set image.digest to the sha256 digest output by your CI build." }}
+{{- end }}
+
+{{- /* L-13: IRSA annotations must be present outside local/dev/test —
+     without them the server pod has no AWS identity (SNS, Glue) and the
+     consumer pod has no AWS identity (SQS), causing silent publish failures
+     and consumer startup errors. Only checked when perWorkload: true (the
+     per-workload annotations path); with perWorkload: false the union role
+     belongs in serviceAccount.annotations, which is not checked here. */}}
+{{- if and $nonDev .Values.serviceAccount.perWorkload }}
+{{- if not (index (.Values.serviceAccount.workloadAnnotations | default dict) "server") }}
+{{- fail "serviceAccount.workloadAnnotations.server must be set in non-dev environments: without IRSA annotations the server pod cannot authenticate to AWS (SNS, Glue)." }}
+{{- end }}
+{{- if not (index (.Values.serviceAccount.workloadAnnotations | default dict) "consumer") }}
+{{- fail "serviceAccount.workloadAnnotations.consumer must be set in non-dev environments: without IRSA annotations the consumer pod cannot authenticate to AWS (SQS)." }}
+{{- end }}
 {{- end }}

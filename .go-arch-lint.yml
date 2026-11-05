@@ -32,6 +32,11 @@ components:
   requestctx:
     in: pkg/requestctx
 
+  # traceutil provides the shared withTraceID log-enrichment helper used by
+  # service/tracing.go and the offboarding consumer (L-10).
+  traceutil:
+    in: pkg/traceutil
+
   # Embedded AsyncAPI spec asset (api/asyncapi.yaml, api/embed.go) — single
   # source of truth for the event contract (§7.3).
   apispec:
@@ -116,8 +121,12 @@ deps:
       - domain
       - port
       - requestctx
+      - traceutil
 
   requestctx:
+    anyVendorDeps: true
+
+  traceutil:
     anyVendorDeps: true
 
   apispec:
@@ -157,6 +166,7 @@ deps:
       - port
       - service
       - requestctx
+      - traceutil
       - apispec
       - observability
 
@@ -175,6 +185,7 @@ deps:
       - port
       - service
       - requestctx
+      - traceutil
       - apispec
       - swaggerdocs
       - postgres

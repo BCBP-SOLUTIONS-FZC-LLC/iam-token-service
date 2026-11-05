@@ -11,15 +11,24 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/v2/pkg/gincommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/pkg/traceutil"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
+
+// cascadePerCallTimeout bounds each individual OpenBao Delete call inside the
+// offboarding cascade (EraseSecretMaterial). Without a bound, a single
+// unresponsive OpenBao can hold the inbox transaction open indefinitely
+// while the SQS visibility timeout ticks down (M-2).
+const cascadePerCallTimeout = 5 * time.Second
 
 // tenantMembershipsPurgedEventType is the wire-format `type` field on a
 // TenantMembershipsPurged envelope, published by iam-org-membership onto
@@ -111,16 +120,32 @@ func (c *OffboardingConsumer) Handle(ctx context.Context, env events.Envelope[js
 		c.error(ctx, "TenantMembershipsPurged has invalid or missing envelope id — rejecting to DLQ; tenant erasure has NOT run", map[string]interface{}{
 			"event_type": env.Type, "event_id": env.ID,
 		})
-		return fmt.Errorf("offboarding consumer: %w: %q", ErrInvalidEnvelopeID, env.ID)
+		rejectErr := fmt.Errorf("offboarding consumer: %w: %q", ErrInvalidEnvelopeID, env.ID)
+		span.RecordError(rejectErr)
+		span.SetStatus(codes.Error, rejectErr.Error())
+		return rejectErr
 	}
 
 	var payload tenantMembershipsPurgedPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		return fmt.Errorf("offboarding consumer: decode TenantMembershipsPurged payload: %w", err)
+		decodeErr := fmt.Errorf("offboarding consumer: decode TenantMembershipsPurged payload: %w", err)
+		span.RecordError(decodeErr)
+		span.SetStatus(codes.Error, decodeErr.Error())
+		return decodeErr
 	}
 	if payload.TenantID == uuid.Nil {
-		return fmt.Errorf("offboarding consumer: TenantMembershipsPurged payload missing tenant_id")
+		nilErr := fmt.Errorf("offboarding consumer: TenantMembershipsPurged payload missing tenant_id")
+		span.RecordError(nilErr)
+		span.SetStatus(codes.Error, nilErr.Error())
+		return nilErr
 	}
+
+	// Annotate the span with tenant/event identifiers so traces are
+	// searchable by tenant_id or event_id (M-11).
+	span.SetAttributes(
+		attribute.String("tenant_id", payload.TenantID.String()),
+		attribute.String("event_id", env.ID),
+	)
 
 	// Bind the RLS GUC to this event's tenant + the reserved system
 	// principal (§4.3) — this consumer processes exactly one tenant per
@@ -137,6 +162,8 @@ func (c *OffboardingConsumer) Handle(ctx context.Context, env events.Envelope[js
 		return c.cascade(txCtx, payload.TenantID)
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	if duplicate {
@@ -185,7 +212,7 @@ func (c *OffboardingConsumer) cascade(ctx context.Context, tenantID uuid.UUID) e
 	// UPDATE), so no new issue/rotate for this tenant can write more
 	// material until this transaction ends. TS-7 runs the same step
 	// (service.EraseSecretMaterial) scoped to one principal's client prefix.
-	if err := service.EraseSecretMaterial(ctx, c.secrets, paths, domain.OpenBaoTenantPrefix(tenantID), 0); err != nil {
+	if err := service.EraseSecretMaterial(ctx, c.secrets, paths, domain.OpenBaoTenantPrefix(tenantID), cascadePerCallTimeout); err != nil {
 		return err
 	}
 
@@ -221,11 +248,5 @@ func (c *OffboardingConsumer) error(ctx context.Context, msg string, fields map[
 }
 
 func withTraceID(ctx context.Context, fields map[string]interface{}) map[string]interface{} {
-	if traceID := gincommon.SpanTraceID(ctx); traceID != "" {
-		if fields == nil {
-			fields = map[string]interface{}{}
-		}
-		fields["trace_id"] = traceID
-	}
-	return fields
+	return traceutil.WithTraceID(ctx, fields)
 }

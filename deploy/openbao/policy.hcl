@@ -1,5 +1,13 @@
 # OpenBao (Vault-API-compatible) ACL policy for iam-token-service.
 #
+# NOTE: This is the legacy combined policy kept for reference and for
+# environments that have not yet adopted per-workload roles. For new
+# deployments, use the per-workload policies in policy-{server,consumer,
+# rotator,scheduler}.hcl instead — they apply least-privilege grants to
+# each binary individually (M-16). With serviceAccount.perWorkload: true
+# (the default) the OpenBao role for each workload ServiceAccount should
+# reference only its matching policy file.
+#
 # Grants access ONLY under this service's own deterministic, frozen
 # per-tenant/per-version credential path (§6.3, §25): the KV v2 mount is
 # "iam" (OPENBAO_KV_MOUNT) and the path shape is

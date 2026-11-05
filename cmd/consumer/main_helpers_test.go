@@ -195,7 +195,8 @@ func TestReadyzHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	probe := func(d *atomic.Bool, db bool, bao error) (int, string) {
 		r := gin.New()
-		r.GET("/readyz", readyzHandler(d, func(context.Context) bool { return db }, func(context.Context) error { return bao }))
+		var neverConsumed atomic.Int64
+		r.GET("/readyz", readyzHandler(d, func(context.Context) bool { return db }, func(context.Context) error { return bao }, &neverConsumed, 60*time.Second))
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 		return rec.Code, rec.Body.String()
@@ -223,13 +224,14 @@ func TestReadyzHandler_ChecksRunUnderServerSideDeadline(t *testing.T) {
 	var dbDeadline, baoDeadline time.Time
 	var dbOK, baoOK bool
 	r := gin.New()
+	var neverConsumed atomic.Int64
 	r.GET("/readyz", readyzHandler(&atomic.Bool{},
 		func(ctx context.Context) bool { dbDeadline, dbOK = ctx.Deadline(); return true },
 		func(ctx context.Context) error {
 			baoDeadline, baoOK = ctx.Deadline()
 			<-ctx.Done() // a hung OpenBao call that only returns when cancelled
 			return ctx.Err()
-		}))
+		}, &neverConsumed, 60*time.Second))
 	start := time.Now()
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))

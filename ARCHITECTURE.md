@@ -835,7 +835,7 @@ sequenceDiagram
     TX->>POOL: checkout connection
     POOL->>PG: BEGIN<br/>SET LOCAL app.tenant_id = '{tenant}'<br/>(transaction-local only — never SET, never session-wide)
     PG->>PG: app_tenant_id() reads current_setting('app.tenant_id', true)<br/>STABLE, SECURITY DEFINER, search_path pinned,<br/>fail-closed (NULL on any error)
-    PG->>PG: rls_check_tenant(row.tenant_id, table)<br/>USING + WITH CHECK on every policy<br/>on failure: log_rls_violation() → rls_violation_log<br/>(1% sampled, migration 000003), still returns false
+    PG->>PG: rls_check_tenant(row.tenant_id, table)<br/>USING + WITH CHECK on every policy<br/>on failure: log_rls_violation() → rls_violation_log<br/>(1% sampled, TS-D18), still returns false
     Note over PG: FORCE ROW LEVEL SECURITY — applies even to<br/>the table owner. No app.tenant_id set → 0 rows /<br/>write rejected (fail-closed), never "no restriction".
     PG-->>TX: query result (tenant-filtered)
     TX->>POOL: COMMIT — GUC is transaction-local, cleared automatically
@@ -865,7 +865,7 @@ lock before `409 rotation_in_flight`.
 
 ### RLS violation logging (LLD TS-D18)
 
-The policy fails closed either way; migration `000003_rls_violation_log`
+The policy fails closed either way; `000001_schema`
 only makes the failures visible. `rls_check_tenant()` now calls
 `log_rls_violation(table, row_tenant_id, type)` on each failed check before
 returning `false` — `SECURITY DEFINER`, swallows its own errors (a logging
@@ -885,7 +885,7 @@ replica counts the same rows — alert on `increase() > 0` and aggregate
 with `max`, not `sum` (`IAMTokenServiceRLSCrossTenantAccess`,
 `IAMTokenServiceRLSMissingGUC`). `cmd/rotator` prunes the table through
 `prune_rls_violation_log(ttl_days, limit)` (`RLS_VIOLATION_LOG_TTL_DAYS`,
-default 30; since `000004_hardening` the function refuses a TTL under 7
+default 30; the consolidated schema enforces a TTL under 7
 days, so a compromised app credential cannot erase recent evidence).
 Grants: `SELECT` to `serviceaccount_reconciler` and `admin_readonly`;
 `serviceaccount_app` has no table grant, only `EXECUTE` on the prune
@@ -922,16 +922,7 @@ non-NULL is a `cmd/scheduler` intent ignored until it expires; app role
 CRUD, reconciler role `SELECT`) and `outbox_events` / `outbox_dead_letters`
 (owned by `platform-events`' `outbox.ApplySchema`; the base migration only
 customizes the `payload` column type). Since this service has never been
-deployed, the history is five outright migrations, not an expand/contract
-sequence: `000001_schema` (the consolidated base schema),
-`000002_rotation_cadence` (§16 TSQ-6 — `rotation_cadence_days`/
-`next_rotation_at` + `idx_sac_next_rotation`), `000003_rls_violation_log`
-(TS-D18 — the table, `log_rls_violation()`, the logging
-`rls_check_tenant()`, `prune_rls_violation_log()` and their grants),
-`000004_hardening` (TS-D21 — app grants on the outbox dead-letter table
-and ordering sequence, `app_tenant_id()` with a pinned `search_path` and
-no `PUBLIC` execute, the 7-day minimum prune TTL) and
-`000005_keys_refresh_pending` (TS-D22/23 — the marker table and its
+deployed, the history is one consolidated migration: `000001_schema`, which incorporates all schema (TSQ-6 cadence columns, TS-D18 RLS violation log, TS-D21 hardening, TS-D22/23 keys_refresh_pending). Future changes add `000002_<name>.{up,down}.sql`.
 grants).
 
 Both tenant-scoped tables carry `record_version`, bumped by the shared
@@ -1490,9 +1481,7 @@ Helm, `RUN_MIGRATIONS` defaults to true and each binary migrates at
 startup. `MIGRATION_DATABASE_URL` bypasses PgBouncer — `pg_advisory_lock` is
 session-scoped and breaks under transaction pooling. Dev-stage migrations
 are outright (no expand/contract dance): this service has never been
-deployed anywhere, so the history is five migrations (`000001_schema`,
-`000002_rotation_cadence`, `000003_rls_violation_log`, `000004_hardening`,
-`000005_keys_refresh_pending`), with grants to optional roles guarded by
+deployed anywhere, so the history is one consolidated migration (`000001_schema`), with grants to optional roles guarded by
 `pg_roles` existence checks. The base down migration's `REVOKE ... FROM
 admin_readonly` is guarded the same way the up migration's grant is
 (`admin_readonly` is infra-provisioned ahead of the migration in prod and
@@ -1676,8 +1665,7 @@ subscriber would need to honor.
 
 Database migrations live in `internal/adapter/outbound/postgres/migrations`
 and are outright (no expand/contract) at this dev stage — five so far
-(`000001_schema`, `000002_rotation_cadence`, `000003_rls_violation_log`,
-`000004_hardening`, `000005_keys_refresh_pending`), applied by the Helm
+(`000001_schema`), applied by the Helm
 migrate hook Job. Event schemas are the other axis: each of the 5 published
 event types has a JSON Schema embedded at
 `internal/adapter/outbound/eventbus/schemas/*.json`,

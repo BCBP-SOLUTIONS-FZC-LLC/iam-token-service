@@ -92,6 +92,14 @@ Common starting points:
 
 **Mitigate.** Restore OpenBao. Callers retry TS-1 safely under the same `rotation_id`.
 
+### IAMTokenServiceOpenBaoReadLatencyHigh
+
+**Meaning.** OpenBao KV v2 `read` p99 is above 2s — the JWKS route's hot path. The JWKS handler makes one `Read` per live credential per Keycloak fetch; sustained read latency above 2s means Keycloak's token verification for every `platform-automation` client assertion is degraded, approaching the 8s `HTTPTimeout` where `503 jwks_keys_unavailable` begins.
+
+**Triage.** Same root causes as `IAMTokenServiceOpenBaoCallLatencyHigh` (seal, Kubernetes-auth login, network egress), but restricted to the read path. Check `platform_dependency_request_seconds{dependency="openbao",operation="read"}` latency histogram by pod and time of day. JWKS reads hit for every unique tenant that Keycloak serves during the overlap window, so traffic spikes during provisioning-heavy periods. If read latency is elevated only for a single principal, the entry may be very large (unusual).
+
+**Mitigate.** Restore OpenBao. The JWKS handler caches nothing — every Keycloak fetch re-reads from OpenBao — so recovery is immediate once OpenBao responds normally.
+
 ### IAMTokenServiceOpenBaoErrors
 
 **Meaning.** More than 5% of OpenBao KV v2 calls failed over 10 minutes, across every binary (`platform_dependency_request_seconds_count{dependency="openbao",outcome="error"}` over all outcomes, selected by `service`; `metric_status: proposed`). TS-1/TS-2 return `502 secret_store_unavailable`, the JWKS route may return `503 jwks_keys_unavailable`, the offboarding cascade fails and is redelivered, and the rotator's sweep and reconciler fail.
@@ -310,6 +318,12 @@ Targets come from LLD §11 (SLO-3's 99% is an operational proxy); see the header
 
 **Triage.** As for `IAMTokenServiceHighErrorRate`, restricted to write routes. Usually `db_unavailable` or `secret_store_unavailable`; check `/readyz`.
 
+### IAMTokenServiceSLO2_WriteErrorRateSlowBurn
+
+**Meaning.** Write error rate burning error budget at 6× over the last hour — below the fast-burn page threshold, but enough to exhaust the monthly budget within days if sustained.
+
+**Triage.** Same as `IAMTokenServiceSLO2_WriteErrorRateFastBurn`. Because this is a ticket (not a page), investigate during business hours. Check `iam_token_service_credentials_issued_total{result="error"}` and `iam_token_service_principal_revocations_total{result="error"}` for which write paths are failing. Usually a degraded Postgres or OpenBao instance that has not yet crossed the full-outage threshold.
+
 ### IAMTokenServiceSLO3_SweepSuccessRateLow
 
 **Meaning.** The share of §8.3 rotator runs in the last hour whose sweep reported `result="ok"` has been below 99% for 20 minutes: a sustained degradation rather than a single failed run. The SLI counts runs — each run is its own short-lived pod whose counter is 1 for its result, read with `max_over_time` and summed across pods — because `rate()` over those never-changing per-pod counters is always 0. Runs whose RP-17 call failed count as failed here even though `keys_refresh_pending` repairs them later.
@@ -321,6 +335,24 @@ Targets come from LLD §11 (SLO-3's 99% is an operational proxy); see the header
 **Meaning.** TS-3 (`GET …/service-accounts/:principal_id`) is missing its p99 ≤ 100 ms target faster than the 99% budget allows (14.4× fast, page; 6× slow, ticket).
 
 **Triage.** TS-3 makes no OpenBao call, so this is Postgres: `platform_db_query_duration_seconds`, `platform_db_pool_acquire_duration_seconds{pool="default"}` (pool waits), `platform_db_slow_queries_total`. The credential list read uses `idx_sac_principal`; a plan change to a sequential scan shows here first.
+
+### IAMTokenServiceSLO5_JWKSAvailabilityFastBurn
+
+**Meaning.** JWKS 5xx error rate burning error budget at 14.4× — Keycloak's token verification for every `platform-automation` client-jwt assertion is degraded. The JWKS route is unauthenticated by design (EXT-6); `503 jwks_keys_unavailable` means this service could not read the active public key from OpenBao for one or more tenants.
+
+**Triage.**
+1. Check `IAMTokenServiceOpenBaoReadLatencyHigh` and `IAMTokenServiceOpenBaoErrors` first — a degraded OpenBao is the primary cause.
+2. Check the JWKS rate-limit counters: `iam_token_service_jwks_rate_limited_total{bucket="unknown"}` — a spike in unknown-tenant probing can exhaust the unknown bucket (2 req/s burst 5) and spill into the global bucket.
+3. Check `jwks_known_tenants_last_refresh_age_seconds` — if the known-tenant list is stale (> 2× `JWKS_KNOWN_TENANTS_REFRESH`), legitimate tenants may be served from the smaller unknown bucket.
+4. Pod logs: `jwks: unreadable key` with `tenant_id` and `credential_id` to identify the affected principal.
+
+**Mitigate.** Restore OpenBao. If rate-limited: scale server replicas (each pod has independent buckets). If the known-tenant list is stale: restart the server pod to trigger a fresh refresh.
+
+### IAMTokenServiceSLO5_JWKSAvailabilitySlowBurn
+
+**Meaning.** JWKS error budget slow burn at 6× over the last hour — below the fast-burn page threshold, but enough to exhaust the monthly budget within days if sustained. Usually indicates intermittent OpenBao read errors or a gradual increase in unknown-tenant rate-limited requests.
+
+**Triage.** Same as `IAMTokenServiceSLO5_JWKSAvailabilityFastBurn`. Because this is a ticket (not a page), investigate during business hours. `iam_token_service_jwks_rate_limited_by_bucket_total{bucket}` shows which bucket is saturating.
 
 ## Caller-visible outcomes (no alert)
 

@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-token-service/pkg/traceutil"
 )
 
 // tracer names every span this package starts. OpenTelemetry via
@@ -67,17 +69,13 @@ func (s *CredentialService) Revoke(ctx context.Context, tenantID, principalID uu
 	return result, nil
 }
 
-// withTraceID copies fields and, when ctx carries a valid span from
-// gincommon's TracerProvider, adds trace_id so application Warn/Error
-// lines join the same trace as HTTP/db spans (iam-user-profile logCtx).
+// withTraceID adds trace_id to fields if the context carries a valid span.
+// Delegates to pkg/traceutil.WithTraceID so the implementation is shared
+// with other packages (L-10).
 func withTraceID(ctx context.Context, fields map[string]interface{}) map[string]interface{} {
-	if span := oteltrace.SpanFromContext(ctx); span.SpanContext().IsValid() {
-		if fields == nil {
-			fields = map[string]interface{}{}
-		}
-		fields["trace_id"] = span.SpanContext().TraceID().String()
-	}
-	return fields
+	// pkg/traceutil.WithTraceID accepts map[string]any; map[string]interface{}
+	// is the same type, so cast is safe.
+	return traceutil.WithTraceID(ctx, fields)
 }
 
 // RevokePrincipal is the exported TS-7 entry point: starts the

@@ -28,11 +28,23 @@ type CredentialService struct {
 	// replayWindow bounds how long after issue a rotation_id replay may
 	// re-read the private key (WithReplayWindow); 0 = unlimited.
 	replayWindow time.Duration
+
+	// onInlineSweepError, when non-nil, is called each time the opportunistic
+	// post-TS-1 sweep encounters an error (sweepExpiredRotating). Injected by
+	// metrics.InstrumentedCredentialService so the metrics package, not the
+	// service package, holds the Prometheus dependency (M-7).
+	onInlineSweepError func()
 }
 
 // DefaultReplayWindow is the rotation_id replay window applied when
 // WithReplayWindow is not called (ROTATION_REPLAY_WINDOW's default).
 const DefaultReplayWindow = 15 * time.Minute
+
+// opportunisticSweepTimeout bounds the detached post-TS-1 sweep of expired
+// rotating credentials (sweepExpiredRotating). Named to avoid a magic
+// literal: the value is the same as inLockSecretWriteTimeout (5s) × 2 to
+// give the sweep room for one revoke + its OpenBao delete.
+const opportunisticSweepTimeout = 10 * time.Second
 
 // inLockSecretWriteTimeout bounds TS-1's OpenBao write — including the
 // OpenBao client's one 403 re-login retry — while the principal row lock is
@@ -77,6 +89,17 @@ func (s *CredentialService) WithReplayWindow(d time.Duration) *CredentialService
 		d = 0
 	}
 	s.replayWindow = d
+	return s
+}
+
+// WithInlineSweepErrorHook sets a zero-argument callback that is invoked on
+// every error from the opportunistic post-TS-1 expired-overlap sweep
+// (sweepExpiredRotating). The hook is intentionally untyped so the service
+// package does not need to import the metrics package — the caller (typically
+// metrics.InstrumentedCredentialService) supplies metrics.IncInlineSweepError
+// (M-7, arch boundary: service may not depend on adapters_outbound).
+func (s *CredentialService) WithInlineSweepErrorHook(fn func()) *CredentialService {
+	s.onInlineSweepError = fn
 	return s
 }
 
@@ -313,7 +336,7 @@ func (s *CredentialService) issueOrRotate(ctx context.Context, tenantID, princip
 	// Detached from the request: the TS-1 response is already decided, and a
 	// client disconnect must not cut a revoke off between its OpenBao delete
 	// and its commit (a live row with no material, until the cron sweep).
-	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opportunisticSweepTimeout)
 	defer cancel()
 	s.sweepExpiredRotating(sweepCtx, tenantID, principalID, actor)
 	return result, nil
@@ -588,6 +611,9 @@ func (s *CredentialService) sweepExpiredRotating(ctx context.Context, tenantID, 
 	creds, err := s.credentials.ListByPrincipal(ctx, tenantID, principalID)
 	if err != nil {
 		s.warn(ctx, "sweep_expired_rotating: list failed", tenantID, principalID, err)
+		if s.onInlineSweepError != nil {
+			s.onInlineSweepError()
+		}
 		return
 	}
 	now := time.Now().UTC()
@@ -597,6 +623,9 @@ func (s *CredentialService) sweepExpiredRotating(ctx context.Context, tenantID, 
 		}
 		if _, err := s.revokeCredential(ctx, tenantID, principalID, c, actor); err != nil {
 			s.warn(ctx, "sweep_expired_rotating: revoke failed", tenantID, principalID, err)
+			if s.onInlineSweepError != nil {
+				s.onInlineSweepError()
+			}
 		}
 	}
 }

@@ -229,12 +229,14 @@ dependency rules: [architecture.md](architecture.md).
 Two tenant-scoped tables under `FORCE ROW LEVEL SECURITY`
 (`service_account_principals`, `service_account_credentials`), plus
 RLS-exempt `processed_events`, `rls_violation_log`, `keys_refresh_pending`
-and platform-events' `outbox_events`/`outbox_dead_letters`. Five
-migrations (dev stage, nothing deployed): `000001_schema`,
-`000002_rotation_cadence` (TSQ-6), `000003_rls_violation_log`,
-`000004_hardening` (outbox dead-letter/sequence grants, `app_tenant_id()`
-search_path pinned + PUBLIC revoked, RLS-log prune TTL ≥ 7 days, TS-D21),
-`000005_keys_refresh_pending` (TS-D22/23). Full detail:
+and platform-events' `outbox_events`/`outbox_dead_letters`. One
+consolidated migration (dev stage, nothing deployed): `000001_schema`
+incorporates the full final schema — enums, all tables (including
+`rotation_cadence_days`/`next_rotation_at` from TSQ-6, `rls_violation_log`
+from TS-D18, `keys_refresh_pending` from TS-D22/23), all hardened
+functions (`app_tenant_id()` with pinned `search_path`, `prune_rls_violation_log`
+with 7-day minimum from TS-D21), and all grants. Future schema changes
+add a new `000002_<name>.{up,down}.sql`. Full detail:
 [database-schema.md](database-schema.md).
 
 ## API & events

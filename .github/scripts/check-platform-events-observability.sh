@@ -6,11 +6,13 @@
 #   publishing   — events go into outbox_events via outbox.Enqueue (in
 #                  publisher.go), then cmd/server's outbox.Runner relays
 #                  them to SNS via events.NewSNSPublisher. No service code
-#                  may call sns.Publish or sns.PublishBatch directly.
+#                  may call sns.Publish or sns.PublishBatch directly, nor
+#                  INSERT INTO outbox_events directly.
 #
 #   consumption  — all inbound SQS messages are polled by platform-events'
 #                  events.SQSConsumer (events.NewSQSConsumerWithClient).
-#                  No service code may call sqs.ReceiveMessage directly;
+#                  No service code may call sqs.ReceiveMessage,
+#                  sqs.DeleteMessage, or sqs.ChangeMessageVisibility directly;
 #                  that would bypass the consumer loop's DLQ routing,
 #                  metrics, span injection, visibility-extension, and
 #                  graceful-drain logic.
@@ -40,20 +42,39 @@ set -euo pipefail
 
 echo "Checking events/outbox/dedup go through platform-events (negative gate)..."
 
+# ── SQS/SNS API bypasses ──────────────────────────────────────────────────────
 offenders=$(grep -rnE \
-  'sqs\.ReceiveMessage\(|sns\.Publish\(|sns\.PublishBatch\(' \
+  'sqs\.ReceiveMessage\(|sqs\.DeleteMessage\(|sqs\.ChangeMessageVisibility\(|sns\.Publish\(|sns\.PublishBatch\(' \
   --include='*.go' \
   --exclude='*_test.go' \
   cmd/ internal/ 2>/dev/null || true)
 
 if [ -n "$offenders" ]; then
 	echo "FAIL: direct SQS/SNS API calls bypass platform-events:"
-	echo "  sqs.ReceiveMessage → use events.NewSQSConsumerWithClient (handles polling,"
-	echo "                        DLQ routing, visibility extension, metrics, drain)"
-	echo "  sns.Publish / sns.PublishBatch → events go through outbox.Enqueue first;"
-	echo "                        cmd/server's outbox.Runner relays them via events.NewSNSPublisher"
+	echo "  sqs.ReceiveMessage         → use events.NewSQSConsumerWithClient (polling, metrics, drain)"
+	echo "  sqs.DeleteMessage          → platform-events consumer acks after handler returns nil"
+	echo "  sqs.ChangeMessageVisibility → platform-events consumer extends visibility during processing"
+	echo "  sns.Publish / PublishBatch → events go through outbox.Enqueue first;"
+	echo "                               cmd/server's outbox.Runner relays via events.NewSNSPublisher"
 	echo ""
 	echo "$offenders"
 	exit 1
 fi
-echo "OK: no direct sqs.ReceiveMessage/sns.Publish in production code (cmd/, internal/)"
+
+# ── SQL bypasses on platform-events-owned tables ──────────────────────────────
+sql_offenders=$(grep -rnE \
+  '"[^"]*INSERT[[:space:]]+INTO[[:space:]]+outbox_events|"[^"]*INSERT[[:space:]]+INTO[[:space:]]+processed_events' \
+  --include='*.go' \
+  --exclude='*_test.go' \
+  cmd/ internal/ 2>/dev/null || true)
+
+if [ -n "$sql_offenders" ]; then
+	echo "FAIL: raw SQL INSERT on platform-events-owned tables bypasses platform-events:"
+	echo "  outbox_events    → use outbox.Enqueue (via port.EventPublisher.Enqueue in a RunInTx transaction)"
+	echo "  processed_events → use inbox.Store.Process (via port.Inbox.ProcessOnce)"
+	echo ""
+	echo "$sql_offenders"
+	exit 1
+fi
+
+echo "OK: no direct sqs.ReceiveMessage/DeleteMessage/ChangeMessageVisibility/sns.Publish/raw-outbox-SQL in production code (cmd/, internal/)"

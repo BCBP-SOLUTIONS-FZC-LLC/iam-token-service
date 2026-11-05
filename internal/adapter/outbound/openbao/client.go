@@ -336,10 +336,22 @@ func instrumentedHTTPClient(timeout time.Duration, base *http.Client) *http.Clie
 }
 
 // wrapErr maps any OpenBao SDK failure to domain.ErrSecretStoreUnavailable
-// (§5.4 TS-1 502, §17) while keeping op and the underlying error in the
-// message for diagnostics — never a secret value (TS-INV-2).
+// (§5.4 TS-1 502, §17). For *api.ResponseError — responses from the OpenBao
+// server — only the HTTP status code is included (never the full response body,
+// which may echo vault paths or policy names into OTLP spans, TS-INV-2).
+// Plain errors from our own validation (e.g. "no secret at path") keep their
+// message because they originate in this package and never contain key material.
 func wrapErr(op string, err error) *domain.Error {
-	return domain.NewError(domain.ErrSecretStoreUnavailable, fmt.Sprintf("openbao: %s: %v", op, err))
+	if err == nil {
+		return nil
+	}
+	var respErr *openbaoapi.ResponseError
+	if errors.As(err, &respErr) {
+		return domain.NewError(domain.ErrSecretStoreUnavailable,
+			fmt.Sprintf("openbao: %s: status=%d", op, respErr.StatusCode))
+	}
+	return domain.NewError(domain.ErrSecretStoreUnavailable,
+		fmt.Sprintf("openbao: %s: %v", op, err))
 }
 
 // isNotFound reports whether err represents OpenBao's 404 (no secret at

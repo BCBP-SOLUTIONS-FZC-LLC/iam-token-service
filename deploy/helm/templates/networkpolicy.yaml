@@ -151,7 +151,9 @@ spec:
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
     - to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iam
       ports:
         - port: {{ .Values.networkPolicy.realmProvisionerPort }}
           protocol: TCP
@@ -179,7 +181,9 @@ spec:
   egress:
     {{- include "iam-token-service.egressRules" . | nindent 4 }}
     - to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iam
       ports:
         - port: {{ .Values.networkPolicy.realmProvisionerPort }}
           protocol: TCP

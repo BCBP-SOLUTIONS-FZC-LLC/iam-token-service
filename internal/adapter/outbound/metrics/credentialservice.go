@@ -25,8 +25,11 @@ type InstrumentedCredentialService struct {
 }
 
 // NewInstrumentedCredentialService wraps inner with transition-counter
-// instrumentation.
+// instrumentation and wires the inline-sweep error hook so
+// rotation_inline_sweep_errors_total is incremented without breaking the
+// arch boundary (service may not import adapters_outbound/metrics; M-7).
 func NewInstrumentedCredentialService(inner *service.CredentialService) *InstrumentedCredentialService {
+	inner.WithInlineSweepErrorHook(IncInlineSweepError)
 	return &InstrumentedCredentialService{inner: inner}
 }
 

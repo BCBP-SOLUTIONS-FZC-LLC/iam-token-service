@@ -17,11 +17,19 @@ type PrincipalService struct {
 	principals  port.PrincipalRepository
 	credentials port.CredentialRepository
 	tx          port.TxRunner
+	log         port.Logger
 }
 
 // NewPrincipalService wires PrincipalService's dependencies.
 func NewPrincipalService(principals port.PrincipalRepository, credentials port.CredentialRepository, tx port.TxRunner) *PrincipalService {
 	return &PrincipalService{principals: principals, credentials: credentials, tx: tx}
+}
+
+// WithLogger sets the logger on the PrincipalService and returns the receiver
+// for fluent construction chaining.
+func (s *PrincipalService) WithLogger(log port.Logger) *PrincipalService {
+	s.log = log
+	return s
 }
 
 // RegisterRequest is the TS-4 request body (§5.4). Supplied by the Realm
@@ -90,6 +98,12 @@ func (s *PrincipalService) Register(ctx context.Context, tenantID uuid.UUID, req
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if s.log != nil {
+		s.log.Info("principal: registered", map[string]any{
+			"tenant_id": tenantID.String(), "principal_id": result.ID.String(),
+		})
 	}
 
 	return &RegisterResult{

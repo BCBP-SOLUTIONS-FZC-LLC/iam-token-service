@@ -321,7 +321,12 @@ func deleteOrphanUnderLock(ctx context.Context, secrets port.SecretStore, lock o
 }
 
 func deleteMaterial(ctx context.Context, secrets port.SecretStore, log port.Logger, st port.PrincipalMaterialState, version int, materialPath string, result *materialReconcileResult) {
-	if err := secrets.Delete(ctx, materialPath); err != nil {
+	// Bounded for consistency with deleteOrphanUnderLock (L-5): even though
+	// deleteMaterial does not hold the principal row lock, an unbounded
+	// OpenBao call could stall the reconciler's sweep budget.
+	dctx, dcancel := context.WithTimeout(ctx, inLockSecretTimeout)
+	defer dcancel()
+	if err := secrets.Delete(dctx, materialPath); err != nil {
 		result.Failed++
 		logError(ctx, log, "orphan reconciler: delete orphaned material failed", map[string]interface{}{
 			"tenant_id": st.TenantID, "principal_id": st.PrincipalID, "version": version,

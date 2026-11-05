@@ -270,11 +270,15 @@ scheduler; MIGRATION_DATABASE_URL for the migrate Job) bypass PgBouncer.
 {{- end }}
 
 {{/*
-Egress peers: any in-cluster namespace, plus the given off-cluster CIDRs
-(a namespaceSelector never matches an address outside the cluster).
+Egress peers: off-cluster CIDRs only. A namespaceSelector: {} was removed
+(M-14) because it matched every pod in every namespace, granting egress to
+all in-cluster destinations on the same port as the CIDR-only rule — far
+broader than intended. CIDR-based rules (AWS, DNS, OTel, Postgres if
+external) now carry only ipBlock entries. In-cluster services (OpenBao,
+istiod, Realm Provisioner) are covered by their own dedicated rules with
+explicit namespaceSelector + podSelector in egressRules/_helpers.tpl.
 */}}
 {{- define "iam-token-service.egressPeers" -}}
-- namespaceSelector: {}
 {{- range .cidrs }}
 - ipBlock:
     cidr: {{ . | quote }}

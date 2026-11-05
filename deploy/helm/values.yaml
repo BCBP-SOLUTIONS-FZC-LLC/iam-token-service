@@ -650,3 +650,20 @@ rotationEpoch: "0"
 #     render (migrations.enabled: false) adopts it instead of failing on
 #     "already exists".
 secretValues: {}
+
+# externalSecret: optional ExternalSecret CRD template (M-20). Requires the
+# External Secrets Operator (ESO) CRD (external-secrets.io/v1beta1) to be
+# installed in the cluster. When enabled, the chart renders an ExternalSecret
+# that ESO will use to pull DATABASE_URL / MIGRATION_DATABASE_URL /
+# RECONCILER_DATABASE_URL from an external secret store (AWS Secrets Manager,
+# HashiCorp Vault, etc.) into a Kubernetes Secret named targetSecretName.
+# Set database.existingSecretName to that same targetSecretName so the
+# workloads mount it. secretValues must remain empty when this is enabled
+# (the H-3 guard above rejects both together outside local/dev/test anyway).
+externalSecret:
+  enabled: false
+  secretStoreName: ""             # required when enabled — name of the SecretStore / ClusterSecretStore resource
+  secretStoreKind: ClusterSecretStore  # ClusterSecretStore (cluster-scoped) or SecretStore (namespace-scoped)
+  secretPath: ""                  # path/key in the external store, e.g. "iam/token-service/db-credentials"
+  targetSecretName: ""            # defaults to <fullname>-db-credentials when empty
+  refreshInterval: "1h"           # how often ESO re-reads from the external store
